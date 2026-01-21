@@ -21,7 +21,7 @@ router.post('/login', async (req, res) => {
 
     // Find user by employee ID
     const result = await pool.query(
-      'SELECT id, employee_id, password, name, email, role, is_active FROM users WHERE employee_id = $1',
+      'SELECT id, employee_id, password, name, email, role, material_type_id, is_active FROM users WHERE employee_id = $1',
       [employeeId.toUpperCase()]
     );
 
@@ -33,6 +33,9 @@ router.post('/login', async (req, res) => {
     }
 
     const user = result.rows[0];
+
+    // Update last login
+    await pool.query('UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = $1', [user.id]);
 
     // Check if user is active
     if (!user.is_active) {
@@ -53,7 +56,7 @@ router.post('/login', async (req, res) => {
 
     // Generate JWT access token (short-lived)
     const accessToken = jwt.sign(
-      { userId: user.id, employeeId: user.employee_id, type: 'access' },
+      { userId: user.id, employeeId: user.employee_id, materialTypeId: user.material_type_id, type: 'access' },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
     );
@@ -87,7 +90,8 @@ router.post('/login', async (req, res) => {
         employeeId: user.employee_id,
         name: user.name,
         email: user.email,
-        role: user.role
+        role: user.role,
+        materialTypeId: user.material_type_id
       }
     });
   } catch (error) {
@@ -113,7 +117,7 @@ router.post('/refresh', async (req, res) => {
 
     // Verify refresh token exists and is valid
     const tokenResult = await pool.query(
-      `SELECT rt.*, u.id, u.employee_id, u.name, u.email, u.role, u.is_active 
+      `SELECT rt.*, u.id, u.employee_id, u.name, u.email, u.role, u.material_type_id, u.is_active 
        FROM refresh_tokens rt
        JOIN users u ON rt.user_id = u.id
        WHERE rt.token = $1 AND rt.is_revoked = false AND rt.expires_at > NOW()`,
@@ -138,7 +142,7 @@ router.post('/refresh', async (req, res) => {
 
     // Generate new access token
     const accessToken = jwt.sign(
-      { userId: tokenData.id, employeeId: tokenData.employee_id, type: 'access' },
+      { userId: tokenData.id, employeeId: tokenData.employee_id, materialTypeId: tokenData.material_type_id, type: 'access' },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
     );
@@ -152,7 +156,8 @@ router.post('/refresh', async (req, res) => {
         employeeId: tokenData.employee_id,
         name: tokenData.name,
         email: tokenData.email,
-        role: tokenData.role
+        role: tokenData.role,
+        materialTypeId: tokenData.material_type_id
       }
     });
   } catch (error) {
@@ -167,6 +172,7 @@ router.post('/refresh', async (req, res) => {
 // Verify token endpoint
 router.get('/verify', authenticateToken, async (req, res) => {
   try {
+    const result = await pool.query('SELECT last_login_at, material_type_id FROM users WHERE id = $1', [req.user.id]);
     res.json({
       success: true,
       user: {
@@ -174,7 +180,9 @@ router.get('/verify', authenticateToken, async (req, res) => {
         employeeId: req.user.employeeId,
         name: req.user.name,
         email: req.user.email,
-        role: req.user.role
+        role: req.user.role,
+        materialTypeId: result.rows[0]?.material_type_id,
+        lastLoginAt: result.rows[0]?.last_login_at
       }
     });
   } catch (error) {

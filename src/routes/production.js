@@ -3,19 +3,6 @@ const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
-// 1. Get all active production lines
-router.get('/lines', authenticateToken, async (req, res) => {
-  try {
-    const result = await pool.query(
-      'SELECT * FROM production_lines WHERE is_active = true ORDER BY id'
-    );
-    res.json({ success: true, data: result.rows });
-  } catch (error) {
-    console.error('Error fetching production lines:', error);
-    res.status(500).json({ success: false, message: 'Internal server error' });
-  }
-});
-
 // 2. Get all shift types
 router.get('/shifts', authenticateToken, async (req, res) => {
   try {
@@ -38,12 +25,27 @@ router.get('/materials', authenticateToken, async (req, res) => {
   }
 });
 
-// 4. Get all active stations
+// 4. Get all active stations for the user's material flow (Role)
 router.get('/stations', authenticateToken, async (req, res) => {
+  const materialTypeId = req.user.materialTypeId;
+
   try {
-    const result = await pool.query(
-      'SELECT * FROM stations WHERE is_active = true ORDER BY order_index'
-    );
+    let result;
+    if (materialTypeId) {
+      // Get stations mapped to this user's material flow
+      result = await pool.query(
+        `SELECT s.* FROM stations s
+         JOIN material_flow_stations mfs ON s.id = mfs.station_id
+         WHERE mfs.material_type_id = $1 AND s.is_active = true
+         ORDER BY s.order_index`,
+        [materialTypeId]
+      );
+    } else {
+      // Fallback to all active stations
+      result = await pool.query(
+        'SELECT * FROM stations WHERE is_active = true ORDER BY order_index'
+      );
+    }
     res.json({ success: true, data: result.rows });
   } catch (error) {
     console.error('Error fetching stations:', error);
@@ -53,8 +55,16 @@ router.get('/stations', authenticateToken, async (req, res) => {
 
 // 5. Start a shift session
 router.post('/start-shift', authenticateToken, async (req, res) => {
-  const { lineId, shiftTypeId, materialTypeId } = req.body;
-  const userId = req.user.userId;
+  const { shiftTypeId } = req.body;
+  const userId = req.user.id;
+  const materialTypeId = req.user.materialTypeId;
+
+  if (!materialTypeId) {
+    return res.status(400).json({
+      success: false,
+      message: 'User does not have an assigned material role (PC, PE, PET). Please contact administrator.'
+    });
+  }
 
   try {
     // Check if there's already an active shift for this user
@@ -64,18 +74,18 @@ router.post('/start-shift', authenticateToken, async (req, res) => {
     );
 
     if (activeShift.rows.length > 0) {
-      return res.status(400).json({ 
-        success: false, 
+      return res.status(400).json({
+        success: false,
         message: 'You already have an active shift session',
         shiftId: activeShift.rows[0].id
       });
     }
 
     const result = await pool.query(
-      `INSERT INTO operator_shifts (user_id, line_id, shift_type_id, material_type_id, is_active)
-       VALUES ($1, $2, $3, $4, true)
+      `INSERT INTO operator_shifts (user_id, shift_type_id, material_type_id, is_active)
+       VALUES ($1, $2, $3, true)
        RETURNING *`,
-      [userId, lineId, shiftTypeId, materialTypeId]
+      [userId, shiftTypeId, materialTypeId]
     );
 
     res.json({ success: true, message: 'Shift started successfully', data: result.rows[0] });
@@ -85,10 +95,37 @@ router.post('/start-shift', authenticateToken, async (req, res) => {
   }
 });
 
-// 6. Check shift status
+// 6. Get active shift for a user/shift combo
+router.get('/active-shift', authenticateToken, async (req, res) => {
+  const { shiftTypeId } = req.query;
+  const userId = req.user.id;
+
+  try {
+    let query = 'SELECT * FROM operator_shifts WHERE user_id = $1 AND is_active = true';
+    const params = [userId];
+
+    if (shiftTypeId) {
+      params.push(shiftTypeId);
+      query += ` AND shift_type_id = $${params.length}`;
+    }
+
+    const result = await pool.query(query, params);
+
+    if (result.rows.length === 0) {
+      return res.json({ success: true, data: null });
+    }
+
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error('Error fetching active shift:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// 7. Check shift status
 router.get('/shift-status/:shiftId', authenticateToken, async (req, res) => {
   const { shiftId } = req.params;
-  const userId = req.user.userId;
+  const userId = req.user.id;
 
   try {
     const result = await pool.query(
@@ -103,8 +140,8 @@ router.get('/shift-status/:shiftId', authenticateToken, async (req, res) => {
     }
 
     const shift = result.rows[0];
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       data: {
         ...shift,
         status: shift.is_active ? 'active' : 'ended'
@@ -119,7 +156,7 @@ router.get('/shift-status/:shiftId', authenticateToken, async (req, res) => {
 // 7. End a shift session
 router.post('/end-shift/:shiftId', authenticateToken, async (req, res) => {
   const { shiftId } = req.params;
-  const userId = req.user.userId;
+  const userId = req.user.id;
 
   console.log(`Attempting to end shift ${shiftId} for user ${userId}`);
 
@@ -163,74 +200,202 @@ router.post('/end-shift/:shiftId', authenticateToken, async (req, res) => {
   }
 });
 
+// 6.5 GET next available QR code (for preview before saving)
+router.get('/next-qr', authenticateToken, async (req, res) => {
+  try {
+    const { stationId, shiftId, subLine } = req.query; // subLine: '3E' or 'Rapid'
+
+    if (!stationId || !shiftId) {
+      return res.status(400).json({ success: false, message: 'stationId and shiftId are required' });
+    }
+
+    // Get shift details
+    const shiftInfo = await pool.query(
+      `SELECT st.name as shift_name, os.start_time, mt.name as material_name
+       FROM operator_shifts os
+       LEFT JOIN shift_types st ON os.shift_type_id = st.id
+       LEFT JOIN material_types mt ON os.material_type_id = mt.id
+       WHERE os.id = $1`,
+      [shiftId]
+    );
+
+    if (shiftInfo.rows.length === 0) {
+      return res.status(400).json({ success: false, message: 'Shift not found.' });
+    }
+
+    const { shift_name, start_time, material_name } = shiftInfo.rows[0];
+    const shiftDate = new Date(start_time);
+    const year = shiftDate.getFullYear();
+    const month = String(shiftDate.getMonth() + 1).padStart(2, '0');
+    const date = String(shiftDate.getDate()).padStart(2, '0');
+
+    const shiftMap = { 'Shift 1': '1', 'Shift 2': '2', 'Shift 3': '3' };
+    const shiftNum = shiftMap[shift_name] || '1';
+
+    // Get Station Code and Name from DB
+    const stationResult = await pool.query('SELECT code, name FROM stations WHERE id = $1', [stationId]);
+    const stationCode = stationResult.rows[0]?.code || 'UNK';
+    const stationName = stationResult.rows[0]?.name || '';
+
+    // Handle Sub-line for Crusher and Washing
+    let finalStationCode = stationCode;
+    let stationDisplayName = stationName;
+    if (stationCode === 'CRS' && subLine) {
+      finalStationCode = subLine === '3E' ? 'C3E' : 'CRP';
+      stationDisplayName = `${stationName}-${subLine}`;
+    } else if (stationCode === 'WSH' && subLine) {
+      if (subLine === 'Washing 1') {
+        finalStationCode = 'W1';
+        stationDisplayName = `${stationName}-W1`;
+      } else if (subLine === 'Washing 2') {
+        finalStationCode = 'W2';
+        stationDisplayName = `${stationName}-W2`;
+      } else if (subLine === 'Washing 3') {
+        finalStationCode = 'W3';
+        stationDisplayName = `${stationName}-W3`;
+      }
+    } else if ((stationCode === 'EXT' || stationCode === 'EXTR') && subLine) {
+      // Handle Extrusion sub-lines
+      if (subLine === 'Extrusion 1') {
+        finalStationCode = 'E1';
+        stationDisplayName = `${stationName}-E1`;
+      } else if (subLine === 'Extrusion 2') {
+        finalStationCode = 'E2';
+        stationDisplayName = `${stationName}-E2`;
+      } else if (subLine === 'Extrusion 3') {
+        finalStationCode = 'E3';
+        stationDisplayName = `${stationName}-E3`;
+      }
+    }
+
+    // Count for increment
+    const countResult = await pool.query(
+      `SELECT COUNT(*) as count 
+       FROM production_logs 
+       WHERE station_id = $1 AND created_at >= CURRENT_DATE`,
+      [stationId]
+    );
+    const increment = String(parseInt(countResult.rows[0].count) + 1).padStart(3, '0');
+    const materialCode = material_name || 'XX';
+
+    const nextQr = `${year}${month}${date}-${materialCode}-S${shiftNum}-${finalStationCode}-${increment}`;
+
+    res.json({
+      success: true,
+      data: {
+        qrCode: nextQr,
+        details: {
+          materialCode,
+          shiftNum,
+          stationCode: finalStationCode,
+          stationName: stationDisplayName,
+          increment
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Error generating next QR:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
 // 7. Log production data
 router.post('/log', authenticateToken, async (req, res) => {
-  const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, status } = req.body;
+  const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, status, subLine } = req.body;
+  const materialTypeId = req.user.materialTypeId;
 
   try {
     let finalOutputBagQr = outputBagQr;
+    let stationCode = null; // Will be used for status determination
 
-    // If outputBagQr is not provided, generate it based on Shift, Line and Station
+    // Get shift details (Line, Shift Type, Date)
+    const shiftExists = await pool.query('SELECT * FROM operator_shifts WHERE id = $1', [shiftId]);
+
+    if (shiftExists.rows.length === 0) {
+      return res.status(404).json({ success: false, message: `Shift session ${shiftId} not found` });
+    }
+
+    // Get Station Code from DB (needed for both QR generation and status determination)
+    const stationResult = await pool.query('SELECT code, name FROM stations WHERE id = $1', [stationId]);
+    stationCode = stationResult.rows[0]?.code || 'UNK';
+    const stationName = stationResult.rows[0]?.name || '';
+
+    // If outputBagQr is not provided, generate it
     if (!finalOutputBagQr) {
-      // Get shift details (Line, Shift Type, Date)
       const shiftInfo = await pool.query(
-        `SELECT os.line_id, pl.name as line_name, st.name as shift_name, os.start_time
+        `SELECT st.name as shift_name, os.start_time, mt.name as material_name
          FROM operator_shifts os
-         JOIN production_lines pl ON os.line_id = pl.id
-         JOIN shift_types st ON os.shift_type_id = st.id
+         LEFT JOIN shift_types st ON os.shift_type_id = st.id
+         LEFT JOIN material_types mt ON os.material_type_id = mt.id
          WHERE os.id = $1`,
         [shiftId]
       );
 
       if (shiftInfo.rows.length === 0) {
-        return res.status(404).json({ success: false, message: 'Shift not found' });
+        return res.status(400).json({ success: false, message: 'Shift data incomplete.' });
       }
 
-      const { line_name, shift_name, start_time } = shiftInfo.rows[0];
+      const { shift_name, start_time, material_name } = shiftInfo.rows[0];
       const shiftDate = new Date(start_time);
       const year = shiftDate.getFullYear();
       const month = String(shiftDate.getMonth() + 1).padStart(2, '0');
       const date = String(shiftDate.getDate()).padStart(2, '0');
 
-      // Map Shift name to number (Shift 1 -> 1, Shift 2 -> 2, Shift 3 -> 3)
       const shiftMap = { 'Shift 1': '1', 'Shift 2': '2', 'Shift 3': '3' };
       const shiftNum = shiftMap[shift_name] || '1';
-      const lineNum = line_name.replace('Line ', '') || '1';
 
-      // Get Station Code
-      const stationResult = await pool.query('SELECT name FROM stations WHERE id = $1', [stationId]);
-      const stationName = stationResult.rows[0]?.name || 'Unknown';
-      const stationCodeMap = {
-        'Label Removal': 'LBL',
-        'Crusher': 'CRS',
-        'Washing': 'WSH',
-        'Extrusion': 'EXT',
-        'Final Packaging': 'PKG'
-      };
-      const stationCode = stationCodeMap[stationName] || 'UNK';
+      // Handle Sub-line for Crusher, Washing, and Extrusion
+      let finalStationCode = stationCode;
+      if (stationCode === 'CRS' && subLine) {
+        finalStationCode = subLine === '3E' ? 'C3E' : 'CRP';
+      } else if (stationCode === 'WSH' && subLine) {
+        if (subLine === 'Washing 1') finalStationCode = 'W1';
+        else if (subLine === 'Washing 2') finalStationCode = 'W2';
+        else if (subLine === 'Washing 3') finalStationCode = 'W3';
+      } else if ((stationCode === 'EXT' || stationCode === 'EXTR') && subLine) {
+        // Handle Extrusion sub-lines
+        if (subLine === 'Extrusion 1') finalStationCode = 'E1';
+        else if (subLine === 'Extrusion 2') finalStationCode = 'E2';
+        else if (subLine === 'Extrusion 3') finalStationCode = 'E3';
+      }
 
-      // Calculate Increment: Count logs for this Line, Shift Type, Station on this Date
-      // We look for all logs that belong to any shift session started on this same date for this line and shift type
+      // Count for increment
       const countResult = await pool.query(
         `SELECT COUNT(*) as count 
          FROM production_logs pl
          JOIN operator_shifts os ON pl.shift_id = os.id
-         WHERE os.line_id = (SELECT line_id FROM operator_shifts WHERE id = $1)
-           AND os.shift_type_id = (SELECT shift_type_id FROM operator_shifts WHERE id = $1)
+         WHERE os.shift_type_id = (SELECT shift_type_id FROM operator_shifts WHERE id = $1)
            AND pl.station_id = $2
            AND os.start_time::date = $3::date`,
         [shiftId, stationId, start_time]
       );
 
-      const increment = String(parseInt(countResult.rows[0].count) + 1).padStart(2, '0');
-      finalOutputBagQr = `${year} ${month} ${date} S ${shiftNum} ${lineNum} ${stationCode} ${increment}`;
+      const increment = String(parseInt(countResult.rows[0].count) + 1).padStart(3, '0');
+
+      // Proper QR format including Material Code, without line
+      const materialCode = material_name || 'PC';
+      finalOutputBagQr = `${year}${month}${date}-${materialCode}-S${shiftNum}-${finalStationCode}-${increment}`;
+    }
+
+    // Hardcode status to 'pending' for crusher, washing, and extrusion entries, use provided status for others
+    let finalStatus;
+    // Check both station code and name to ensure we catch crusher, washing, and extrusion entries
+    const isCrusher = stationCode === 'CRS' || stationName.toLowerCase().includes('crusher');
+    const isWashing = stationCode === 'WSH' || stationName.toLowerCase().includes('washing');
+    const isExtrusion = stationCode === 'EXT' || stationCode === 'EXTR' || stationName.toLowerCase().includes('extrusion');
+    if (isCrusher || isWashing || isExtrusion) {
+      // Always set to 'pending' for crusher, washing, and extrusion entries, regardless of what frontend sends
+      finalStatus = 'pending';
+    } else {
+      // Use provided status or default to 'Completed' for other stations
+      finalStatus = status || 'Completed';
     }
 
     const result = await pool.query(
-      `INSERT INTO production_logs (shift_id, station_id, input_bag_qr, output_bag_qr, weight, photo_url, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO production_logs (shift_id, station_id, material_type_id, input_bag_qr, output_bag_qr, weight, photo_url, status, sub_line)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
-      [shiftId, stationId, inputBagQr, finalOutputBagQr, weight, photoUrl, status || 'Completed']
+      [shiftId, stationId, materialTypeId, inputBagQr, finalOutputBagQr, weight, photoUrl, finalStatus, subLine]
     );
 
     res.json({ success: true, message: 'Log recorded successfully', data: result.rows[0] });
@@ -284,25 +449,102 @@ router.post('/by-products', authenticateToken, async (req, res) => {
   }
 });
 
-// 9. Search logs by output QR (for autocomplete)
-router.get('/search-logs', authenticateToken, async (req, res) => {
-  const { query, stationId, currentStationId } = req.query;
+// 9. Get all logs for a shift
+router.get('/logs/:shiftId', authenticateToken, async (req, res) => {
+  const { shiftId } = req.params;
   try {
-    let sql = `SELECT * FROM production_logs WHERE output_bag_qr ILIKE $1`;
-    const params = [`%${query}%` || ''];
-    let paramIndex = 1;
-    
-    // Filter by the source station (where the bags came from)
-    if (stationId) {
-      paramIndex++;
-      sql += ` AND station_id = $${paramIndex}`;
-      params.push(stationId);
+    const result = await pool.query(
+      'SELECT * FROM production_logs WHERE shift_id = $1 ORDER BY created_at DESC',
+      [shiftId]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Error fetching shift logs:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// 10. Search logs by output QR (for autocomplete)
+router.get('/search-logs', authenticateToken, async (req, res) => {
+  const { query, stationId, currentStationId, status } = req.query;
+  const materialTypeId = req.user.materialTypeId;
+
+  try {
+    // Determine target station and status based on current station context
+    let targetStationId = stationId;
+    let targetStatus = status;
+
+    // Always check currentStationId first to determine if we're searching from Washing or Extrusion station
+    if (currentStationId) {
+      const currentStationResult = await pool.query(
+        "SELECT code FROM stations WHERE id = $1 LIMIT 1",
+        [currentStationId]
+      );
+
+      if (currentStationResult.rows.length > 0) {
+        const currentStationCode = currentStationResult.rows[0].code;
+
+        // If current station is Washing, search for Crusher batches with pending status
+        if (currentStationCode === 'WSH') {
+          const crusherStationResult = await pool.query("SELECT id FROM stations WHERE code = 'CRS' LIMIT 1");
+          if (crusherStationResult.rows.length > 0) {
+            targetStationId = crusherStationResult.rows[0].id; // Override with Crusher station ID
+            targetStatus = targetStatus || 'pending'; // Default to 'pending' if not explicitly specified
+          }
+        }
+
+        // If current station is Extrusion, search for Washing batches with pending status
+        if (currentStationCode === 'EXT' || currentStationCode === 'EXTR') {
+          const washingStationResult = await pool.query("SELECT id FROM stations WHERE code = 'WSH' LIMIT 1");
+          if (washingStationResult.rows.length > 0) {
+            targetStationId = washingStationResult.rows[0].id; // Override with Washing station ID
+            targetStatus = targetStatus || 'pending'; // Default to 'pending' if not explicitly specified
+          }
+        }
+      }
     }
-    
+
+    // If status='pending' is explicitly requested and stationId is 2 or not provided, get Crusher station
+    // But only if we haven't already set targetStationId from the currentStationId check above
+    if (status === 'pending' && (!targetStationId || targetStationId === '2') && targetStationId !== 3) {
+      const crusherStationResult = await pool.query("SELECT id FROM stations WHERE code = 'CRS' LIMIT 1");
+      if (crusherStationResult.rows.length > 0) {
+        targetStationId = crusherStationResult.rows[0].id;
+      }
+    }
+
+    let sql = `SELECT pl.* FROM production_logs pl
+               JOIN operator_shifts os ON pl.shift_id = os.id
+               WHERE 1=1`;
+    const params = [];
+    let paramIndex = 0;
+
+    // Add search filter only if query is provided and not empty
+    if (query && query.trim().length > 0) {
+      paramIndex++;
+      sql += ` AND pl.output_bag_qr ILIKE $${paramIndex}`;
+      params.push(`%${query}%`);
+    }
+
+    // Filter by material type (Role)
+    if (materialTypeId) {
+      paramIndex++;
+      sql += ` AND os.material_type_id = $${paramIndex}`;
+      params.push(materialTypeId);
+    }
+
+    // Filter by the source station (where the bags came from)
+    // For washing, this should be Crusher station (CRS)
+    if (targetStationId) {
+      paramIndex++;
+      sql += ` AND pl.station_id = $${paramIndex}`;
+      params.push(targetStationId);
+    }
+
     // Exclude bags that are already processing at the current station
     if (currentStationId) {
       paramIndex++;
-      sql += ` AND output_bag_qr NOT IN (
+      sql += ` AND pl.output_bag_qr NOT IN (
         SELECT input_bag_qr FROM production_logs 
         WHERE station_id = $${paramIndex} 
         AND status = 'Processing' 
@@ -310,15 +552,423 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
       )`;
       params.push(currentStationId);
     }
-    
-    // Only show completed bags (not processing ones)
-    sql += ` AND status = 'Completed'`;
-    sql += ` ORDER BY created_at DESC LIMIT 10`;
-    
+
+    // Filter by status (e.g., 'pending' for washing to show only pending crusher batches)
+    // If status is provided, use it; otherwise default to 'Completed' for other stations
+    if (targetStatus) {
+      paramIndex++;
+      sql += ` AND pl.status = $${paramIndex}`;
+      params.push(targetStatus);
+    } else {
+      // Default to 'Completed' for stations other than washing
+      sql += ` AND pl.status = 'Completed'`;
+    }
+    sql += ` ORDER BY pl.created_at DESC LIMIT 20`;
+
     const result = await pool.query(sql, params);
     res.json({ success: true, data: result.rows });
   } catch (error) {
     console.error('Error searching logs:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// 10.5. Update production log status (e.g., mark crusher batch as completed when washing starts processing, or washing when extrusion starts)
+router.put('/update-log-status', authenticateToken, async (req, res) => {
+  const { outputBagQr, status, usedLine, washingLine, extrusionLine } = req.body;
+
+  if (!outputBagQr || !status) {
+    return res.status(400).json({ success: false, message: 'outputBagQr and status are required' });
+  }
+
+  try {
+    // Build update query dynamically based on provided fields
+    let updateFields = ['status = $1'];
+    let params = [status];
+    let paramIndex = 2;
+
+    // Add used_line if provided (prefer usedLine over washingLine for backward compatibility)
+    const finalUsedLine = usedLine || washingLine || extrusionLine;
+    if (finalUsedLine) {
+      updateFields.push(`used_line = $${paramIndex}`);
+      params.push(finalUsedLine);
+      paramIndex++;
+    }
+
+    params.push(outputBagQr); // outputBagQr is always the last parameter for WHERE clause
+
+    const result = await pool.query(
+      `UPDATE production_logs 
+       SET ${updateFields.join(', ')}
+       WHERE output_bag_qr = $${paramIndex}
+       RETURNING *`,
+      params
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Production log not found' });
+    }
+
+    res.json({ success: true, message: 'Status updated successfully', data: result.rows[0] });
+  } catch (error) {
+    console.error('Error updating log status:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// 11. Get crusher line logs with date filter, search, and pagination
+router.get('/crusher-logs', authenticateToken, async (req, res) => {
+  const { subLine, date, search, status, page = 1, limit = 10 } = req.query;
+  const materialTypeId = req.user.materialTypeId;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+
+  try {
+    // Get Crusher station ID (assuming ID 2)
+    const stationResult = await pool.query("SELECT id FROM stations WHERE code = 'CRS' LIMIT 1");
+    if (stationResult.rows.length === 0) {
+      return res.json({ success: true, data: [], pagination: { total: 0, page: 1, limit: 10, totalPages: 0 } });
+    }
+    const crusherStationId = stationResult.rows[0].id;
+
+    let sql = `SELECT pl.*, os.start_time, st.name as shift_name, mt.name as material_name
+               FROM production_logs pl
+               JOIN operator_shifts os ON pl.shift_id = os.id
+               LEFT JOIN shift_types st ON os.shift_type_id = st.id
+               LEFT JOIN material_types mt ON os.material_type_id = mt.id
+               WHERE pl.station_id = $1`;
+    const params = [crusherStationId];
+    let paramIndex = 1;
+
+    // Filter by material type (Role)
+    if (materialTypeId) {
+      paramIndex++;
+      sql += ` AND os.material_type_id = $${paramIndex}`;
+      params.push(materialTypeId);
+    }
+
+    // Filter by sub-line (3E or Rapid)
+    if (subLine) {
+      paramIndex++;
+      sql += ` AND pl.sub_line = $${paramIndex}`;
+      params.push(subLine);
+    }
+
+    // Filter by status (pending, processing, Completed)
+    if (status) {
+      paramIndex++;
+      sql += ` AND pl.status = $${paramIndex}`;
+      params.push(status);
+    }
+
+    // Filter by date (default to current date if not provided)
+    const targetDate = date || new Date().toISOString().split('T')[0];
+    paramIndex++;
+    sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
+    params.push(targetDate);
+
+    // Search filter (by QR code)
+    if (search) {
+      paramIndex++;
+      sql += ` AND pl.output_bag_qr ILIKE $${paramIndex}`;
+      params.push(`%${search}%`);
+    }
+
+    // Get total count for pagination (build count query separately)
+    let countSql = `SELECT COUNT(*) as total
+                    FROM production_logs pl
+                    JOIN operator_shifts os ON pl.shift_id = os.id
+                    WHERE pl.station_id = $1`;
+    const countParams = [crusherStationId];
+    let countParamIndex = 1;
+
+    if (materialTypeId) {
+      countParamIndex++;
+      countSql += ` AND os.material_type_id = $${countParamIndex}`;
+      countParams.push(materialTypeId);
+    }
+
+    if (subLine) {
+      countParamIndex++;
+      countSql += ` AND pl.sub_line = $${countParamIndex}`;
+      countParams.push(subLine);
+    }
+
+    if (status) {
+      countParamIndex++;
+      countSql += ` AND pl.status = $${countParamIndex}`;
+      countParams.push(status);
+    }
+
+    // Use the targetDate already declared above
+    countParamIndex++;
+    countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
+    countParams.push(targetDate);
+
+    if (search) {
+      countParamIndex++;
+      countSql += ` AND pl.output_bag_qr ILIKE $${countParamIndex}`;
+      countParams.push(`%${search}%`);
+    }
+
+    const countResult = await pool.query(countSql, countParams);
+    const total = parseInt(countResult.rows[0].total);
+
+    // Add ordering and pagination to main query
+    sql += ` ORDER BY pl.created_at DESC LIMIT $${paramIndex + 1} OFFSET $${paramIndex + 2}`;
+    params.push(parseInt(limit), offset);
+
+    const result = await pool.query(sql, params);
+
+    res.json({
+      success: true,
+      data: result.rows,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        totalPages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching crusher logs:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// 12. Get washing line logs with date filter, search, and pagination
+router.get('/washing-logs', authenticateToken, async (req, res) => {
+  const { subLine, date, search, status, page = 1, limit = 10 } = req.query;
+  const materialTypeId = req.user.materialTypeId;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+
+  try {
+    // Get Washing station ID from database by code
+    const stationResult = await pool.query("SELECT id FROM stations WHERE code = 'WSH' LIMIT 1");
+    if (stationResult.rows.length === 0) {
+      return res.json({ success: true, data: [], pagination: { total: 0, page: 1, limit: 10, totalPages: 0 } });
+    }
+    const washingStationId = stationResult.rows[0].id;
+
+    let sql = `SELECT pl.*, os.start_time, st.name as shift_name, mt.name as material_name
+               FROM production_logs pl
+               JOIN operator_shifts os ON pl.shift_id = os.id
+               LEFT JOIN shift_types st ON os.shift_type_id = st.id
+               LEFT JOIN material_types mt ON os.material_type_id = mt.id
+               WHERE pl.station_id = $1`;
+    const params = [washingStationId];
+    let paramIndex = 1;
+
+    // Filter by material type (Role)
+    if (materialTypeId) {
+      paramIndex++;
+      sql += ` AND os.material_type_id = $${paramIndex}`;
+      params.push(materialTypeId);
+    }
+
+    // Filter by sub-line (Washing 1, Washing 2, Washing 3)
+    if (subLine) {
+      paramIndex++;
+      sql += ` AND pl.sub_line = $${paramIndex}`;
+      params.push(subLine);
+    }
+
+    // Filter by status (pending, processing, Completed)
+    if (status) {
+      paramIndex++;
+      sql += ` AND pl.status = $${paramIndex}`;
+      params.push(status);
+    }
+
+    // Filter by date (default to current date if not provided)
+    const targetDate = date || new Date().toISOString().split('T')[0];
+    paramIndex++;
+    sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
+    params.push(targetDate);
+
+    // Search filter (by QR code)
+    if (search) {
+      paramIndex++;
+      sql += ` AND pl.output_bag_qr ILIKE $${paramIndex}`;
+      params.push(`%${search}%`);
+    }
+
+    // Get total count for pagination (build count query separately)
+    let countSql = `SELECT COUNT(*) as total
+                    FROM production_logs pl
+                    JOIN operator_shifts os ON pl.shift_id = os.id
+                    WHERE pl.station_id = $1`;
+    const countParams = [washingStationId];
+    let countParamIndex = 1;
+
+    if (materialTypeId) {
+      countParamIndex++;
+      countSql += ` AND os.material_type_id = $${countParamIndex}`;
+      countParams.push(materialTypeId);
+    }
+
+    if (subLine) {
+      countParamIndex++;
+      countSql += ` AND pl.sub_line = $${countParamIndex}`;
+      countParams.push(subLine);
+    }
+
+    if (status) {
+      countParamIndex++;
+      countSql += ` AND pl.status = $${countParamIndex}`;
+      countParams.push(status);
+    }
+
+    // Use the targetDate already declared above
+    countParamIndex++;
+    countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
+    countParams.push(targetDate);
+
+    if (search) {
+      countParamIndex++;
+      countSql += ` AND pl.output_bag_qr ILIKE $${countParamIndex}`;
+      countParams.push(`%${search}%`);
+    }
+
+    const countResult = await pool.query(countSql, countParams);
+    const total = parseInt(countResult.rows[0].total);
+
+    // Add ordering and pagination to main query
+    sql += ` ORDER BY pl.created_at DESC LIMIT $${paramIndex + 1} OFFSET $${paramIndex + 2}`;
+    params.push(parseInt(limit), offset);
+
+    const result = await pool.query(sql, params);
+
+    res.json({
+      success: true,
+      data: result.rows,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        totalPages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching washing logs:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// 13. Get extrusion line logs with date filter, search, and pagination
+router.get('/extrusion-logs', authenticateToken, async (req, res) => {
+  const { subLine, date, search, status, page = 1, limit = 10 } = req.query;
+  const materialTypeId = req.user.materialTypeId;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+
+  try {
+    // Get Extrusion station ID from database by code (try common codes)
+    const stationResult = await pool.query("SELECT id FROM stations WHERE code = 'EXT' OR code = 'EXTR' OR name ILIKE '%extrusion%' LIMIT 1");
+    if (stationResult.rows.length === 0) {
+      return res.json({ success: true, data: [], pagination: { total: 0, page: 1, limit: 10, totalPages: 0 } });
+    }
+    const extrusionStationId = stationResult.rows[0].id;
+
+    let sql = `SELECT pl.*, os.start_time, st.name as shift_name, mt.name as material_name
+               FROM production_logs pl
+               JOIN operator_shifts os ON pl.shift_id = os.id
+               LEFT JOIN shift_types st ON os.shift_type_id = st.id
+               LEFT JOIN material_types mt ON os.material_type_id = mt.id
+               WHERE pl.station_id = $1`;
+    const params = [extrusionStationId];
+    let paramIndex = 1;
+
+    // Filter by material type (Role)
+    if (materialTypeId) {
+      paramIndex++;
+      sql += ` AND os.material_type_id = $${paramIndex}`;
+      params.push(materialTypeId);
+    }
+
+    // Filter by sub-line (Extrusion 1, Extrusion 2, Extrusion 3)
+    if (subLine) {
+      paramIndex++;
+      sql += ` AND pl.sub_line = $${paramIndex}`;
+      params.push(subLine);
+    }
+
+    // Filter by status (pending, processing, Completed)
+    if (status) {
+      paramIndex++;
+      sql += ` AND pl.status = $${paramIndex}`;
+      params.push(status);
+    }
+
+    // Filter by date (default to current date if not provided)
+    const targetDate = date || new Date().toISOString().split('T')[0];
+    paramIndex++;
+    sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
+    params.push(targetDate);
+
+    // Search filter (by QR code)
+    if (search) {
+      paramIndex++;
+      sql += ` AND pl.output_bag_qr ILIKE $${paramIndex}`;
+      params.push(`%${search}%`);
+    }
+
+    // Get total count for pagination (build count query separately)
+    let countSql = `SELECT COUNT(*) as total
+                    FROM production_logs pl
+                    JOIN operator_shifts os ON pl.shift_id = os.id
+                    WHERE pl.station_id = $1`;
+    const countParams = [extrusionStationId];
+    let countParamIndex = 1;
+
+    if (materialTypeId) {
+      countParamIndex++;
+      countSql += ` AND os.material_type_id = $${countParamIndex}`;
+      countParams.push(materialTypeId);
+    }
+
+    if (subLine) {
+      countParamIndex++;
+      countSql += ` AND pl.sub_line = $${countParamIndex}`;
+      countParams.push(subLine);
+    }
+
+    if (status) {
+      countParamIndex++;
+      countSql += ` AND pl.status = $${countParamIndex}`;
+      countParams.push(status);
+    }
+
+    // Use the targetDate already declared above
+    countParamIndex++;
+    countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
+    countParams.push(targetDate);
+
+    if (search) {
+      countParamIndex++;
+      countSql += ` AND pl.output_bag_qr ILIKE $${countParamIndex}`;
+      countParams.push(`%${search}%`);
+    }
+
+    const countResult = await pool.query(countSql, countParams);
+    const total = parseInt(countResult.rows[0].total);
+
+    // Add ordering and pagination to main query
+    sql += ` ORDER BY pl.created_at DESC LIMIT $${paramIndex + 1} OFFSET $${paramIndex + 2}`;
+    params.push(parseInt(limit), offset);
+
+    const result = await pool.query(sql, params);
+
+    res.json({
+      success: true,
+      data: result.rows,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        totalPages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching extrusion logs:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 });

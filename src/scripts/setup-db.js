@@ -51,11 +51,22 @@ async function setupDatabase() {
         name VARCHAR(255) NOT NULL,
         email VARCHAR(255),
         role VARCHAR(50) DEFAULT 'employee',
+        material_type_id INTEGER,
         is_active BOOLEAN DEFAULT true,
+        last_login_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    
+    // Ensure last_login_at and material_type_id exist for existing tables
+    try {
+      await dbClient.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP');
+      await dbClient.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS material_type_id INTEGER');
+    } catch (e) {
+      console.warn('Could not update users table columns (might already exist)');
+    }
+    
     console.log('✅ Users table created/verified');
 
     // Create refresh_tokens table
