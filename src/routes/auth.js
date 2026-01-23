@@ -5,10 +5,12 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+console.log("inside auth 8 ");
 
 // Login endpoint
 router.post('/login', async (req, res) => {
   try {
+    console.log("inside auth 9 ");
     const { employeeId, password } = req.body;
 
     // Validate input

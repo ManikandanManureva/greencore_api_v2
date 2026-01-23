@@ -5,7 +5,7 @@ Backend API for Greencore Resources Indonesia - PC Production System
 ## Prerequisites
 
 - Node.js (v14 or higher)
-- PostgreSQL (v12 or higher)
+- postgresQL (v12 or higher)
 
 ## Installation
 
