@@ -5,6 +5,29 @@ async function initProductionSchema() {
   try {
     console.log('🚀 Initializing Production Database Schema for PC...');
 
+    // 0. Users table (required for foreign keys in operator_shifts)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        employee_id VARCHAR(50) UNIQUE NOT NULL,
+        password VARCHAR(255) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        email VARCHAR(255),
+        role VARCHAR(50) DEFAULT 'employee',
+        material_type_id INTEGER,
+        is_active BOOLEAN DEFAULT true,
+        last_login_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // Ensure last_login_at and material_type_id exist for existing tables
+    await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP');
+    await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS material_type_id INTEGER');
+    
+    console.log('✅ users table created/verified');
+
     // 1. Production Lines
     await client.query(`
       CREATE TABLE IF NOT EXISTS production_lines (
@@ -32,7 +55,6 @@ async function initProductionSchema() {
 
     // 3. Shift Types
     await client.query(`
-      DROP TABLE IF EXISTS production_lines CASCADE;
       CREATE TABLE IF NOT EXISTS shift_types (
         id SERIAL PRIMARY KEY,
         name VARCHAR(10) NOT NULL UNIQUE, -- A, B, C
