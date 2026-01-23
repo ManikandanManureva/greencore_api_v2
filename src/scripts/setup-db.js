@@ -5,9 +5,9 @@ require('dotenv').config();
 const dbConfig = {
   host: process.env.DB_HOST || 'localhost',
   port: process.env.DB_PORT || 3306,
-  user: process.env.DB_USER || 'postgres',
+  user: process.env.DB_USER || 'mysql',
   password: process.env.DB_PASSWORD || 'password',
-  database: 'postgres' // Connect to default postgres database first
+  database: 'mysql' // Connect to default mysql database first
 };
 
 async function setupDatabase() {
@@ -15,7 +15,7 @@ async function setupDatabase() {
   
   try {
     await client.connect();
-    console.log('✅ Connected to PostgreSQL');
+    console.log('✅ Connected to mysqlQL');
 
     // Create database if it doesn't exist
     const dbName = process.env.DB_NAME || 'greencorev2';

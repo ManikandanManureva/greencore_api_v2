@@ -5,7 +5,7 @@ Backend API for Greencore Resources Indonesia - PC Production System
 ## Prerequisites
 
 - Node.js (v14 or higher)
-- PostgreSQL (v12 or higher)
+- mysqlQL (v12 or higher)
 
 ## Installation
 
@@ -24,7 +24,7 @@ Edit `.env` file with your database credentials:
 DB_HOST=localhost
 DB_PORT=3306
 DB_NAME=greencorev2
-DB_USER=postgres
+DB_USER=mysql
 DB_PASSWORD=your_password
 JWT_SECRET=your_secret_key
 ```
