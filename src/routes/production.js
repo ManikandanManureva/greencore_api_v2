@@ -466,12 +466,14 @@ router.get('/logs/:shiftId', authenticateToken, async (req, res) => {
 
 // 10. Search logs by output QR (for autocomplete)
 router.get('/search-logs', authenticateToken, async (req, res) => {
-  const { query, stationId, currentStationId, status } = req.query;
+  const { query, stationId, targetStationId: targetStationIdParam, currentStationId, status } = req.query;
   const materialTypeId = req.user.materialTypeId;
 
   try {
-    // Determine target station and status based on current station context
-    let targetStationId = stationId;
+    // Support both targetStationId (frontend) and stationId (legacy). E.g. extrusion uses
+    // targetStationId=3&currentStationId=49&status=pending; final packing uses only
+    // query&currentStationId=50 (no targetStationId → "all station batch").
+    let targetStationId = targetStationIdParam || stationId;
     let targetStatus = status;
 
     // Always check currentStationId first to determine if we're searching from Washing or Extrusion station
@@ -504,9 +506,9 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
       }
     }
 
-    // If status='pending' is explicitly requested and stationId is 2 or not provided, get Crusher station
+    // If status='pending' is explicitly requested and target station is 2 or not provided, get Crusher station
     // But only if we haven't already set targetStationId from the currentStationId check above
-    if (status === 'pending' && (!targetStationId || targetStationId === '2') && targetStationId !== 3) {
+    if (status === 'pending' && (!targetStationId || String(targetStationId) === '2') && String(targetStationId) !== '3') {
       const crusherStationResult = await pool.query("SELECT id FROM stations WHERE code = 'CRS' LIMIT 1");
       if (crusherStationResult.rows.length > 0) {
         targetStationId = crusherStationResult.rows[0].id;
@@ -526,10 +528,11 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
       params.push(`%${query}%`);
     }
 
-    // Filter by material type (Role)
+    // Filter by material type (Role). Use COALESCE so logs with pl.material_type_id
+    // (or NULL) match when shift material type matches user.
     if (materialTypeId) {
       paramIndex++;
-      sql += ` AND os.material_type_id = $${paramIndex}`;
+      sql += ` AND COALESCE(pl.material_type_id, os.material_type_id) = $${paramIndex}`;
       params.push(materialTypeId);
     }
 
@@ -541,14 +544,16 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
       params.push(targetStationId);
     }
 
-    // Exclude bags that are already processing at the current station
+    // Exclude bags that are already processing at the current station.
+    // Use NOT EXISTS instead of NOT IN to avoid NULL edge cases.
     if (currentStationId) {
       paramIndex++;
-      sql += ` AND pl.output_bag_qr NOT IN (
-        SELECT input_bag_qr FROM production_logs 
-        WHERE station_id = $${paramIndex} 
-        AND status = 'Processing' 
-        AND input_bag_qr IS NOT NULL
+      sql += ` AND NOT EXISTS (
+        SELECT 1 FROM production_logs px
+        WHERE px.station_id = $${paramIndex}
+          AND px.status = 'Processing'
+          AND px.input_bag_qr IS NOT NULL
+          AND px.input_bag_qr = pl.output_bag_qr
       )`;
       params.push(currentStationId);
     }
@@ -564,6 +569,13 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
       sql += ` AND pl.status = 'Completed'`;
     }
     sql += ` ORDER BY pl.created_at DESC LIMIT 20`;
+
+    if (req.query.debug === '1') {
+      console.log('[search-logs] query params:', { query, targetStationId, currentStationId, status });
+      console.log('[search-logs] materialTypeId:', materialTypeId);
+      console.log('[search-logs] sql:', sql);
+      console.log('[search-logs] params:', params);
+    }
 
     const result = await pool.query(sql, params);
     res.json({ success: true, data: result.rows });
