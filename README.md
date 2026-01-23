@@ -22,7 +22,7 @@ cp .env.example .env
 Edit `.env` file with your database credentials:
 ```
 DB_HOST=localhost
-DB_PORT=5432
+DB_PORT=3306
 DB_NAME=greencorev2
 DB_USER=postgres
 DB_PASSWORD=your_password

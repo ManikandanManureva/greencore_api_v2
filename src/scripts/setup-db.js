@@ -4,7 +4,7 @@ require('dotenv').config();
 
 const dbConfig = {
   host: process.env.DB_HOST || 'localhost',
-  port: process.env.DB_PORT || 5432,
+  port: process.env.DB_PORT || 3306,
   user: process.env.DB_USER || 'postgres',
   password: process.env.DB_PASSWORD || 'password',
   database: 'postgres' // Connect to default postgres database first
