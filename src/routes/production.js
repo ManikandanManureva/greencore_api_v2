@@ -241,7 +241,15 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
     let finalStationCode = stationCode;
     let stationDisplayName = stationName;
     if (stationCode === 'CRS' && subLine) {
-      finalStationCode = subLine === '3E' ? 'C3E' : 'CRP';
+      if (subLine === '3E') {
+        finalStationCode = 'C3E';
+      } else if (subLine === 'Rapid') {
+        finalStationCode = 'CRP';
+      } else if (subLine === 'Betty') {
+        finalStationCode = 'CBT';
+      } else {
+        finalStationCode = 'CRP'; // Default fallback
+      }
       stationDisplayName = `${stationName}-${subLine}`;
     } else if (stationCode === 'WSH' && subLine) {
       if (subLine === 'Washing 1') {
@@ -265,6 +273,9 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
       } else if (subLine === 'Extrusion 3') {
         finalStationCode = 'E3';
         stationDisplayName = `${stationName}-E3`;
+      } else if (subLine === 'Mixture') {
+        finalStationCode = 'MIX';
+        stationDisplayName = `${stationName}-MIX`;
       }
     }
 
@@ -347,7 +358,15 @@ router.post('/log', authenticateToken, async (req, res) => {
       // Handle Sub-line for Crusher, Washing, and Extrusion
       let finalStationCode = stationCode;
       if (stationCode === 'CRS' && subLine) {
-        finalStationCode = subLine === '3E' ? 'C3E' : 'CRP';
+        if (subLine === '3E') {
+          finalStationCode = 'C3E';
+        } else if (subLine === 'Rapid') {
+          finalStationCode = 'CRP';
+        } else if (subLine === 'Betty') {
+          finalStationCode = 'CBT';
+        } else {
+          finalStationCode = 'CRP'; // Default fallback
+        }
       } else if (stationCode === 'WSH' && subLine) {
         if (subLine === 'Washing 1') finalStationCode = 'W1';
         else if (subLine === 'Washing 2') finalStationCode = 'W2';
@@ -357,6 +376,7 @@ router.post('/log', authenticateToken, async (req, res) => {
         if (subLine === 'Extrusion 1') finalStationCode = 'E1';
         else if (subLine === 'Extrusion 2') finalStationCode = 'E2';
         else if (subLine === 'Extrusion 3') finalStationCode = 'E3';
+        else if (subLine === 'Mixture') finalStationCode = 'MIX';
       }
 
       // Count for increment
@@ -415,7 +435,6 @@ router.post('/by-products', authenticateToken, async (req, res) => {
 
   const client = await pool.connect();
   try {
-    // Check if shift session exists
     const shiftResult = await client.query(
       'SELECT id FROM operator_shifts WHERE id = $1',
       [shiftId]
@@ -430,9 +449,9 @@ router.post('/by-products', authenticateToken, async (req, res) => {
 
     for (const item of byProducts) {
       await client.query(
-        `INSERT INTO by_product_logs (shift_id, station_id, name, weight)
-         VALUES ($1, $2, $3, $4)`,
-        [shiftId, item.stationId, item.name, item.weight]
+        `INSERT INTO by_product_logs (shift_id, station_id, name, weight, category)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [shiftId, item.stationId, item.name, item.weight, item.category || null]
       );
     }
 
@@ -444,6 +463,76 @@ router.post('/by-products', authenticateToken, async (req, res) => {
     }
     console.error('Error recording by-products:', error);
     res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// 8.1 Get by-products for a shift
+router.get('/shift/:shiftId/by-products', authenticateToken, async (req, res) => {
+  const { shiftId } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT b.id, b.shift_id, b.station_id, s.name AS station_name, b.name, b.category, b.weight
+       FROM by_product_logs b
+       LEFT JOIN stations s ON s.id = b.station_id
+       WHERE b.shift_id = $1
+       ORDER BY b.id`,
+      [shiftId]
+    );
+    const rows = result.rows.map((r) => ({
+      id: r.id,
+      shiftId: r.shift_id,
+      stationId: r.station_id,
+      stationName: r.station_name || '',
+      name: r.name,
+      category: r.category || '',
+      weight: Number(r.weight) || 0,
+    }));
+    res.json({ success: true, data: rows });
+  } catch (error) {
+    console.error('Error fetching by-products:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// 8.2 Update by-products for a shift (replace all)
+router.put('/shift/:shiftId/by-products', authenticateToken, async (req, res) => {
+  const { shiftId } = req.params;
+  const { byProducts } = req.body;
+
+  if (!Array.isArray(byProducts)) {
+    return res.status(400).json({ success: false, message: 'byProducts array required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    const shiftResult = await client.query(
+      'SELECT id FROM operator_shifts WHERE id = $1',
+      [shiftId]
+    );
+    if (shiftResult.rows.length === 0) {
+      client.release();
+      return res.status(404).json({ success: false, message: 'Shift not found' });
+    }
+
+    await client.query('BEGIN');
+    await client.query('DELETE FROM by_product_logs WHERE shift_id = $1', [shiftId]);
+
+    for (const item of byProducts) {
+      await client.query(
+        `INSERT INTO by_product_logs (shift_id, station_id, name, weight, category)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [shiftId, item.stationId, item.name, item.weight, item.category || null]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true, message: 'By-products updated successfully' });
+  } catch (error) {
+    if (client) await client.query('ROLLBACK');
+    console.error('Error updating by-products:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
   } finally {
     client.release();
   }
@@ -624,6 +713,38 @@ router.put('/update-log-status', authenticateToken, async (req, res) => {
     res.json({ success: true, message: 'Status updated successfully', data: result.rows[0] });
   } catch (error) {
     console.error('Error updating log status:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// 10.6. Update production log weight
+router.put('/update-log-weight', authenticateToken, async (req, res) => {
+  const { logId, weight } = req.body;
+
+  if (!logId || weight === undefined || weight === null) {
+    return res.status(400).json({ success: false, message: 'logId and weight are required' });
+  }
+
+  if (isNaN(weight) || weight < 0) {
+    return res.status(400).json({ success: false, message: 'Weight must be a valid positive number' });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE production_logs 
+       SET weight = $1
+       WHERE id = $2
+       RETURNING *`,
+      [weight, logId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Production log not found' });
+    }
+
+    res.json({ success: true, message: 'Weight updated successfully', data: result.rows[0] });
+  } catch (error) {
+    console.error('Error updating log weight:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 });

@@ -201,6 +201,10 @@ async function initProductionSchema() {
     `);
     console.log('✅ by_product_logs table created');
 
+    await client.query(`
+      ALTER TABLE by_product_logs ADD COLUMN IF NOT EXISTS category VARCHAR(100);
+    `);
+
     // --- SEED DATA ---
     console.log('🌱 Seeding initial data for PC...');
 
