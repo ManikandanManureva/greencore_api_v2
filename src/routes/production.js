@@ -153,9 +153,10 @@ router.get('/shift-status/:shiftId', authenticateToken, async (req, res) => {
   }
 });
 
-// 7. End a shift session
+// 7. End a shift session (optional: remark, waste[])
 router.post('/end-shift/:shiftId', authenticateToken, async (req, res) => {
   const { shiftId } = req.params;
+  const { remark, waste } = req.body || {};
   const userId = req.user.id;
 
   console.log(`Attempting to end shift ${shiftId} for user ${userId}`);
@@ -179,18 +180,36 @@ router.post('/end-shift/:shiftId', authenticateToken, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Shift is already ended' });
     }
 
-    // Now end the shift
+    // Now end the shift (save optional end_remark)
     const result = await pool.query(
       `UPDATE operator_shifts 
-       SET is_active = false, end_time = CURRENT_TIMESTAMP 
-       WHERE id = $1 AND user_id = $2 AND is_active = true
+       SET is_active = false, end_time = CURRENT_TIMESTAMP, end_remark = $1
+       WHERE id = $2 AND user_id = $3 AND is_active = true
        RETURNING *`,
-      [shiftId, userId]
+      [remark && String(remark).trim() ? String(remark).trim() : null, shiftId, userId]
     );
 
     if (result.rows.length === 0) {
       console.log(`Failed to end shift ${shiftId} - no rows updated`);
       return res.status(404).json({ success: false, message: 'Active shift not found' });
+    }
+
+    // Save waste entries (per machine, per section)
+    const wasteList = Array.isArray(waste) ? waste : [];
+    if (wasteList.length > 0) {
+      await pool.query('DELETE FROM shift_waste WHERE shift_id = $1', [shiftId]);
+      for (const row of wasteList) {
+        const stationId = row.stationId != null ? row.stationId : null;
+        const subLine = row.subLine != null ? String(row.subLine).trim() : '';
+        const wasteType = row.wasteType != null ? String(row.wasteType).trim() : '';
+        const weight = Number(row.weight);
+        if (!subLine || !wasteType || Number.isNaN(weight) || weight <= 0) continue;
+        await pool.query(
+          `INSERT INTO shift_waste (shift_id, station_id, sub_line, waste_type, weight)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [shiftId, stationId, subLine, wasteType, weight]
+        );
+      }
     }
 
     res.json({ success: true, message: 'Shift ended successfully', data: result.rows[0] });
@@ -312,7 +331,7 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
 
 // 7. Log production data
 router.post('/log', authenticateToken, async (req, res) => {
-  const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, status, subLine } = req.body;
+  const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, status, subLine, remark } = req.body;
   const materialTypeId = req.user.materialTypeId;
 
   try {
@@ -397,25 +416,23 @@ router.post('/log', authenticateToken, async (req, res) => {
       finalOutputBagQr = `${year}${month}${date}-${materialCode}-S${shiftNum}-${finalStationCode}-${increment}`;
     }
 
-    // Hardcode status to 'pending' for crusher, washing, and extrusion entries, use provided status for others
+    // Worker chooses status by jumbo bag type: temporary → pending, final → Completed
     let finalStatus;
-    // Check both station code and name to ensure we catch crusher, washing, and extrusion entries
     const isCrusher = stationCode === 'CRS' || stationName.toLowerCase().includes('crusher');
     const isWashing = stationCode === 'WSH' || stationName.toLowerCase().includes('washing');
     const isExtrusion = stationCode === 'EXT' || stationCode === 'EXTR' || stationName.toLowerCase().includes('extrusion');
     if (isCrusher || isWashing || isExtrusion) {
-      // Always set to 'pending' for crusher, washing, and extrusion entries, regardless of what frontend sends
-      finalStatus = 'pending';
+      // Use worker-selected status (pending = temporary jumbo bag, Completed = final jumbo bag) or default pending
+      finalStatus = (status === 'Completed' || status === 'completed') ? 'Completed' : 'pending';
     } else {
-      // Use provided status or default to 'Completed' for other stations
       finalStatus = status || 'Completed';
     }
 
     const result = await pool.query(
-      `INSERT INTO production_logs (shift_id, station_id, material_type_id, input_bag_qr, output_bag_qr, weight, photo_url, status, sub_line)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO production_logs (shift_id, station_id, material_type_id, input_bag_qr, output_bag_qr, weight, photo_url, status, sub_line, remark)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING *`,
-      [shiftId, stationId, materialTypeId, inputBagQr, finalOutputBagQr, weight, photoUrl, finalStatus, subLine]
+      [shiftId, stationId, materialTypeId, inputBagQr, finalOutputBagQr, weight, photoUrl, finalStatus, subLine, remark || null]
     );
 
     res.json({ success: true, message: 'Log recorded successfully', data: result.rows[0] });
@@ -535,6 +552,150 @@ router.put('/shift/:shiftId/by-products', authenticateToken, async (req, res) =>
     res.status(500).json({ success: false, message: 'Internal server error' });
   } finally {
     client.release();
+  }
+});
+
+// Helper: get Crusher, Washing, Extrusion station IDs
+async function getStationIdsByCode() {
+  const r = await pool.query(
+    "SELECT id, code, name FROM stations WHERE code IN ('CRS','WSH','EXT','EXTR') OR name ILIKE '%crusher%' OR name ILIKE '%washing%' OR name ILIKE '%extrusion%'"
+  );
+  const byCode = { crusher: null, washing: null, extrusion: null };
+  for (const row of r.rows) {
+    const code = (row.code || '').toUpperCase();
+    const name = (row.name || '').toLowerCase();
+    if (code === 'CRS' || name.includes('crusher')) byCode.crusher = row.id;
+    else if (code === 'WSH' || name.includes('washing')) byCode.washing = row.id;
+    else if ((code === 'EXT' || code === 'EXTR') || name.includes('extrusion')) byCode.extrusion = row.id;
+  }
+  return byCode;
+}
+
+// 8.3 List closed shifts (for PPIC: edit & print saved reports)
+router.get('/closed-shifts', authenticateToken, async (req, res) => {
+  const { limit = 30 } = req.query;
+  try {
+    const stationIds = await getStationIdsByCode();
+    const result = await pool.query(
+      `SELECT os.id, os.start_time, os.end_time, st.name AS shift_name, u.name AS operator_name
+       FROM operator_shifts os
+       LEFT JOIN shift_types st ON st.id = os.shift_type_id
+       LEFT JOIN users u ON u.id = os.user_id
+       WHERE os.is_active = false
+       ORDER BY os.end_time DESC NULLS LAST, os.start_time DESC
+       LIMIT $1`,
+      [Math.min(parseInt(limit, 10) || 30, 100)]
+    );
+    const list = await Promise.all(result.rows.map(async (row) => {
+      const byStation = { crusher: { outputs: 0, weight: '0.0' }, washing: { outputs: 0, weight: '0.0' }, extrusion: { outputs: 0, weight: '0.0' } };
+      for (const [key, stationId] of Object.entries(stationIds)) {
+        if (!stationId) continue;
+        const logs = await pool.query(
+          'SELECT COUNT(*) AS cnt, COALESCE(SUM(weight), 0) AS tot FROM production_logs WHERE shift_id = $1 AND station_id = $2',
+          [row.id, stationId]
+        );
+        byStation[key].outputs = parseInt(logs.rows[0]?.cnt || 0, 10);
+        byStation[key].weight = String(Number(logs.rows[0]?.tot || 0).toFixed(1));
+      }
+      const totalOutputs = byStation.crusher.outputs + byStation.washing.outputs + byStation.extrusion.outputs;
+      const totalWeight = (Number(byStation.crusher.weight) + Number(byStation.washing.weight) + Number(byStation.extrusion.weight)).toFixed(1);
+      return {
+        shiftId: row.id,
+        shiftName: row.shift_name || 'N/A',
+        operatorName: row.operator_name || 'N/A',
+        date: row.start_time ? new Date(row.start_time).toLocaleDateString() : '',
+        totalOutputs,
+        totalWeight,
+        byStation,
+      };
+    }));
+    res.json({ success: true, data: list });
+  } catch (error) {
+    console.error('Error listing closed shifts:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// 8.4 Get closed shift summary (for PPIC: load report to edit/print)
+router.get('/closed-shift/:shiftId/summary', authenticateToken, async (req, res) => {
+  const { shiftId } = req.params;
+  try {
+    const shiftRow = await pool.query(
+      `SELECT os.id, os.start_time, st.name AS shift_name, u.name AS operator_name, os.end_remark
+       FROM operator_shifts os
+       LEFT JOIN shift_types st ON st.id = os.shift_type_id
+       LEFT JOIN users u ON u.id = os.user_id
+       WHERE os.id = $1 AND os.is_active = false`,
+      [shiftId]
+    );
+    if (shiftRow.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Closed shift not found' });
+    }
+    const row = shiftRow.rows[0];
+    const stationIds = await getStationIdsByCode();
+    const byStation = { crusher: { outputs: 0, weight: '0.0' }, washing: { outputs: 0, weight: '0.0' }, extrusion: { outputs: 0, weight: '0.0' } };
+    for (const [key, stationId] of Object.entries(stationIds)) {
+      if (!stationId) continue;
+      const logs = await pool.query(
+        'SELECT COUNT(*) AS cnt, COALESCE(SUM(weight), 0) AS tot FROM production_logs WHERE shift_id = $1 AND station_id = $2',
+        [shiftId, stationId]
+      );
+      byStation[key].outputs = parseInt(logs.rows[0]?.cnt || 0, 10);
+      byStation[key].weight = String(Number(logs.rows[0]?.tot || 0).toFixed(1));
+    }
+    const totalOutputs = byStation.crusher.outputs + byStation.washing.outputs + byStation.extrusion.outputs;
+    const totalWeight = (Number(byStation.crusher.weight) + Number(byStation.washing.weight) + Number(byStation.extrusion.weight)).toFixed(1);
+    const byProductsRes = await pool.query(
+      `SELECT b.id, b.shift_id, b.station_id, s.name AS station_name, b.name, b.category, b.weight
+       FROM by_product_logs b
+       LEFT JOIN stations s ON s.id = b.station_id
+       WHERE b.shift_id = $1 ORDER BY b.id`,
+      [shiftId]
+    );
+    const byProducts = byProductsRes.rows.map((r) => ({
+      id: r.id,
+      shiftId: r.shift_id,
+      stationId: r.station_id,
+      stationName: r.station_name || '',
+      name: r.name,
+      category: r.category || '',
+      weight: Number(r.weight) || 0,
+    }));
+
+    const wasteRes = await pool.query(
+      `SELECT w.id, w.shift_id, w.station_id, s.name AS station_name, w.sub_line, w.waste_type, w.weight
+       FROM shift_waste w
+       LEFT JOIN stations s ON s.id = w.station_id
+       WHERE w.shift_id = $1 ORDER BY w.station_id, w.sub_line, w.waste_type`,
+      [shiftId]
+    );
+    const waste = wasteRes.rows.map((r) => ({
+      id: r.id,
+      shiftId: r.shift_id,
+      stationId: r.station_id,
+      stationName: r.station_name || '',
+      subLine: r.sub_line || '',
+      wasteType: r.waste_type || '',
+      weight: Number(r.weight) || 0,
+    }));
+
+    res.json({
+      success: true,
+      data: {
+        shift: row.shift_name || 'N/A',
+        operator: row.operator_name || 'N/A',
+        date: row.start_time ? new Date(row.start_time).toLocaleDateString() : '',
+        totalOutputs,
+        totalWeight,
+        byStation,
+        remark: row.end_remark || '',
+        byProducts,
+        waste,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching closed shift summary:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
   }
 });
 

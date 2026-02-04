@@ -21,11 +21,14 @@ async function initProductionSchema() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    
+
     // Ensure last_login_at and material_type_id exist for existing tables
     await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP');
     await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS material_type_id INTEGER');
-    
+
+    // End-shift report remark (worker version)
+    await client.query('ALTER TABLE operator_shifts ADD COLUMN IF NOT EXISTS end_remark TEXT');
+
     console.log('✅ users table created/verified');
 
     // 1. Production Lines
@@ -81,7 +84,7 @@ async function initProductionSchema() {
     await client.query(`
       ALTER TABLE stations ADD COLUMN IF NOT EXISTS code VARCHAR(10);
     `);
-    
+
     // Add unique constraint only if it doesn't exist
     await client.query(`
       DO $$
@@ -181,12 +184,17 @@ async function initProductionSchema() {
       DROP INDEX IF EXISTS idx_production_logs_main_line;
     `);
 
+    // Add remark column for worker version (optional note before save)
+    await client.query(`
+      ALTER TABLE production_logs ADD COLUMN IF NOT EXISTS remark TEXT;
+    `);
+
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_production_logs_material ON production_logs(material_type_id);
       CREATE INDEX IF NOT EXISTS idx_production_logs_qr ON production_logs(output_bag_qr);
       CREATE INDEX IF NOT EXISTS idx_production_logs_used_line ON production_logs(used_line);
     `);
-    console.log('✅ production_logs table updated with material tracking and used_line');
+    console.log('✅ production_logs table updated with material tracking, used_line and remark');
 
     // 7. By-product Logs
     await client.query(`
@@ -204,6 +212,23 @@ async function initProductionSchema() {
     await client.query(`
       ALTER TABLE by_product_logs ADD COLUMN IF NOT EXISTS category VARCHAR(100);
     `);
+
+    // 8. Shift waste (per machine, per section – worker input at end shift)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS shift_waste (
+        id SERIAL PRIMARY KEY,
+        shift_id INTEGER NOT NULL REFERENCES operator_shifts(id) ON DELETE CASCADE,
+        station_id INTEGER REFERENCES stations(id),
+        sub_line VARCHAR(50) NOT NULL,
+        waste_type VARCHAR(100) NOT NULL,
+        weight DECIMAL(10, 2) NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_shift_waste_shift_id ON shift_waste(shift_id);
+    `);
+    console.log('✅ shift_waste table created');
 
     // --- SEED DATA ---
     console.log('🌱 Seeding initial data for PC...');
@@ -262,7 +287,7 @@ async function initProductionSchema() {
     const matPC = await client.query("SELECT id FROM material_types WHERE name = 'PC'");
     const matPE = await client.query("SELECT id FROM material_types WHERE name = 'PE'");
     const matPET = await client.query("SELECT id FROM material_types WHERE name = 'PET'");
-    
+
     // Fetch newly created station IDs by their codes
     const stationMap = {};
     const stationsResult = await client.query("SELECT id, code FROM stations");
