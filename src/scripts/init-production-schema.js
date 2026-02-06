@@ -272,8 +272,8 @@ async function initProductionSchema() {
       ['Label Removal', 'LBL', 'Initial cleaning and label stripping', 1],
       ['Crusher', 'CRS', 'Bottle crushing into flakes', 2],
       ['Washing', 'WSH', 'Intensive flake washing', 3],
-      ['Extrusion', 'EXT', 'Melting and forming pellets', 4],
-      ['Final Packaging', 'PKG', 'Bagging and weighing', 5]
+      ['Extrusion & Packing', 'EXT', 'Melting and forming pellets', 4],
+      ['Re-packaging', 'PKG', 'Bagging and weighing', 5]
     ];
     for (const [name, code, desc, order] of stations) {
       await client.query(`

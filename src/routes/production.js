@@ -292,9 +292,9 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
       } else if (subLine === 'Extrusion 3') {
         finalStationCode = 'E3';
         stationDisplayName = `${stationName}-E3`;
-      } else if (subLine === 'Mixture') {
-        finalStationCode = 'MIX';
-        stationDisplayName = `${stationName}-MIX`;
+      } else if (subLine === 'SILO') {
+        finalStationCode = 'SILO';
+        stationDisplayName = `${stationName}-SILO`;
       }
     }
 
@@ -395,7 +395,7 @@ router.post('/log', authenticateToken, async (req, res) => {
         if (subLine === 'Extrusion 1') finalStationCode = 'E1';
         else if (subLine === 'Extrusion 2') finalStationCode = 'E2';
         else if (subLine === 'Extrusion 3') finalStationCode = 'E3';
-        else if (subLine === 'Mixture') finalStationCode = 'MIX';
+        else if (subLine === 'SILO') finalStationCode = 'SILO';
       }
 
       // Count for increment
@@ -1178,11 +1178,15 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
       params.push(materialTypeId);
     }
 
-    // Filter by sub-line (Extrusion 1, Extrusion 2, Extrusion 3)
+    // Filter by sub-line (Extrusion 1, Extrusion 2, Extrusion 3, SILO); SILO includes legacy 'Mixture'
     if (subLine) {
-      paramIndex++;
-      sql += ` AND pl.sub_line = $${paramIndex}`;
-      params.push(subLine);
+      if (subLine === 'SILO') {
+        sql += ` AND (pl.sub_line = 'SILO' OR pl.sub_line = 'Mixture')`;
+      } else {
+        paramIndex++;
+        sql += ` AND pl.sub_line = $${paramIndex}`;
+        params.push(subLine);
+      }
     }
 
     // Filter by status (pending, processing, Completed)
@@ -1220,9 +1224,13 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
     }
 
     if (subLine) {
-      countParamIndex++;
-      countSql += ` AND pl.sub_line = $${countParamIndex}`;
-      countParams.push(subLine);
+      if (subLine === 'SILO') {
+        countSql += ` AND (pl.sub_line = 'SILO' OR pl.sub_line = 'Mixture')`;
+      } else {
+        countParamIndex++;
+        countSql += ` AND pl.sub_line = $${countParamIndex}`;
+        countParams.push(subLine);
+      }
     }
 
     if (status) {
