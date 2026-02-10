@@ -26,9 +26,6 @@ async function initProductionSchema() {
     await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP');
     await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS material_type_id INTEGER');
 
-    // End-shift report remark (worker version)
-    await client.query('ALTER TABLE operator_shifts ADD COLUMN IF NOT EXISTS end_remark TEXT');
-
     console.log('✅ users table created/verified');
 
     // 1. Production Lines
@@ -123,7 +120,8 @@ async function initProductionSchema() {
       -- Index for finding active shifts quickly
       CREATE INDEX IF NOT EXISTS idx_operator_shifts_active ON operator_shifts(user_id, is_active) WHERE is_active = true;
     `);
-    console.log('✅ operator_shifts table created with performance index');
+    await client.query('ALTER TABLE operator_shifts ADD COLUMN IF NOT EXISTS end_remark TEXT');
+    console.log('✅ operator_shifts table created with performance index and end_remark');
 
     // 6. Production Logs
     await client.query(`

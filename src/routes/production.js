@@ -197,7 +197,12 @@ router.post('/end-shift/:shiftId', authenticateToken, async (req, res) => {
     res.json({ success: true, message: 'Shift ended successfully', data: result.rows[0] });
   } catch (error) {
     console.error('Error ending shift:', error);
-    res.status(500).json({ success: false, message: 'Internal server error' });
+    const isProd = process.env.NODE_ENV === 'production';
+    res.status(500).json({
+      success: false,
+      message: isProd ? 'Internal server error' : (error.message || 'Internal server error'),
+      ...(isProd ? {} : { error: error.message })
+    });
   }
 });
 
