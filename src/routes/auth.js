@@ -97,10 +97,11 @@ router.post('/login', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Login error:', error);
+    console.error('Login error:', error.message);
+    console.error('Login error stack:', error.stack);
     res.status(500).json({
       success: false,
-      message: 'Internal server error'
+      message: process.env.NODE_ENV === 'production' ? 'Internal server error' : (error.message || 'Internal server error')
     });
   }
 });

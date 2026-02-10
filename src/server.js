@@ -2,6 +2,11 @@ const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
 
+if (!process.env.JWT_SECRET || String(process.env.JWT_SECRET).trim() === '') {
+  console.error('FATAL: JWT_SECRET is not set in .env');
+  process.exit(1);
+}
+
 const authRoutes = require('./routes/auth');
 const productionRoutes = require('./routes/production');
 
@@ -20,6 +25,22 @@ app.get('/health', (req, res) => {
     message: 'Greencore API V2 is running',
     timestamp: new Date().toISOString()
   });
+});
+
+// Database health check (for debugging 500 on login)
+app.get('/health/db', async (req, res) => {
+  try {
+    const pool = require('./config/database');
+    await pool.query('SELECT 1');
+    res.json({ success: true, message: 'Database connection OK' });
+  } catch (err) {
+    console.error('Health DB error:', err.message);
+    res.status(500).json({
+      success: false,
+      message: 'Database connection failed',
+      error: process.env.NODE_ENV === 'production' ? undefined : err.message
+    });
+  }
 });
 
 // API Routes
