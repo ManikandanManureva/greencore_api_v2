@@ -8,6 +8,18 @@ require('dotenv').config();
 const pool = require('../config/database');
 
 const MIGRATIONS = [
+  {
+    name: 'refresh_tokens table',
+    sql: `CREATE TABLE IF NOT EXISTS refresh_tokens (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      token VARCHAR(500) UNIQUE NOT NULL,
+      expires_at TIMESTAMP NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      is_revoked BOOLEAN DEFAULT false
+    )`,
+  },
+  { name: 'refresh_tokens.is_revoked', sql: 'ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS is_revoked BOOLEAN DEFAULT false' },
   { name: 'operator_shifts.end_remark', sql: 'ALTER TABLE operator_shifts ADD COLUMN IF NOT EXISTS end_remark TEXT' },
   { name: 'by_product_logs.category', sql: 'ALTER TABLE by_product_logs ADD COLUMN IF NOT EXISTS category VARCHAR(100)' },
   { name: 'users.last_login_at', sql: 'ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP' },
