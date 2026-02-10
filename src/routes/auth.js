@@ -203,11 +203,15 @@ router.post('/logout', authenticateToken, async (req, res) => {
     const { refreshToken } = req.body;
 
     if (refreshToken) {
-      // Revoke refresh token
-      await pool.query(
-        'UPDATE refresh_tokens SET is_revoked = true WHERE token = $1',
-        [refreshToken]
-      );
+      try {
+        await pool.query(
+          'UPDATE refresh_tokens SET is_revoked = true WHERE token = $1',
+          [refreshToken]
+        );
+      } catch (dbErr) {
+        // Table/column may not exist on server; log but still succeed logout
+        console.warn('Logout: could not revoke refresh token (table may be missing):', dbErr.message);
+      }
     }
 
     res.json({
