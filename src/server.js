@@ -43,9 +43,11 @@ app.get('/health/db', async (req, res) => {
   }
 });
 
-// API Routes
+// API Routes (mount both so /auth and /api/auth work – app uses /auth on EC2, /api/auth on localhost)
 app.use('/api/auth', authRoutes);
+app.use('/auth', authRoutes);
 app.use('/api/production', productionRoutes);
+app.use('/production', productionRoutes);
 
 // 404 handler
 app.use((req, res) => {
