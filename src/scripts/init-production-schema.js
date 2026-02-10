@@ -213,23 +213,6 @@ async function initProductionSchema() {
       ALTER TABLE by_product_logs ADD COLUMN IF NOT EXISTS category VARCHAR(100);
     `);
 
-    // 8. Shift waste (per machine, per section – worker input at end shift)
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS shift_waste (
-        id SERIAL PRIMARY KEY,
-        shift_id INTEGER NOT NULL REFERENCES operator_shifts(id) ON DELETE CASCADE,
-        station_id INTEGER REFERENCES stations(id),
-        sub_line VARCHAR(50) NOT NULL,
-        waste_type VARCHAR(100) NOT NULL,
-        weight DECIMAL(10, 2) NOT NULL DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_shift_waste_shift_id ON shift_waste(shift_id);
-    `);
-    console.log('✅ shift_waste table created');
-
     // --- SEED DATA ---
     console.log('🌱 Seeding initial data for PC...');
 
@@ -272,8 +255,8 @@ async function initProductionSchema() {
       ['Label Removal', 'LBL', 'Initial cleaning and label stripping', 1],
       ['Crusher', 'CRS', 'Bottle crushing into flakes', 2],
       ['Washing', 'WSH', 'Intensive flake washing', 3],
-      ['Extrusion & Packing', 'EXT', 'Melting and forming pellets', 4],
-      ['Re-packaging', 'PKG', 'Bagging and weighing', 5]
+      ['Extrusion', 'EXT', 'Melting and forming pellets', 4],
+      ['Final Packaging', 'PKG', 'Bagging and weighing', 5]
     ];
     for (const [name, code, desc, order] of stations) {
       await client.query(`

@@ -153,10 +153,10 @@ router.get('/shift-status/:shiftId', authenticateToken, async (req, res) => {
   }
 });
 
-// 7. End a shift session (optional: remark, waste[])
+// 7. End a shift session
 router.post('/end-shift/:shiftId', authenticateToken, async (req, res) => {
   const { shiftId } = req.params;
-  const { remark, waste } = req.body || {};
+  const { remark } = req.body || {};
   const userId = req.user.id;
 
   console.log(`Attempting to end shift ${shiftId} for user ${userId}`);
@@ -192,24 +192,6 @@ router.post('/end-shift/:shiftId', authenticateToken, async (req, res) => {
     if (result.rows.length === 0) {
       console.log(`Failed to end shift ${shiftId} - no rows updated`);
       return res.status(404).json({ success: false, message: 'Active shift not found' });
-    }
-
-    // Save waste entries (per machine, per section)
-    const wasteList = Array.isArray(waste) ? waste : [];
-    if (wasteList.length > 0) {
-      await pool.query('DELETE FROM shift_waste WHERE shift_id = $1', [shiftId]);
-      for (const row of wasteList) {
-        const stationId = row.stationId != null ? row.stationId : null;
-        const subLine = row.subLine != null ? String(row.subLine).trim() : '';
-        const wasteType = row.wasteType != null ? String(row.wasteType).trim() : '';
-        const weight = Number(row.weight);
-        if (!subLine || !wasteType || Number.isNaN(weight) || weight <= 0) continue;
-        await pool.query(
-          `INSERT INTO shift_waste (shift_id, station_id, sub_line, waste_type, weight)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [shiftId, stationId, subLine, wasteType, weight]
-        );
-      }
     }
 
     res.json({ success: true, message: 'Shift ended successfully', data: result.rows[0] });
@@ -292,9 +274,9 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
       } else if (subLine === 'Extrusion 3') {
         finalStationCode = 'E3';
         stationDisplayName = `${stationName}-E3`;
-      } else if (subLine === 'SILO') {
-        finalStationCode = 'SILO';
-        stationDisplayName = `${stationName}-SILO`;
+      } else if (subLine === 'Mixture') {
+        finalStationCode = 'MIX';
+        stationDisplayName = `${stationName}-MIX`;
       }
     }
 
@@ -395,7 +377,7 @@ router.post('/log', authenticateToken, async (req, res) => {
         if (subLine === 'Extrusion 1') finalStationCode = 'E1';
         else if (subLine === 'Extrusion 2') finalStationCode = 'E2';
         else if (subLine === 'Extrusion 3') finalStationCode = 'E3';
-        else if (subLine === 'SILO') finalStationCode = 'SILO';
+        else if (subLine === 'Mixture') finalStationCode = 'MIX';
       }
 
       // Count for increment
@@ -661,24 +643,6 @@ router.get('/closed-shift/:shiftId/summary', authenticateToken, async (req, res)
       category: r.category || '',
       weight: Number(r.weight) || 0,
     }));
-
-    const wasteRes = await pool.query(
-      `SELECT w.id, w.shift_id, w.station_id, s.name AS station_name, w.sub_line, w.waste_type, w.weight
-       FROM shift_waste w
-       LEFT JOIN stations s ON s.id = w.station_id
-       WHERE w.shift_id = $1 ORDER BY w.station_id, w.sub_line, w.waste_type`,
-      [shiftId]
-    );
-    const waste = wasteRes.rows.map((r) => ({
-      id: r.id,
-      shiftId: r.shift_id,
-      stationId: r.station_id,
-      stationName: r.station_name || '',
-      subLine: r.sub_line || '',
-      wasteType: r.waste_type || '',
-      weight: Number(r.weight) || 0,
-    }));
-
     res.json({
       success: true,
       data: {
@@ -690,7 +654,6 @@ router.get('/closed-shift/:shiftId/summary', authenticateToken, async (req, res)
         byStation,
         remark: row.end_remark || '',
         byProducts,
-        waste,
       },
     });
   } catch (error) {
@@ -1178,15 +1141,11 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
       params.push(materialTypeId);
     }
 
-    // Filter by sub-line (Extrusion 1, Extrusion 2, Extrusion 3, SILO); SILO includes legacy 'Mixture'
+    // Filter by sub-line (Extrusion 1, Extrusion 2, Extrusion 3)
     if (subLine) {
-      if (subLine === 'SILO') {
-        sql += ` AND (pl.sub_line = 'SILO' OR pl.sub_line = 'Mixture')`;
-      } else {
-        paramIndex++;
-        sql += ` AND pl.sub_line = $${paramIndex}`;
-        params.push(subLine);
-      }
+      paramIndex++;
+      sql += ` AND pl.sub_line = $${paramIndex}`;
+      params.push(subLine);
     }
 
     // Filter by status (pending, processing, Completed)
@@ -1224,13 +1183,9 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
     }
 
     if (subLine) {
-      if (subLine === 'SILO') {
-        countSql += ` AND (pl.sub_line = 'SILO' OR pl.sub_line = 'Mixture')`;
-      } else {
-        countParamIndex++;
-        countSql += ` AND pl.sub_line = $${countParamIndex}`;
-        countParams.push(subLine);
-      }
+      countParamIndex++;
+      countSql += ` AND pl.sub_line = $${countParamIndex}`;
+      countParams.push(subLine);
     }
 
     if (status) {
