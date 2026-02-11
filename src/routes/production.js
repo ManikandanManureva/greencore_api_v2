@@ -586,11 +586,12 @@ router.get('/closed-shifts', authenticateToken, async (req, res) => {
       }
       const totalOutputs = byStation.crusher.outputs + byStation.washing.outputs + byStation.extrusion.outputs;
       const totalWeight = (Number(byStation.crusher.weight) + Number(byStation.washing.weight) + Number(byStation.extrusion.weight)).toFixed(1);
+      const dateStr = row.start_time ? new Date(row.start_time).toLocaleDateString() : '';
       return {
         shiftId: row.id,
-        shiftName: row.shift_name || 'N/A',
+        shiftName: (row.shift_name && String(row.shift_name).trim()) ? String(row.shift_name).trim() : 'Shift',
         operatorName: row.operator_name || 'N/A',
-        date: row.start_time ? new Date(row.start_time).toLocaleDateString() : '',
+        date: dateStr,
         totalOutputs,
         totalWeight,
         byStation,
