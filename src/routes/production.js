@@ -55,7 +55,8 @@ router.get('/stations', authenticateToken, async (req, res) => {
 
 // 5. Start a shift session
 router.post('/start-shift', authenticateToken, async (req, res) => {
-  const { shiftTypeId } = req.body;
+  // Support both { shiftTypeId } and { lineId } (frontend may send selectedShift.id as lineId only)
+  const shiftTypeId = req.body.shiftTypeId ?? req.body.lineId;
   const userId = req.user.id;
   const materialTypeId = req.user.materialTypeId;
 
@@ -64,6 +65,10 @@ router.post('/start-shift', authenticateToken, async (req, res) => {
       success: false,
       message: 'User does not have an assigned material role (PC, PE, PET). Please contact administrator.'
     });
+  }
+
+  if (shiftTypeId == null || shiftTypeId === '') {
+    return res.status(400).json({ success: false, message: 'shiftTypeId or lineId is required' });
   }
 
   try {
@@ -85,7 +90,7 @@ router.post('/start-shift', authenticateToken, async (req, res) => {
       `INSERT INTO operator_shifts (user_id, shift_type_id, material_type_id, is_active)
        VALUES ($1, $2, $3, true)
        RETURNING *`,
-      [userId, shiftTypeId, materialTypeId]
+      [userId, Number(shiftTypeId), materialTypeId]
     );
 
     res.json({ success: true, message: 'Shift started successfully', data: result.rows[0] });
@@ -209,15 +214,15 @@ router.post('/end-shift/:shiftId', authenticateToken, async (req, res) => {
 // 6.5 GET next available QR code (for preview before saving)
 router.get('/next-qr', authenticateToken, async (req, res) => {
   try {
-    const { stationId, shiftId, subLine } = req.query; // subLine: '3E' or 'Rapid'
+    const { stationId, shiftId, subLine, shiftTypeId: shiftTypeIdParam } = req.query; // shiftTypeId from frontend when DB has null
 
     if (!stationId || !shiftId) {
       return res.status(400).json({ success: false, message: 'stationId and shiftId are required' });
     }
 
-    // Get shift details
+    // Get shift details (use shift_type_id for correct S1/S2/S3 in QR)
     const shiftInfo = await pool.query(
-      `SELECT st.name as shift_name, os.start_time, mt.name as material_name
+      `SELECT os.shift_type_id, st.name as shift_name, os.start_time, mt.name as material_name
        FROM operator_shifts os
        LEFT JOIN shift_types st ON os.shift_type_id = st.id
        LEFT JOIN material_types mt ON os.material_type_id = mt.id
@@ -229,14 +234,37 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Shift not found.' });
     }
 
-    const { shift_name, start_time, material_name } = shiftInfo.rows[0];
+    const row = shiftInfo.rows[0];
+    const shift_type_id = row.shift_type_id != null ? Number(row.shift_type_id) : null;
+    const shift_name = row.shift_name;
+    const start_time = row.start_time;
+    const material_name = row.material_name;
+
     const shiftDate = new Date(start_time);
     const year = shiftDate.getFullYear();
     const month = String(shiftDate.getMonth() + 1).padStart(2, '0');
     const date = String(shiftDate.getDate()).padStart(2, '0');
 
+    // S1/S2/S3: prefer DB shift_type_id, then frontend shiftTypeId (for old sessions with null), then shift name map
+    console.log('DEBUG next-qr: shift_type_id from DB:', shift_type_id, 'shiftTypeIdParam from frontend:', shiftTypeIdParam, 'shift_name:', shift_name);
     const shiftMap = { 'Shift 1': '1', 'Shift 2': '2', 'Shift 3': '3' };
-    const shiftNum = shiftMap[shift_name] || '1';
+    let shiftNum = '1';
+    if (shift_type_id >= 1 && shift_type_id <= 3) {
+      shiftNum = String(shift_type_id);
+      console.log('DEBUG: Using DB shift_type_id:', shift_type_id, '-> shiftNum:', shiftNum);
+    } else if (shiftTypeIdParam != null && shiftTypeIdParam !== '') {
+      const t = Number(shiftTypeIdParam);
+      if (t >= 1 && t <= 3) {
+        shiftNum = String(t);
+        console.log('DEBUG: Using frontend shiftTypeIdParam:', shiftTypeIdParam, '-> shiftNum:', shiftNum);
+      } else {
+        shiftNum = shiftMap[String(shift_name || '').trim()] || '1';
+        console.log('DEBUG: Using shift_name fallback:', shift_name, '-> shiftNum:', shiftNum);
+      }
+    } else {
+      shiftNum = shiftMap[String(shift_name || '').trim()] || '1';
+      console.log('DEBUG: Using shift_name fallback (no param):', shift_name, '-> shiftNum:', shiftNum);
+    }
 
     // Get Station Code and Name from DB
     const stationResult = await pool.query('SELECT code, name FROM stations WHERE id = $1', [stationId]);
@@ -268,8 +296,8 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
         finalStationCode = 'W3';
         stationDisplayName = `${stationName}-W3`;
       }
-    } else if ((stationCode === 'EXT' || stationCode === 'EXTR') && subLine) {
-      // Handle Extrusion sub-lines
+    } else if ((stationCode === 'EXT' || stationCode === 'EXTR' || (stationName && String(stationName).toLowerCase().includes('extrusion'))) && subLine) {
+      // Handle Extrusion sub-lines (by code or by station name)
       if (subLine === 'Extrusion 1') {
         finalStationCode = 'E1';
         stationDisplayName = `${stationName}-E1`;
@@ -292,10 +320,11 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
        WHERE station_id = $1 AND created_at >= CURRENT_DATE`,
       [stationId]
     );
-    const increment = String(parseInt(countResult.rows[0].count) + 1).padStart(3, '0');
-    const materialCode = material_name || 'XX';
+    const increment = String(parseInt(countResult.rows[0].count, 10) + 1).padStart(3, '0');
+    const materialCode = (material_name && String(material_name).trim()) || 'PC';
+    const safeStationCode = (finalStationCode && String(finalStationCode).trim()) || stationCode || 'UNK';
 
-    const nextQr = `${year}${month}${date}-${materialCode}-S${shiftNum}-${finalStationCode}-${increment}`;
+    const nextQr = `${year}${month}${date}-${materialCode}-S${shiftNum}-${safeStationCode}-${increment}`;
 
     res.json({
       success: true,
@@ -318,7 +347,7 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
 
 // 7. Log production data
 router.post('/log', authenticateToken, async (req, res) => {
-  const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, status, subLine, remark } = req.body;
+    const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, status, subLine, remark, shiftTypeId: shiftTypeIdBody } = req.body;
   const materialTypeId = req.user.materialTypeId;
 
   try {
@@ -340,7 +369,7 @@ router.post('/log', authenticateToken, async (req, res) => {
     // If outputBagQr is not provided, generate it
     if (!finalOutputBagQr) {
       const shiftInfo = await pool.query(
-        `SELECT st.name as shift_name, os.start_time, mt.name as material_name
+        `SELECT os.shift_type_id, st.name as shift_name, os.start_time, mt.name as material_name
          FROM operator_shifts os
          LEFT JOIN shift_types st ON os.shift_type_id = st.id
          LEFT JOIN material_types mt ON os.material_type_id = mt.id
@@ -352,14 +381,26 @@ router.post('/log', authenticateToken, async (req, res) => {
         return res.status(400).json({ success: false, message: 'Shift data incomplete.' });
       }
 
-      const { shift_name, start_time, material_name } = shiftInfo.rows[0];
+      const row = shiftInfo.rows[0];
+      const shift_type_id = row.shift_type_id != null ? Number(row.shift_type_id) : null;
+      const shift_name = row.shift_name;
+      const start_time = row.start_time;
+      const material_name = row.material_name;
       const shiftDate = new Date(start_time);
       const year = shiftDate.getFullYear();
       const month = String(shiftDate.getMonth() + 1).padStart(2, '0');
       const date = String(shiftDate.getDate()).padStart(2, '0');
 
       const shiftMap = { 'Shift 1': '1', 'Shift 2': '2', 'Shift 3': '3' };
-      const shiftNum = shiftMap[shift_name] || '1';
+      let shiftNum = '1';
+      if (shift_type_id >= 1 && shift_type_id <= 3) {
+        shiftNum = String(shift_type_id);
+      } else if (shiftTypeIdBody != null && shiftTypeIdBody !== '') {
+        const t = Number(shiftTypeIdBody);
+        shiftNum = (t >= 1 && t <= 3) ? String(t) : (shiftMap[String(shift_name || '').trim()] || '1');
+      } else {
+        shiftNum = shiftMap[String(shift_name || '').trim()] || '1';
+      }
 
       // Handle Sub-line for Crusher, Washing, and Extrusion
       let finalStationCode = stationCode;
@@ -377,8 +418,7 @@ router.post('/log', authenticateToken, async (req, res) => {
         if (subLine === 'Washing 1') finalStationCode = 'W1';
         else if (subLine === 'Washing 2') finalStationCode = 'W2';
         else if (subLine === 'Washing 3') finalStationCode = 'W3';
-      } else if ((stationCode === 'EXT' || stationCode === 'EXTR') && subLine) {
-        // Handle Extrusion sub-lines
+      } else if ((stationCode === 'EXT' || stationCode === 'EXTR' || (stationName && String(stationName).toLowerCase().includes('extrusion'))) && subLine) {
         if (subLine === 'Extrusion 1') finalStationCode = 'E1';
         else if (subLine === 'Extrusion 2') finalStationCode = 'E2';
         else if (subLine === 'Extrusion 3') finalStationCode = 'E3';
@@ -559,20 +599,35 @@ async function getStationIdsByCode() {
 }
 
 // 8.3 List closed shifts (for PPIC: edit & print saved reports)
+// Query params: limit (default 30), date (YYYY-MM-DD), shiftTypeId (1, 2, 3)
 router.get('/closed-shifts', authenticateToken, async (req, res) => {
-  const { limit = 30 } = req.query;
+  const { limit = 30, date: dateFilter } = req.query;
+  // Support both shiftTypeId and shifttypeid (some runtimes lowercase query keys)
+  const shiftTypeIdFilter = req.query.shiftTypeId ?? req.query.shifttypeid;
   try {
     const stationIds = await getStationIdsByCode();
-    const result = await pool.query(
-      `SELECT os.id, os.start_time, os.end_time, st.name AS shift_name, u.name AS operator_name
+    const shiftTypeNum = shiftTypeIdFilter != null && shiftTypeIdFilter !== '' ? Number(shiftTypeIdFilter) : NaN;
+    const filterByShift = !Number.isNaN(shiftTypeNum) && [1, 2, 3].includes(shiftTypeNum);
+    let sql = `SELECT os.id, os.start_time, os.end_time, st.name AS shift_name, u.name AS operator_name
        FROM operator_shifts os
        LEFT JOIN shift_types st ON st.id = os.shift_type_id
        LEFT JOIN users u ON u.id = os.user_id
-       WHERE os.is_active = false
-       ORDER BY os.end_time DESC NULLS LAST, os.start_time DESC
-       LIMIT $1`,
-      [Math.min(parseInt(limit, 10) || 30, 100)]
-    );
+       WHERE os.is_active = false`;
+    const params = [];
+    if (dateFilter && /^\d{4}-\d{2}-\d{2}$/.test(String(dateFilter).trim())) {
+      params.push(String(dateFilter).trim());
+      sql += ` AND os.start_time::date = $${params.length}::date`;
+    }
+    if (filterByShift) {
+      params.push(shiftTypeNum);
+      sql += ` AND os.shift_type_id = $${params.length}`;
+    }
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('closed-shifts query params: dateFilter=', dateFilter, 'shiftTypeIdFilter=', shiftTypeIdFilter, 'filterByShift=', filterByShift, 'params=', params);
+    }
+    sql += ` ORDER BY os.end_time DESC NULLS LAST, os.start_time DESC LIMIT $${params.length + 1}`;
+    params.push(Math.min(parseInt(limit, 10) || 30, 100));
+    const result = await pool.query(sql, params);
     const list = await Promise.all(result.rows.map(async (row) => {
       const byStation = { crusher: { outputs: 0, weight: '0.0' }, washing: { outputs: 0, weight: '0.0' }, extrusion: { outputs: 0, weight: '0.0' } };
       for (const [key, stationId] of Object.entries(stationIds)) {
@@ -664,6 +719,29 @@ router.get('/closed-shift/:shiftId/summary', authenticateToken, async (req, res)
     });
   } catch (error) {
     console.error('Error fetching closed shift summary:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// 8.5 PPIC: Update closed shift remark (edit any data from PC production)
+router.put('/closed-shift/:shiftId/remark', authenticateToken, async (req, res) => {
+  const { shiftId } = req.params;
+  const { remark } = req.body || {};
+  try {
+    const check = await pool.query(
+      'SELECT id FROM operator_shifts WHERE id = $1 AND is_active = false',
+      [shiftId]
+    );
+    if (check.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Closed shift not found' });
+    }
+    await pool.query(
+      'UPDATE operator_shifts SET end_remark = $1 WHERE id = $2 AND is_active = false',
+      [typeof remark === 'string' ? remark : '', shiftId]
+    );
+    res.json({ success: true, message: 'Remark updated' });
+  } catch (error) {
+    console.error('Error updating closed shift remark:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 });
