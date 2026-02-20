@@ -601,36 +601,89 @@ async function getStationIdsByCode() {
 // 8.3 List closed shifts (for PPIC: edit & print saved reports)
 // Query params: limit (default 30), date (YYYY-MM-DD), shiftTypeId (1, 2, 3)
 router.get('/closed-shifts', authenticateToken, async (req, res) => {
-  const { limit = 30, date: dateFilter } = req.query;
-  // Support both shiftTypeId and shifttypeid (some runtimes lowercase query keys)
+  // Legacy single-date param kept for backward compat; new params take precedence
+  const {
+    limit = 10, page = 1,
+    date: dateFilterLegacy,
+    date_start, date_end,
+    shift_type, material_type, operator,
+  } = req.query;
+  // Legacy shiftTypeId filter (mobile app)
   const shiftTypeIdFilter = req.query.shiftTypeId ?? req.query.shifttypeid;
   try {
     const stationIds = await getStationIdsByCode();
-    const shiftTypeNum = shiftTypeIdFilter != null && shiftTypeIdFilter !== '' ? Number(shiftTypeIdFilter) : NaN;
-    const filterByShift = !Number.isNaN(shiftTypeNum) && [1, 2, 3].includes(shiftTypeNum);
-    let sql = `SELECT os.id, os.start_time, os.end_time, st.name AS shift_name, u.name AS operator_name, mt.name AS material_type_name
+    const params = [];
+    const conds = ['os.is_active = false'];
+
+    // Date range (new API)
+    if (date_start && /^\d{4}-\d{2}-\d{2}$/.test(String(date_start).trim())) {
+      params.push(String(date_start).trim());
+      conds.push(`os.start_time::date >= $${params.length}::date`);
+    } else if (dateFilterLegacy && /^\d{4}-\d{2}-\d{2}$/.test(String(dateFilterLegacy).trim())) {
+      params.push(String(dateFilterLegacy).trim());
+      conds.push(`os.start_time::date = $${params.length}::date`);
+    }
+    if (date_end && /^\d{4}-\d{2}-\d{2}$/.test(String(date_end).trim())) {
+      params.push(String(date_end).trim());
+      conds.push(`os.start_time::date <= $${params.length}::date`);
+    }
+    // Shift type by name (new) or by ID (legacy)
+    if (shift_type && shift_type !== 'all') {
+      params.push(String(shift_type).trim());
+      conds.push(`st.name = $${params.length}`);
+    } else {
+      const shiftTypeNum = shiftTypeIdFilter != null && shiftTypeIdFilter !== '' ? Number(shiftTypeIdFilter) : NaN;
+      if (!Number.isNaN(shiftTypeNum) && [1,2,3].includes(shiftTypeNum)) {
+        params.push(shiftTypeNum);
+        conds.push(`os.shift_type_id = $${params.length}`);
+      }
+    }
+    // Material type by name
+    if (material_type && material_type !== 'all') {
+      params.push(String(material_type).trim());
+      conds.push(`mt.name = $${params.length}`);
+    }
+    // Operator name search
+    if (operator && String(operator).trim().length > 0) {
+      params.push(`%${String(operator).trim()}%`);
+      conds.push(`u.name ILIKE $${params.length}`);
+    }
+
+    const where = conds.join(' AND ');
+
+    // Count query for pagination
+    const countSql = `SELECT COUNT(*) AS total
+      FROM operator_shifts os
+      LEFT JOIN shift_types st ON st.id = os.shift_type_id
+      LEFT JOIN users u ON u.id = os.user_id
+      LEFT JOIN material_types mt ON os.material_type_id = mt.id
+      WHERE ${where}`;
+    const countResult = await pool.query(countSql, params);
+    const total = parseInt(countResult.rows[0]?.total || 0, 10);
+
+    // Data query with pagination
+    const pageNum  = Math.max(1, parseInt(String(page), 10) || 1);
+    const limitNum = Math.min(Math.max(1, parseInt(String(limit), 10) || 10), 100);
+    const offset   = (pageNum - 1) * limitNum;
+    params.push(limitNum, offset);
+
+    const sql = `SELECT os.id, os.start_time, os.end_time, os.end_remark,
+       st.name AS shift_name, u.name AS operator_name, mt.name AS material_type_name
        FROM operator_shifts os
        LEFT JOIN shift_types st ON st.id = os.shift_type_id
        LEFT JOIN users u ON u.id = os.user_id
        LEFT JOIN material_types mt ON os.material_type_id = mt.id
-       WHERE os.is_active = false`;
-    const params = [];
-    if (dateFilter && /^\d{4}-\d{2}-\d{2}$/.test(String(dateFilter).trim())) {
-      params.push(String(dateFilter).trim());
-      sql += ` AND os.start_time::date = $${params.length}::date`;
-    }
-    if (filterByShift) {
-      params.push(shiftTypeNum);
-      sql += ` AND os.shift_type_id = $${params.length}`;
-    }
-    if (process.env.NODE_ENV !== 'production') {
-      console.log('closed-shifts query params: dateFilter=', dateFilter, 'shiftTypeIdFilter=', shiftTypeIdFilter, 'filterByShift=', filterByShift, 'params=', params);
-    }
-    sql += ` ORDER BY os.end_time DESC NULLS LAST, os.start_time DESC LIMIT $${params.length + 1}`;
-    params.push(Math.min(parseInt(limit, 10) || 30, 100));
+       WHERE ${where}
+       ORDER BY os.end_time DESC NULLS LAST, os.start_time DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`;
+
     const result = await pool.query(sql, params);
     const list = await Promise.all(result.rows.map(async (row) => {
-      const byStation = { crusher: { outputs: 0, weight: '0.0' }, washing: { outputs: 0, weight: '0.0' }, extrusion: { outputs: 0, weight: '0.0' } };
+      const byStation = {
+        crusher:  { outputs: 0, weight: '0.0' },
+        washing:  { outputs: 0, weight: '0.0' },
+        extrusion:{ outputs: 0, weight: '0.0' },
+      };
       for (const [key, stationId] of Object.entries(stationIds)) {
         if (!stationId) continue;
         const logs = await pool.query(
@@ -638,23 +691,28 @@ router.get('/closed-shifts', authenticateToken, async (req, res) => {
           [row.id, stationId]
         );
         byStation[key].outputs = parseInt(logs.rows[0]?.cnt || 0, 10);
-        byStation[key].weight = String(Number(logs.rows[0]?.tot || 0).toFixed(1));
+        byStation[key].weight  = String(Number(logs.rows[0]?.tot || 0).toFixed(1));
       }
       const totalOutputs = byStation.crusher.outputs + byStation.washing.outputs + byStation.extrusion.outputs;
-      const totalWeight = (Number(byStation.crusher.weight) + Number(byStation.washing.weight) + Number(byStation.extrusion.weight)).toFixed(1);
-      const dateStr = row.start_time ? new Date(row.start_time).toLocaleDateString() : '';
+      const totalWeight  = (Number(byStation.crusher.weight) + Number(byStation.washing.weight) + Number(byStation.extrusion.weight)).toFixed(1);
       return {
-        shiftId: row.id,
-        shiftName: (row.shift_name && String(row.shift_name).trim()) ? String(row.shift_name).trim() : 'Shift',
-        operatorName: row.operator_name || 'N/A',
+        shiftId:          row.id,
+        shiftName:        (row.shift_name && String(row.shift_name).trim()) ? String(row.shift_name).trim() : 'Shift',
+        operatorName:     row.operator_name || 'N/A',
         materialTypeName: (row.material_type_name && String(row.material_type_name).trim()) ? String(row.material_type_name).trim() : null,
-        date: dateStr,
+        startTime:        row.start_time,
+        endTime:          row.end_time,
+        endRemark:        row.end_remark || '',
+        date:             row.start_time ? new Date(row.start_time).toLocaleDateString() : '',
         totalOutputs,
         totalWeight,
         byStation,
       };
     }));
-    res.json({ success: true, data: list });
+    res.json({
+      success: true, data: list,
+      pagination: { total, page: pageNum, limit: limitNum, totalPages: Math.ceil(total / limitNum) },
+    });
   } catch (error) {
     console.error('Error listing closed shifts:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
