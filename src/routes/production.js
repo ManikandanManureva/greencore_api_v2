@@ -1358,9 +1358,9 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
 });
 
 // 13a. All production logs with filters (for backoffice production-logs page)
-// Query params: date_start, date_end, station_code (CRS|WSH|EXT), sub_line, material_type, limit
+// Query params: date_start, date_end, station_code (CRS|WSH|EXT), sub_line, material_type, shift_type, limit
 router.get('/logs-all', authenticateToken, async (req, res) => {
-  const { date_start, date_end, station_code, sub_line, material_type, limit = 500 } = req.query;
+  const { date_start, date_end, station_code, sub_line, material_type, shift_type, limit = 500 } = req.query;
   try {
     const params = [];
     const conds = [];
@@ -1384,6 +1384,10 @@ router.get('/logs-all', authenticateToken, async (req, res) => {
     if (material_type && material_type !== 'all') {
       params.push(String(material_type).trim());
       conds.push(`mt.name = $${params.length}`);
+    }
+    if (shift_type && shift_type !== 'all') {
+      params.push(String(shift_type).trim());
+      conds.push(`sht.name = $${params.length}`);
     }
 
     const where = conds.length ? 'AND ' + conds.join(' AND ') : '';
