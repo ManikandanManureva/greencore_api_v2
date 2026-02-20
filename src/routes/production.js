@@ -1316,6 +1316,115 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
   }
 });
 
+// 13a. All production logs with filters (for backoffice production-logs page)
+// Query params: date_start, date_end, station_code (CRS|WSH|EXT), sub_line, material_type, limit
+router.get('/logs-all', authenticateToken, async (req, res) => {
+  const { date_start, date_end, station_code, sub_line, material_type, limit = 500 } = req.query;
+  try {
+    const params = [];
+    const conds  = [];
+
+    if (date_start && /^\d{4}-\d{2}-\d{2}$/.test(String(date_start).trim())) {
+      params.push(String(date_start).trim());
+      conds.push(`pl.created_at::date >= $${params.length}`);
+    }
+    if (date_end && /^\d{4}-\d{2}-\d{2}$/.test(String(date_end).trim())) {
+      params.push(String(date_end).trim());
+      conds.push(`pl.created_at::date <= $${params.length}`);
+    }
+    if (station_code && station_code !== 'all') {
+      params.push(String(station_code).toUpperCase().trim());
+      conds.push(`s.code = $${params.length}`);
+    }
+    if (sub_line && sub_line !== 'all') {
+      params.push(String(sub_line).trim());
+      conds.push(`COALESCE(NULLIF(TRIM(COALESCE(pl.sub_line,'')), ''), 'General') = $${params.length}`);
+    }
+    if (material_type && material_type !== 'all') {
+      params.push(String(material_type).trim());
+      conds.push(`mt.name = $${params.length}`);
+    }
+
+    const where = conds.length ? 'AND ' + conds.join(' AND ') : '';
+    params.push(Math.min(parseInt(String(limit), 10) || 500, 1000));
+    const limitParam = `$${params.length}`;
+
+    const sql = `
+      SELECT
+        pl.id,
+        pl.created_at,
+        COALESCE(NULLIF(TRIM(COALESCE(pl.sub_line,'')), ''), 'General') AS sub_line,
+        pl.weight,
+        pl.status,
+        pl.input_bag_qr,
+        pl.output_bag_qr,
+        pl.remark,
+        u.name                          AS operator_name,
+        s.name                          AS station_name,
+        s.code                          AS station_code,
+        COALESCE(mt.name, 'Unknown')    AS material_type,
+        COALESCE(sht.name, 'Unknown')   AS shift_type,
+        os.start_time                   AS shift_start,
+        os.id                           AS shift_id
+      FROM production_logs pl
+      JOIN operator_shifts os  ON pl.shift_id = os.id
+      JOIN users u             ON os.user_id = u.id
+      JOIN stations s          ON pl.station_id = s.id
+      LEFT JOIN material_types mt  ON os.material_type_id = mt.id
+      LEFT JOIN shift_types sht    ON os.shift_type_id = sht.id
+      WHERE 1=1
+        ${where}
+      ORDER BY pl.created_at DESC
+      LIMIT ${limitParam}
+    `;
+
+    const result = await pool.query(sql, params);
+
+    // Group by station → sub_line for the response
+    const grouped = {};
+    for (const row of result.rows) {
+      const stKey = row.station_code || 'OTHER';
+      const slKey = row.sub_line || 'General';
+      if (!grouped[stKey]) grouped[stKey] = { stationName: row.station_name, stationCode: stKey, subLines: {} };
+      if (!grouped[stKey].subLines[slKey]) {
+        grouped[stKey].subLines[slKey] = {
+          subLine: slKey, logs: [],
+          totalWeight: 0, totalOutputs: 0, totalInputs: 0,
+        };
+      }
+      const sl = grouped[stKey].subLines[slKey];
+      sl.logs.push({
+        id:           row.id,
+        createdAt:    row.created_at,
+        weight:       Number(row.weight) || 0,
+        status:       row.status,
+        inputBagQr:   row.input_bag_qr,
+        outputBagQr:  row.output_bag_qr,
+        remark:       row.remark,
+        operatorName: row.operator_name,
+        materialType: row.material_type,
+        shiftType:    row.shift_type,
+        shiftId:      row.shift_id,
+      });
+      sl.totalWeight  += Number(row.weight) || 0;
+      sl.totalOutputs += 1;
+      if (row.input_bag_qr) sl.totalInputs += 1;
+    }
+
+    // Round weights
+    for (const st of Object.values(grouped)) {
+      for (const sl of Object.values(st.subLines)) {
+        sl.totalWeight = Math.round(sl.totalWeight * 10) / 10;
+      }
+    }
+
+    res.json({ success: true, data: grouped, total: result.rows.length });
+  } catch (error) {
+    console.error('[logs-all] ERROR:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // 13b. Live active shifts — all currently running operator sessions
 router.get('/active-shifts', authenticateToken, async (req, res) => {
   try {
@@ -1353,16 +1462,16 @@ router.get('/active-shifts', authenticateToken, async (req, res) => {
     `);
 
     const shifts = result.rows.map((r) => ({
-      shiftId:         r.shift_id,
-      operatorId:      r.operator_id,
-      operatorName:    r.operator_name,
-      shiftType:       r.shift_type,
-      materialType:    r.material_type,
-      startTime:       r.start_time,
-      outputsSoFar:    r.outputs_so_far,
-      inputsSoFar:     r.inputs_so_far,
-      weightSoFar:     Math.round(Number(r.weight_so_far) * 10) / 10,
-      stationsActive:  r.stations_active || [],
+      shiftId: r.shift_id,
+      operatorId: r.operator_id,
+      operatorName: r.operator_name,
+      shiftType: r.shift_type,
+      materialType: r.material_type,
+      startTime: r.start_time,
+      outputsSoFar: r.outputs_so_far,
+      inputsSoFar: r.inputs_so_far,
+      weightSoFar: Math.round(Number(r.weight_so_far) * 10) / 10,
+      stationsActive: r.stations_active || [],
     }));
 
     res.json({ success: true, data: shifts, count: shifts.length });
