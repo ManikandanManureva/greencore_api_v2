@@ -633,7 +633,7 @@ router.get('/closed-shifts', authenticateToken, async (req, res) => {
       conds.push(`st.name = $${params.length}`);
     } else {
       const shiftTypeNum = shiftTypeIdFilter != null && shiftTypeIdFilter !== '' ? Number(shiftTypeIdFilter) : NaN;
-      if (!Number.isNaN(shiftTypeNum) && [1,2,3].includes(shiftTypeNum)) {
+      if (!Number.isNaN(shiftTypeNum) && [1, 2, 3].includes(shiftTypeNum)) {
         params.push(shiftTypeNum);
         conds.push(`os.shift_type_id = $${params.length}`);
       }
@@ -647,6 +647,11 @@ router.get('/closed-shifts', authenticateToken, async (req, res) => {
     if (operator && String(operator).trim().length > 0) {
       params.push(`%${String(operator).trim()}%`);
       conds.push(`u.name ILIKE $${params.length}`);
+    }
+    // Hide shifts with zero production logs
+    const { hide_empty } = req.query;
+    if (hide_empty === 'true' || hide_empty === '1') {
+      conds.push(`EXISTS (SELECT 1 FROM production_logs pl WHERE pl.shift_id = os.id)`);
     }
 
     const where = conds.join(' AND ');
@@ -662,9 +667,9 @@ router.get('/closed-shifts', authenticateToken, async (req, res) => {
     const total = parseInt(countResult.rows[0]?.total || 0, 10);
 
     // Data query with pagination
-    const pageNum  = Math.max(1, parseInt(String(page), 10) || 1);
+    const pageNum = Math.max(1, parseInt(String(page), 10) || 1);
     const limitNum = Math.min(Math.max(1, parseInt(String(limit), 10) || 10), 100);
-    const offset   = (pageNum - 1) * limitNum;
+    const offset = (pageNum - 1) * limitNum;
     params.push(limitNum, offset);
 
     const sql = `SELECT os.id, os.start_time, os.end_time, os.end_remark,
@@ -680,9 +685,9 @@ router.get('/closed-shifts', authenticateToken, async (req, res) => {
     const result = await pool.query(sql, params);
     const list = await Promise.all(result.rows.map(async (row) => {
       const byStation = {
-        crusher:  { outputs: 0, weight: '0.0' },
-        washing:  { outputs: 0, weight: '0.0' },
-        extrusion:{ outputs: 0, weight: '0.0' },
+        crusher: { outputs: 0, weight: '0.0' },
+        washing: { outputs: 0, weight: '0.0' },
+        extrusion: { outputs: 0, weight: '0.0' },
       };
       for (const [key, stationId] of Object.entries(stationIds)) {
         if (!stationId) continue;
@@ -691,19 +696,19 @@ router.get('/closed-shifts', authenticateToken, async (req, res) => {
           [row.id, stationId]
         );
         byStation[key].outputs = parseInt(logs.rows[0]?.cnt || 0, 10);
-        byStation[key].weight  = String(Number(logs.rows[0]?.tot || 0).toFixed(1));
+        byStation[key].weight = String(Number(logs.rows[0]?.tot || 0).toFixed(1));
       }
       const totalOutputs = byStation.crusher.outputs + byStation.washing.outputs + byStation.extrusion.outputs;
-      const totalWeight  = (Number(byStation.crusher.weight) + Number(byStation.washing.weight) + Number(byStation.extrusion.weight)).toFixed(1);
+      const totalWeight = (Number(byStation.crusher.weight) + Number(byStation.washing.weight) + Number(byStation.extrusion.weight)).toFixed(1);
       return {
-        shiftId:          row.id,
-        shiftName:        (row.shift_name && String(row.shift_name).trim()) ? String(row.shift_name).trim() : 'Shift',
-        operatorName:     row.operator_name || 'N/A',
+        shiftId: row.id,
+        shiftName: (row.shift_name && String(row.shift_name).trim()) ? String(row.shift_name).trim() : 'Shift',
+        operatorName: row.operator_name || 'N/A',
         materialTypeName: (row.material_type_name && String(row.material_type_name).trim()) ? String(row.material_type_name).trim() : null,
-        startTime:        row.start_time,
-        endTime:          row.end_time,
-        endRemark:        row.end_remark || '',
-        date:             row.start_time ? new Date(row.start_time).toLocaleDateString() : '',
+        startTime: row.start_time,
+        endTime: row.end_time,
+        endRemark: row.end_remark || '',
+        date: row.start_time ? new Date(row.start_time).toLocaleDateString() : '',
         totalOutputs,
         totalWeight,
         byStation,
