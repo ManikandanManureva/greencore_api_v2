@@ -1316,6 +1316,62 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
   }
 });
 
+// 13b. Live active shifts — all currently running operator sessions
+router.get('/active-shifts', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        os.id                                            AS shift_id,
+        u.id                                             AS operator_id,
+        u.name                                           AS operator_name,
+        COALESCE(sht.name, 'Unknown')                   AS shift_type,
+        COALESCE(mt.name, 'Unknown')                    AS material_type,
+        os.start_time,
+        COUNT(pl.id)::int                               AS outputs_so_far,
+        COALESCE(SUM(pl.weight), 0)::numeric            AS weight_so_far,
+        COUNT(CASE WHEN pl.input_bag_qr IS NOT NULL
+                        AND pl.input_bag_qr <> '' THEN 1 END)::int AS inputs_so_far,
+        COALESCE(
+          json_agg(
+            DISTINCT jsonb_build_object(
+              'station', s.name,
+              'station_code', s.code,
+              'sub_line', COALESCE(NULLIF(TRIM(COALESCE(pl.sub_line,'')), ''), 'General')
+            )
+          ) FILTER (WHERE s.id IS NOT NULL),
+          '[]'
+        ) AS stations_active
+      FROM operator_shifts os
+      JOIN users u          ON os.user_id = u.id
+      LEFT JOIN shift_types sht ON sht.id = os.shift_type_id
+      LEFT JOIN material_types mt ON os.material_type_id = mt.id
+      LEFT JOIN production_logs pl ON pl.shift_id = os.id
+      LEFT JOIN stations s ON pl.station_id = s.id
+      WHERE os.is_active = true
+      GROUP BY os.id, u.id, u.name, sht.name, mt.name, os.start_time
+      ORDER BY os.start_time ASC
+    `);
+
+    const shifts = result.rows.map((r) => ({
+      shiftId:         r.shift_id,
+      operatorId:      r.operator_id,
+      operatorName:    r.operator_name,
+      shiftType:       r.shift_type,
+      materialType:    r.material_type,
+      startTime:       r.start_time,
+      outputsSoFar:    r.outputs_so_far,
+      inputsSoFar:     r.inputs_so_far,
+      weightSoFar:     Math.round(Number(r.weight_so_far) * 10) / 10,
+      stationsActive:  r.stations_active || [],
+    }));
+
+    res.json({ success: true, data: shifts, count: shifts.length });
+  } catch (error) {
+    console.error('[active-shifts] ERROR:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // 14. Dashboard summary: station sub-line breakdown + operator performance
 // Query params: date_start, date_end, material_type (name), shift_name ("Shift 1"|"Shift 2"|"Shift 3")
 router.get('/dashboard-summary', authenticateToken, async (req, res) => {
