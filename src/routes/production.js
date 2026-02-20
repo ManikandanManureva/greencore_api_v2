@@ -1594,47 +1594,33 @@ router.get('/active-shifts', authenticateToken, async (req, res) => {
 router.get('/dashboard-summary', authenticateToken, async (req, res) => {
   const { date_start, date_end, material_type, shift_name } = req.query;
   try {
-    // ── Step 1: Get actual station IDs (same reliable helper used by closed-shifts)
-    const stIds = await getStationIdsByCode();
-    const allStationIds = Object.values(stIds).filter(Boolean);
+    // ── Step 1: Build WHERE conditions (no pre-fetch of station IDs needed)
+    const params = [];
+    const conds = [];
 
-    // ── Step 2: Build filter params (shared between station & operator queries)
-    //    filterParams are positioned at offset +1 for station query ($1 = station array)
-    //    and at offset 0 for operator query ($1 = first filter)
-    const filterParams = [];
-    const stationConds = [];  // with $2, $3, ...
-    const opConds = [];       // with $1, $2, ...
+    const push = (val, sql) => { params.push(val); conds.push(sql.replace('$?', `$${params.length}`)); };
 
-    const addFilter = (value, sql) => {
-      filterParams.push(value);
-      const idx = filterParams.length;
-      stationConds.push(sql.replace('$?', `$${idx + 1}`));
-      opConds.push(sql.replace('$?', `$${idx}`));
-    };
-
-    if (date_start && /^\d{4}-\d{2}-\d{2}$/.test(String(date_start).trim())) {
-      addFilter(String(date_start).trim(), 'os.start_time::date >= $?');
-    }
-    if (date_end && /^\d{4}-\d{2}-\d{2}$/.test(String(date_end).trim())) {
-      addFilter(String(date_end).trim(), 'os.start_time::date <= $?');
-    }
-    if (material_type && material_type !== 'all') {
-      addFilter(String(material_type).trim(), 'mt.name = $?');
-    }
+    if (date_start && /^\d{4}-\d{2}-\d{2}$/.test(String(date_start).trim()))
+      push(String(date_start).trim(), 'os.start_time::date >= $?');
+    if (date_end && /^\d{4}-\d{2}-\d{2}$/.test(String(date_end).trim()))
+      push(String(date_end).trim(), 'os.start_time::date <= $?');
+    if (material_type && material_type !== 'all')
+      push(String(material_type).trim(), 'mt.name = $?');
     if (shift_name && shift_name !== 'all') {
       const m = String(shift_name).match(/(\d)$/);
-      if (m) addFilter(Number(m[1]), 'os.shift_type_id = $?');
+      if (m) push(Number(m[1]), 'os.shift_type_id = $?');
     }
 
-    const stationWhereExtra = stationConds.length ? 'AND ' + stationConds.join(' AND ') : '';
-    const opWhereExtra = opConds.length ? 'AND ' + opConds.join(' AND ') : '';
-    const stationParams = [allStationIds, ...filterParams];
-    const opParams = [...filterParams];
+    const whereClause = conds.length ? 'AND ' + conds.join(' AND ') : '';
 
-    // ── Step 3: Station sub-line + shift query (uses station IDs for reliability)
-    const stationSql = allStationIds.length > 0 ? `
+    // ── Step 2: Station query — direct JOIN on stations, classify by name/code
+    //    Works regardless of what codes are stored in the DB
+    const stationSql = `
       SELECT
-        pl.station_id,
+        s.id                                                      AS station_id,
+        s.name                                                    AS station_name,
+        LOWER(s.name)                                             AS station_key_raw,
+        s.code                                                    AS station_code,
         COALESCE(NULLIF(TRIM(pl.sub_line::text), ''), 'General') AS sub_line,
         COALESCE(sht.name, 'Unknown')                            AS shift_name,
         COUNT(*)::int                                            AS outputs,
@@ -1642,16 +1628,17 @@ router.get('/dashboard-summary', authenticateToken, async (req, res) => {
                         AND pl.input_bag_qr <> '' THEN 1 END)::int AS inputs,
         COALESCE(SUM(pl.weight), 0)::numeric                    AS weight
       FROM production_logs pl
-      JOIN operator_shifts os  ON pl.shift_id = os.id
+      JOIN stations s         ON s.id = pl.station_id
+      JOIN operator_shifts os ON pl.shift_id = os.id
       LEFT JOIN shift_types sht ON sht.id = os.shift_type_id
       LEFT JOIN material_types mt ON os.material_type_id = mt.id
-      WHERE pl.station_id = ANY($1::int[])
-        ${stationWhereExtra}
-      GROUP BY pl.station_id, sub_line, sht.name
-      ORDER BY pl.station_id, weight DESC
-    ` : null;
+      WHERE 1=1
+        ${whereClause}
+      GROUP BY s.id, s.name, s.code, sub_line, sht.name
+      ORDER BY s.name, weight DESC
+    `;
 
-    // ── Step 4: Operator performance query
+    // ── Step 3: Operator performance query
     const operatorSql = `
       SELECT
         u.id                             AS operator_id,
@@ -1664,31 +1651,36 @@ router.get('/dashboard-summary', authenticateToken, async (req, res) => {
       LEFT JOIN production_logs pl ON pl.shift_id = os.id
       LEFT JOIN material_types mt  ON os.material_type_id = mt.id
       WHERE 1=1
-        ${opWhereExtra}
+        ${whereClause}
       GROUP BY u.id, u.name
       ORDER BY total_weight DESC
       LIMIT 30
     `;
 
     const [stationResult, operatorResult] = await Promise.all([
-      stationSql ? pool.query(stationSql, stationParams) : Promise.resolve({ rows: [] }),
-      pool.query(operatorSql, opParams),
+      pool.query(stationSql, params),
+      pool.query(operatorSql, params),
     ]);
 
-    // ── Step 5: Build station map using ID → key reverse lookup
-    const idToKey = {};
-    for (const [key, id] of Object.entries(stIds)) {
-      if (id != null) idToKey[id] = key;
-    }
+    // ── Step 4: Classify each station row into crusher / washing / extrusion
+    //    Uses the same name-matching logic as the mobile app / active-shifts
+    const classifyStation = (name, code) => {
+      const n = (name || '').toLowerCase();
+      const c = (code || '').toUpperCase();
+      if (c === 'CRS' || n.includes('crusher')) return 'crusher';
+      if (c === 'WSH' || n.includes('washing')) return 'washing';
+      if (c === 'EXT' || c === 'EXTR' || n.includes('extrusion')) return 'extrusion';
+      // fallback: use the station name itself as key (so unknown stations still show up)
+      return n.replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '') || 'other';
+    };
 
     const stationMap = {};
     for (const row of stationResult.rows) {
-      const stKey = idToKey[row.station_id];
-      if (!stKey) continue;
+      const stKey = classifyStation(row.station_name, row.station_code);
 
       if (!stationMap[stKey]) {
         stationMap[stKey] = {
-          stationName: stKey.charAt(0).toUpperCase() + stKey.slice(1),
+          stationName: row.station_name,  // use actual DB name
           totalOutputs: 0,
           totalInputs: 0,
           totalWeight: 0,
@@ -1724,14 +1716,14 @@ router.get('/dashboard-summary', authenticateToken, async (req, res) => {
       stationMap[stKey].byShift[shiftName].weight += weight;
     }
 
-    // ── Step 6: Round weights
+    // ── Step 5: Round weights
     for (const st of Object.values(stationMap)) {
       st.totalWeight = Number(st.totalWeight.toFixed(1));
       for (const sl of Object.values(st.subLines)) sl.weight = Number(sl.weight.toFixed(1));
       for (const sh of Object.values(st.byShift)) sh.weight = Number(sh.weight.toFixed(1));
     }
 
-    // ── Step 7: Operators
+    // ── Step 6: Operators
     const operators = operatorResult.rows.map((r) => ({
       id: r.operator_id,
       name: r.operator_name,
