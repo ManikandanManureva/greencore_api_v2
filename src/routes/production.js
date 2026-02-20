@@ -1646,7 +1646,6 @@ router.get('/dashboard-summary', authenticateToken, async (req, res) => {
       LEFT JOIN shift_types sht ON sht.id = os.shift_type_id
       LEFT JOIN material_types mt ON os.material_type_id = mt.id
       WHERE pl.station_id = ANY($1::int[])
-        AND os.is_active = false
         ${stationWhereExtra}
       GROUP BY pl.station_id, sub_line, sht.name
       ORDER BY pl.station_id, weight DESC
@@ -1664,7 +1663,7 @@ router.get('/dashboard-summary', authenticateToken, async (req, res) => {
       JOIN users u ON os.user_id = u.id
       LEFT JOIN production_logs pl ON pl.shift_id = os.id
       LEFT JOIN material_types mt  ON os.material_type_id = mt.id
-      WHERE os.is_active = false
+      WHERE 1=1
         ${opWhereExtra}
       GROUP BY u.id, u.name
       ORDER BY total_weight DESC
