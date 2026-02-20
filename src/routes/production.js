@@ -347,7 +347,7 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
 
 // 7. Log production data
 router.post('/log', authenticateToken, async (req, res) => {
-    const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, status, subLine, remark, shiftTypeId: shiftTypeIdBody } = req.body;
+  const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, status, subLine, remark, shiftTypeId: shiftTypeIdBody } = req.body;
   const materialTypeId = req.user.materialTypeId;
 
   try {
@@ -608,10 +608,11 @@ router.get('/closed-shifts', authenticateToken, async (req, res) => {
     const stationIds = await getStationIdsByCode();
     const shiftTypeNum = shiftTypeIdFilter != null && shiftTypeIdFilter !== '' ? Number(shiftTypeIdFilter) : NaN;
     const filterByShift = !Number.isNaN(shiftTypeNum) && [1, 2, 3].includes(shiftTypeNum);
-    let sql = `SELECT os.id, os.start_time, os.end_time, st.name AS shift_name, u.name AS operator_name
+    let sql = `SELECT os.id, os.start_time, os.end_time, st.name AS shift_name, u.name AS operator_name, mt.name AS material_type_name
        FROM operator_shifts os
        LEFT JOIN shift_types st ON st.id = os.shift_type_id
        LEFT JOIN users u ON u.id = os.user_id
+       LEFT JOIN material_types mt ON os.material_type_id = mt.id
        WHERE os.is_active = false`;
     const params = [];
     if (dateFilter && /^\d{4}-\d{2}-\d{2}$/.test(String(dateFilter).trim())) {
@@ -646,6 +647,7 @@ router.get('/closed-shifts', authenticateToken, async (req, res) => {
         shiftId: row.id,
         shiftName: (row.shift_name && String(row.shift_name).trim()) ? String(row.shift_name).trim() : 'Shift',
         operatorName: row.operator_name || 'N/A',
+        materialTypeName: (row.material_type_name && String(row.material_type_name).trim()) ? String(row.material_type_name).trim() : null,
         date: dateStr,
         totalOutputs,
         totalWeight,
@@ -1310,6 +1312,168 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Error fetching extrusion logs:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// 14. Dashboard summary: station sub-line breakdown + operator performance
+// Query params: date_start, date_end, material_type (name), shift_name ("Shift 1"|"Shift 2"|"Shift 3")
+router.get('/dashboard-summary', authenticateToken, async (req, res) => {
+  const { date_start, date_end, material_type, shift_name } = req.query;
+  try {
+    // ── Step 1: Get actual station IDs (same reliable helper used by closed-shifts)
+    const stIds = await getStationIdsByCode();
+    const allStationIds = Object.values(stIds).filter(Boolean);
+
+    // ── Step 2: Build filter params (shared between station & operator queries)
+    //    filterParams are positioned at offset +1 for station query ($1 = station array)
+    //    and at offset 0 for operator query ($1 = first filter)
+    const filterParams = [];
+    const stationConds = [];  // with $2, $3, ...
+    const opConds = [];       // with $1, $2, ...
+
+    const addFilter = (value, sql) => {
+      filterParams.push(value);
+      const idx = filterParams.length;
+      stationConds.push(sql.replace('$?', `$${idx + 1}`));
+      opConds.push(sql.replace('$?', `$${idx}`));
+    };
+
+    if (date_start && /^\d{4}-\d{2}-\d{2}$/.test(String(date_start).trim())) {
+      addFilter(String(date_start).trim(), 'os.start_time::date >= $?');
+    }
+    if (date_end && /^\d{4}-\d{2}-\d{2}$/.test(String(date_end).trim())) {
+      addFilter(String(date_end).trim(), 'os.start_time::date <= $?');
+    }
+    if (material_type && material_type !== 'all') {
+      addFilter(String(material_type).trim(), 'mt.name = $?');
+    }
+    if (shift_name && shift_name !== 'all') {
+      const m = String(shift_name).match(/(\d)$/);
+      if (m) addFilter(Number(m[1]), 'os.shift_type_id = $?');
+    }
+
+    const stationWhereExtra = stationConds.length ? 'AND ' + stationConds.join(' AND ') : '';
+    const opWhereExtra = opConds.length ? 'AND ' + opConds.join(' AND ') : '';
+    const stationParams = [allStationIds, ...filterParams];
+    const opParams = [...filterParams];
+
+    // ── Step 3: Station sub-line + shift query (uses station IDs for reliability)
+    const stationSql = allStationIds.length > 0 ? `
+      SELECT
+        pl.station_id,
+        COALESCE(NULLIF(TRIM(pl.sub_line::text), ''), 'General') AS sub_line,
+        COALESCE(sht.name, 'Unknown')                            AS shift_name,
+        COUNT(*)::int                                            AS outputs,
+        COUNT(CASE WHEN pl.input_bag_qr IS NOT NULL
+                        AND pl.input_bag_qr <> '' THEN 1 END)::int AS inputs,
+        COALESCE(SUM(pl.weight), 0)::numeric                    AS weight
+      FROM production_logs pl
+      JOIN operator_shifts os  ON pl.shift_id = os.id
+      LEFT JOIN shift_types sht ON sht.id = os.shift_type_id
+      LEFT JOIN material_types mt ON os.material_type_id = mt.id
+      WHERE pl.station_id = ANY($1::int[])
+        AND os.is_active = false
+        ${stationWhereExtra}
+      GROUP BY pl.station_id, sub_line, sht.name
+      ORDER BY pl.station_id, weight DESC
+    ` : null;
+
+    // ── Step 4: Operator performance query
+    const operatorSql = `
+      SELECT
+        u.id                             AS operator_id,
+        u.name                           AS operator_name,
+        COUNT(DISTINCT os.id)::int       AS shift_count,
+        COALESCE(SUM(pl.weight), 0)::numeric AS total_weight,
+        MAX(os.start_time)               AS last_shift
+      FROM operator_shifts os
+      JOIN users u ON os.user_id = u.id
+      LEFT JOIN production_logs pl ON pl.shift_id = os.id
+      LEFT JOIN material_types mt  ON os.material_type_id = mt.id
+      WHERE os.is_active = false
+        ${opWhereExtra}
+      GROUP BY u.id, u.name
+      ORDER BY total_weight DESC
+      LIMIT 30
+    `;
+
+    const [stationResult, operatorResult] = await Promise.all([
+      stationSql ? pool.query(stationSql, stationParams) : Promise.resolve({ rows: [] }),
+      pool.query(operatorSql, opParams),
+    ]);
+
+    // ── Step 5: Build station map using ID → key reverse lookup
+    const idToKey = {};
+    for (const [key, id] of Object.entries(stIds)) {
+      if (id != null) idToKey[id] = key;
+    }
+
+    const stationMap = {};
+    for (const row of stationResult.rows) {
+      const stKey = idToKey[row.station_id];
+      if (!stKey) continue;
+
+      if (!stationMap[stKey]) {
+        stationMap[stKey] = {
+          stationName: stKey.charAt(0).toUpperCase() + stKey.slice(1),
+          totalOutputs: 0,
+          totalInputs: 0,
+          totalWeight: 0,
+          byShift: {},
+          subLines: {},
+        };
+      }
+
+      const subLine = String(row.sub_line);
+      const shiftName = String(row.shift_name);
+      const outputs = parseInt(row.outputs, 10) || 0;
+      const inputs = parseInt(row.inputs, 10) || 0;
+      const weight = Number(row.weight) || 0;
+
+      stationMap[stKey].totalOutputs += outputs;
+      stationMap[stKey].totalInputs += inputs;
+      stationMap[stKey].totalWeight += weight;
+
+      // Sub-lines
+      if (!stationMap[stKey].subLines[subLine]) {
+        stationMap[stKey].subLines[subLine] = { outputs: 0, inputs: 0, weight: 0 };
+      }
+      stationMap[stKey].subLines[subLine].outputs += outputs;
+      stationMap[stKey].subLines[subLine].inputs += inputs;
+      stationMap[stKey].subLines[subLine].weight += weight;
+
+      // By shift
+      if (!stationMap[stKey].byShift[shiftName]) {
+        stationMap[stKey].byShift[shiftName] = { outputs: 0, inputs: 0, weight: 0 };
+      }
+      stationMap[stKey].byShift[shiftName].outputs += outputs;
+      stationMap[stKey].byShift[shiftName].inputs += inputs;
+      stationMap[stKey].byShift[shiftName].weight += weight;
+    }
+
+    // ── Step 6: Round weights
+    for (const st of Object.values(stationMap)) {
+      st.totalWeight = Number(st.totalWeight.toFixed(1));
+      for (const sl of Object.values(st.subLines)) sl.weight = Number(sl.weight.toFixed(1));
+      for (const sh of Object.values(st.byShift)) sh.weight = Number(sh.weight.toFixed(1));
+    }
+
+    // ── Step 7: Operators
+    const operators = operatorResult.rows.map((r) => ({
+      id: r.operator_id,
+      name: r.operator_name,
+      shiftCount: parseInt(r.shift_count, 10) || 0,
+      totalWeight: Number(Number(r.total_weight).toFixed(1)),
+      avgPerShift: parseInt(r.shift_count, 10) > 0
+        ? Number((Number(r.total_weight) / parseInt(r.shift_count, 10)).toFixed(1))
+        : 0,
+      lastShift: r.last_shift ? new Date(r.last_shift).toLocaleDateString('en-CA') : null,
+    }));
+
+    res.json({ success: true, data: { stations: stationMap, operators } });
+  } catch (error) {
+    console.error('Error fetching dashboard summary:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 });
