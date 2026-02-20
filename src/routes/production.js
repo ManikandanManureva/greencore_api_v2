@@ -959,6 +959,47 @@ router.put('/update-log-weight', authenticateToken, async (req, res) => {
   }
 });
 
+// 10.7. Backoffice: update any editable fields on a production log by ID
+router.put('/logs-update/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  if (!id || isNaN(Number(id))) {
+    return res.status(400).json({ success: false, message: 'Valid log id is required' });
+  }
+  const { weight, status, sub_line, remark } = req.body;
+  const sets = [];
+  const params = [];
+
+  if (weight !== undefined && weight !== null && !isNaN(Number(weight)) && Number(weight) >= 0) {
+    params.push(Number(weight)); sets.push(`weight = $${params.length}`);
+  }
+  if (status && typeof status === 'string') {
+    params.push(status.trim()); sets.push(`status = $${params.length}`);
+  }
+  if (sub_line !== undefined) {
+    params.push(sub_line === '' ? null : String(sub_line).trim()); sets.push(`sub_line = $${params.length}`);
+  }
+  if (remark !== undefined) {
+    params.push(remark === '' ? null : String(remark).trim()); sets.push(`remark = $${params.length}`);
+  }
+  if (sets.length === 0) {
+    return res.status(400).json({ success: false, message: 'No valid fields to update' });
+  }
+  params.push(Number(id));
+  try {
+    const result = await pool.query(
+      `UPDATE production_logs SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING *`,
+      params
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Log not found' });
+    }
+    res.json({ success: true, message: 'Log updated', data: result.rows[0] });
+  } catch (error) {
+    console.error('[logs-update] ERROR:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // 11. Get crusher line logs with date filter, search, and pagination
 router.get('/crusher-logs', authenticateToken, async (req, res) => {
   const { subLine, date, search, status, page = 1, limit = 10 } = req.query;
@@ -1322,7 +1363,7 @@ router.get('/logs-all', authenticateToken, async (req, res) => {
   const { date_start, date_end, station_code, sub_line, material_type, limit = 500 } = req.query;
   try {
     const params = [];
-    const conds  = [];
+    const conds = [];
 
     if (date_start && /^\d{4}-\d{2}-\d{2}$/.test(String(date_start).trim())) {
       params.push(String(date_start).trim());
@@ -1394,19 +1435,19 @@ router.get('/logs-all', authenticateToken, async (req, res) => {
       }
       const sl = grouped[stKey].subLines[slKey];
       sl.logs.push({
-        id:           row.id,
-        createdAt:    row.created_at,
-        weight:       Number(row.weight) || 0,
-        status:       row.status,
-        inputBagQr:   row.input_bag_qr,
-        outputBagQr:  row.output_bag_qr,
-        remark:       row.remark,
+        id: row.id,
+        createdAt: row.created_at,
+        weight: Number(row.weight) || 0,
+        status: row.status,
+        inputBagQr: row.input_bag_qr,
+        outputBagQr: row.output_bag_qr,
+        remark: row.remark,
         operatorName: row.operator_name,
         materialType: row.material_type,
-        shiftType:    row.shift_type,
-        shiftId:      row.shift_id,
+        shiftType: row.shift_type,
+        shiftId: row.shift_id,
       });
-      sl.totalWeight  += Number(row.weight) || 0;
+      sl.totalWeight += Number(row.weight) || 0;
       sl.totalOutputs += 1;
       if (row.input_bag_qr) sl.totalInputs += 1;
     }
