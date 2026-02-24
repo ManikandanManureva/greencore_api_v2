@@ -491,6 +491,9 @@ router.post('/by-products', authenticateToken, async (req, res) => {
 
     await client.query('BEGIN');
 
+    // Delete existing rows first so repeated calls (e.g. after printer failure) never duplicate
+    await client.query('DELETE FROM by_product_logs WHERE shift_id = $1', [shiftId]);
+
     for (const item of byProducts) {
       await client.query(
         `INSERT INTO by_product_logs (shift_id, station_id, name, weight, category)
@@ -689,14 +692,27 @@ router.get('/closed-shifts', authenticateToken, async (req, res) => {
         washing: { outputs: 0, weight: '0.0' },
         extrusion: { outputs: 0, weight: '0.0' },
       };
-      for (const [key, stationId] of Object.entries(stationIds)) {
-        if (!stationId) continue;
-        const logs = await pool.query(
-          'SELECT COUNT(*) AS cnt, COALESCE(SUM(weight), 0) AS tot FROM production_logs WHERE shift_id = $1 AND station_id = $2',
-          [row.id, stationId]
-        );
-        byStation[key].outputs = parseInt(logs.rows[0]?.cnt || 0, 10);
-        byStation[key].weight = String(Number(logs.rows[0]?.tot || 0).toFixed(1));
+      // Single aggregated query per shift, excluding Cancelled logs for accuracy
+      const aggRows = await pool.query(
+        `SELECT s.code, s.name,
+                COUNT(pl.id) AS cnt,
+                COALESCE(SUM(pl.weight), 0) AS tot
+         FROM production_logs pl
+         JOIN stations s ON s.id = pl.station_id
+         WHERE pl.shift_id = $1 AND pl.status != 'Cancelled'
+         GROUP BY s.code, s.name`,
+        [row.id]
+      );
+      for (const sr of aggRows.rows) {
+        const code = (sr.code || '').toUpperCase();
+        const name = (sr.name || '').toLowerCase();
+        let key = null;
+        if (code === 'CRS' || name.includes('crusher')) key = 'crusher';
+        else if (code === 'WSH' || name.includes('washing')) key = 'washing';
+        else if (code === 'EXT' || code === 'EXTR' || name.includes('extrusion')) key = 'extrusion';
+        if (!key) continue;
+        byStation[key].outputs += parseInt(sr.cnt, 10);
+        byStation[key].weight = String((Number(byStation[key].weight) + Number(sr.tot)).toFixed(1));
       }
       const totalOutputs = byStation.crusher.outputs + byStation.washing.outputs + byStation.extrusion.outputs;
       const totalWeight = (Number(byStation.crusher.weight) + Number(byStation.washing.weight) + Number(byStation.extrusion.weight)).toFixed(1);
@@ -740,16 +756,29 @@ router.get('/closed-shift/:shiftId/summary', authenticateToken, async (req, res)
       return res.status(404).json({ success: false, message: 'Closed shift not found' });
     }
     const row = shiftRow.rows[0];
-    const stationIds = await getStationIdsByCode();
+    // Aggregate per station in one query; exclude Cancelled so counts match actual production
+    const aggResult = await pool.query(
+      `SELECT s.id, s.code, s.name,
+              COUNT(pl.id) AS cnt,
+              COALESCE(SUM(pl.weight), 0) AS tot
+       FROM production_logs pl
+       JOIN stations s ON s.id = pl.station_id
+       WHERE pl.shift_id = $1
+         AND pl.status != 'Cancelled'
+       GROUP BY s.id, s.code, s.name`,
+      [shiftId]
+    );
     const byStation = { crusher: { outputs: 0, weight: '0.0' }, washing: { outputs: 0, weight: '0.0' }, extrusion: { outputs: 0, weight: '0.0' } };
-    for (const [key, stationId] of Object.entries(stationIds)) {
-      if (!stationId) continue;
-      const logs = await pool.query(
-        'SELECT COUNT(*) AS cnt, COALESCE(SUM(weight), 0) AS tot FROM production_logs WHERE shift_id = $1 AND station_id = $2',
-        [shiftId, stationId]
-      );
-      byStation[key].outputs = parseInt(logs.rows[0]?.cnt || 0, 10);
-      byStation[key].weight = String(Number(logs.rows[0]?.tot || 0).toFixed(1));
+    for (const row of aggResult.rows) {
+      const code = (row.code || '').toUpperCase();
+      const name = (row.name || '').toLowerCase();
+      let key = null;
+      if (code === 'CRS' || name.includes('crusher')) key = 'crusher';
+      else if (code === 'WSH' || name.includes('washing')) key = 'washing';
+      else if (code === 'EXT' || code === 'EXTR' || name.includes('extrusion')) key = 'extrusion';
+      if (!key) continue;
+      byStation[key].outputs += parseInt(row.cnt, 10);
+      byStation[key].weight = String((Number(byStation[key].weight) + Number(row.tot)).toFixed(1));
     }
     const totalOutputs = byStation.crusher.outputs + byStation.washing.outputs + byStation.extrusion.outputs;
     const totalWeight = (Number(byStation.crusher.weight) + Number(byStation.washing.weight) + Number(byStation.extrusion.weight)).toFixed(1);
@@ -828,7 +857,9 @@ router.get('/logs/:shiftId', authenticateToken, async (req, res) => {
 
 // 10. Search logs by output QR (for autocomplete)
 router.get('/search-logs', authenticateToken, async (req, res) => {
-  const { query, stationId, targetStationId: targetStationIdParam, currentStationId, status } = req.query;
+  // source_sub_lines: comma-separated list to restrict which sub-lines can appear as inputs
+  // Used by Betty crusher so it only sees 3E/Rapid bags, not its own Betty bags.
+  const { query, stationId, targetStationId: targetStationIdParam, currentStationId, status, source_sub_lines } = req.query;
   const materialTypeId = req.user.materialTypeId;
 
   try {
@@ -904,6 +935,16 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
       paramIndex++;
       sql += ` AND pl.station_id = $${paramIndex}`;
       params.push(targetStationId);
+    }
+
+    // Restrict to specific source sub-lines (e.g. Betty only sees 3E/Rapid bags)
+    if (source_sub_lines) {
+      const allowed = String(source_sub_lines).split(',').map(s => s.trim()).filter(Boolean);
+      if (allowed.length > 0) {
+        paramIndex++;
+        sql += ` AND pl.sub_line = ANY($${paramIndex}::text[])`;
+        params.push(allowed);
+      }
     }
 
     // Exclude bags that are already processing at the current station.
@@ -1065,12 +1106,11 @@ router.put('/logs-update/:id', authenticateToken, async (req, res) => {
 
 // 11. Get crusher line logs with date filter, search, and pagination
 router.get('/crusher-logs', authenticateToken, async (req, res) => {
-  const { subLine, date, search, status, page = 1, limit = 10 } = req.query;
+  const { subLine, date, search, status, shift_id, page = 1, limit = 10 } = req.query;
   const materialTypeId = req.user.materialTypeId;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   try {
-    // Get Crusher station ID (assuming ID 2)
     const stationResult = await pool.query("SELECT id FROM stations WHERE code = 'CRS' LIMIT 1");
     if (stationResult.rows.length === 0) {
       return res.json({ success: true, data: [], pagination: { total: 0, page: 1, limit: 10, totalPages: 0 } });
@@ -1086,41 +1126,42 @@ router.get('/crusher-logs', authenticateToken, async (req, res) => {
     const params = [crusherStationId];
     let paramIndex = 1;
 
-    // Filter by material type (Role)
     if (materialTypeId) {
       paramIndex++;
       sql += ` AND os.material_type_id = $${paramIndex}`;
       params.push(materialTypeId);
     }
 
-    // Filter by sub-line (3E or Rapid)
     if (subLine) {
       paramIndex++;
       sql += ` AND pl.sub_line = $${paramIndex}`;
       params.push(subLine);
     }
 
-    // Filter by status (pending, processing, Completed)
     if (status) {
       paramIndex++;
       sql += ` AND pl.status = $${paramIndex}`;
       params.push(status);
     }
 
-    // Filter by date (default to current date if not provided)
-    const targetDate = date || new Date().toISOString().split('T')[0];
-    paramIndex++;
-    sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
-    params.push(targetDate);
+    // shift_id takes priority: scope to exact shift; otherwise fall back to date filter
+    if (shift_id) {
+      paramIndex++;
+      sql += ` AND pl.shift_id = $${paramIndex}`;
+      params.push(parseInt(shift_id));
+    } else {
+      const targetDate = date || new Date().toISOString().split('T')[0];
+      paramIndex++;
+      sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
+      params.push(targetDate);
+    }
 
-    // Search filter (by QR code)
     if (search) {
       paramIndex++;
       sql += ` AND pl.output_bag_qr ILIKE $${paramIndex}`;
       params.push(`%${search}%`);
     }
 
-    // Get total count for pagination (build count query separately)
     let countSql = `SELECT COUNT(*) as total
                     FROM production_logs pl
                     JOIN operator_shifts os ON pl.shift_id = os.id
@@ -1146,10 +1187,16 @@ router.get('/crusher-logs', authenticateToken, async (req, res) => {
       countParams.push(status);
     }
 
-    // Use the targetDate already declared above
-    countParamIndex++;
-    countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
-    countParams.push(targetDate);
+    if (shift_id) {
+      countParamIndex++;
+      countSql += ` AND pl.shift_id = $${countParamIndex}`;
+      countParams.push(parseInt(shift_id));
+    } else {
+      const targetDate = date || new Date().toISOString().split('T')[0];
+      countParamIndex++;
+      countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
+      countParams.push(targetDate);
+    }
 
     if (search) {
       countParamIndex++;
@@ -1184,12 +1231,11 @@ router.get('/crusher-logs', authenticateToken, async (req, res) => {
 
 // 12. Get washing line logs with date filter, search, and pagination
 router.get('/washing-logs', authenticateToken, async (req, res) => {
-  const { subLine, date, search, status, page = 1, limit = 10 } = req.query;
+  const { subLine, date, search, status, shift_id, page = 1, limit = 10 } = req.query;
   const materialTypeId = req.user.materialTypeId;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   try {
-    // Get Washing station ID from database by code
     const stationResult = await pool.query("SELECT id FROM stations WHERE code = 'WSH' LIMIT 1");
     if (stationResult.rows.length === 0) {
       return res.json({ success: true, data: [], pagination: { total: 0, page: 1, limit: 10, totalPages: 0 } });
@@ -1205,41 +1251,42 @@ router.get('/washing-logs', authenticateToken, async (req, res) => {
     const params = [washingStationId];
     let paramIndex = 1;
 
-    // Filter by material type (Role)
     if (materialTypeId) {
       paramIndex++;
       sql += ` AND os.material_type_id = $${paramIndex}`;
       params.push(materialTypeId);
     }
 
-    // Filter by sub-line (Washing 1, Washing 2, Washing 3)
     if (subLine) {
       paramIndex++;
       sql += ` AND pl.sub_line = $${paramIndex}`;
       params.push(subLine);
     }
 
-    // Filter by status (pending, processing, Completed)
     if (status) {
       paramIndex++;
       sql += ` AND pl.status = $${paramIndex}`;
       params.push(status);
     }
 
-    // Filter by date (default to current date if not provided)
-    const targetDate = date || new Date().toISOString().split('T')[0];
-    paramIndex++;
-    sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
-    params.push(targetDate);
+    // shift_id takes priority: scope to exact shift; otherwise fall back to date filter
+    if (shift_id) {
+      paramIndex++;
+      sql += ` AND pl.shift_id = $${paramIndex}`;
+      params.push(parseInt(shift_id));
+    } else {
+      const targetDate = date || new Date().toISOString().split('T')[0];
+      paramIndex++;
+      sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
+      params.push(targetDate);
+    }
 
-    // Search filter (by QR code)
     if (search) {
       paramIndex++;
       sql += ` AND pl.output_bag_qr ILIKE $${paramIndex}`;
       params.push(`%${search}%`);
     }
 
-    // Get total count for pagination (build count query separately)
     let countSql = `SELECT COUNT(*) as total
                     FROM production_logs pl
                     JOIN operator_shifts os ON pl.shift_id = os.id
@@ -1265,10 +1312,16 @@ router.get('/washing-logs', authenticateToken, async (req, res) => {
       countParams.push(status);
     }
 
-    // Use the targetDate already declared above
-    countParamIndex++;
-    countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
-    countParams.push(targetDate);
+    if (shift_id) {
+      countParamIndex++;
+      countSql += ` AND pl.shift_id = $${countParamIndex}`;
+      countParams.push(parseInt(shift_id));
+    } else {
+      const targetDate = date || new Date().toISOString().split('T')[0];
+      countParamIndex++;
+      countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
+      countParams.push(targetDate);
+    }
 
     if (search) {
       countParamIndex++;
@@ -1303,12 +1356,11 @@ router.get('/washing-logs', authenticateToken, async (req, res) => {
 
 // 13. Get extrusion line logs with date filter, search, and pagination
 router.get('/extrusion-logs', authenticateToken, async (req, res) => {
-  const { subLine, date, search, status, page = 1, limit = 10 } = req.query;
+  const { subLine, date, search, status, shift_id, page = 1, limit = 10 } = req.query;
   const materialTypeId = req.user.materialTypeId;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   try {
-    // Get Extrusion station ID from database by code (try common codes)
     const stationResult = await pool.query("SELECT id FROM stations WHERE code = 'EXT' OR code = 'EXTR' OR name ILIKE '%extrusion%' LIMIT 1");
     if (stationResult.rows.length === 0) {
       return res.json({ success: true, data: [], pagination: { total: 0, page: 1, limit: 10, totalPages: 0 } });
@@ -1324,41 +1376,42 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
     const params = [extrusionStationId];
     let paramIndex = 1;
 
-    // Filter by material type (Role)
     if (materialTypeId) {
       paramIndex++;
       sql += ` AND os.material_type_id = $${paramIndex}`;
       params.push(materialTypeId);
     }
 
-    // Filter by sub-line (Extrusion 1, Extrusion 2, Extrusion 3)
     if (subLine) {
       paramIndex++;
       sql += ` AND pl.sub_line = $${paramIndex}`;
       params.push(subLine);
     }
 
-    // Filter by status (pending, processing, Completed)
     if (status) {
       paramIndex++;
       sql += ` AND pl.status = $${paramIndex}`;
       params.push(status);
     }
 
-    // Filter by date (default to current date if not provided)
-    const targetDate = date || new Date().toISOString().split('T')[0];
-    paramIndex++;
-    sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
-    params.push(targetDate);
+    // shift_id takes priority: scope to exact shift; otherwise fall back to date filter
+    if (shift_id) {
+      paramIndex++;
+      sql += ` AND pl.shift_id = $${paramIndex}`;
+      params.push(parseInt(shift_id));
+    } else {
+      const targetDate = date || new Date().toISOString().split('T')[0];
+      paramIndex++;
+      sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
+      params.push(targetDate);
+    }
 
-    // Search filter (by QR code)
     if (search) {
       paramIndex++;
       sql += ` AND pl.output_bag_qr ILIKE $${paramIndex}`;
       params.push(`%${search}%`);
     }
 
-    // Get total count for pagination (build count query separately)
     let countSql = `SELECT COUNT(*) as total
                     FROM production_logs pl
                     JOIN operator_shifts os ON pl.shift_id = os.id
@@ -1384,10 +1437,16 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
       countParams.push(status);
     }
 
-    // Use the targetDate already declared above
-    countParamIndex++;
-    countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
-    countParams.push(targetDate);
+    if (shift_id) {
+      countParamIndex++;
+      countSql += ` AND pl.shift_id = $${countParamIndex}`;
+      countParams.push(parseInt(shift_id));
+    } else {
+      const targetDate = date || new Date().toISOString().split('T')[0];
+      countParamIndex++;
+      countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
+      countParams.push(targetDate);
+    }
 
     if (search) {
       countParamIndex++;
