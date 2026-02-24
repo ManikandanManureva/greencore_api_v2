@@ -817,6 +817,83 @@ router.get('/closed-shift/:shiftId/summary', authenticateToken, async (req, res)
   }
 });
 
+// 8.3 Universal shift summary — works for both active and closed shifts (used by PPIC)
+router.get('/shift/:shiftId/summary', authenticateToken, async (req, res) => {
+  const { shiftId } = req.params;
+  try {
+    const shiftRow = await pool.query(
+      `SELECT os.id, os.start_time, os.is_active, st.name AS shift_name, u.name AS operator_name, os.end_remark
+       FROM operator_shifts os
+       LEFT JOIN shift_types st ON st.id = os.shift_type_id
+       LEFT JOIN users u ON u.id = os.user_id
+       WHERE os.id = $1`,
+      [shiftId]
+    );
+    if (shiftRow.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Shift not found' });
+    }
+    const row = shiftRow.rows[0];
+    const aggResult = await pool.query(
+      `SELECT s.id, s.code, s.name,
+              COUNT(pl.id) AS cnt,
+              COALESCE(SUM(pl.weight), 0) AS tot
+       FROM production_logs pl
+       JOIN stations s ON s.id = pl.station_id
+       WHERE pl.shift_id = $1
+         AND pl.status != 'Cancelled'
+       GROUP BY s.id, s.code, s.name`,
+      [shiftId]
+    );
+    const byStation = { crusher: { outputs: 0, weight: '0.0' }, washing: { outputs: 0, weight: '0.0' }, extrusion: { outputs: 0, weight: '0.0' } };
+    for (const r of aggResult.rows) {
+      const code = (r.code || '').toUpperCase();
+      const name = (r.name || '').toLowerCase();
+      let key = null;
+      if (code === 'CRS' || name.includes('crusher')) key = 'crusher';
+      else if (code === 'WSH' || name.includes('washing')) key = 'washing';
+      else if (code === 'EXT' || code === 'EXTR' || name.includes('extrusion')) key = 'extrusion';
+      if (!key) continue;
+      byStation[key].outputs += parseInt(r.cnt, 10);
+      byStation[key].weight = String((Number(byStation[key].weight) + Number(r.tot)).toFixed(1));
+    }
+    const totalOutputs = byStation.crusher.outputs + byStation.washing.outputs + byStation.extrusion.outputs;
+    const totalWeight = (Number(byStation.crusher.weight) + Number(byStation.washing.weight) + Number(byStation.extrusion.weight)).toFixed(1);
+    const byProductsRes = await pool.query(
+      `SELECT b.id, b.shift_id, b.station_id, s.name AS station_name, b.name, b.category, b.weight
+       FROM by_product_logs b
+       LEFT JOIN stations s ON s.id = b.station_id
+       WHERE b.shift_id = $1 ORDER BY b.id`,
+      [shiftId]
+    );
+    const byProducts = byProductsRes.rows.map((r) => ({
+      id: r.id,
+      shiftId: r.shift_id,
+      stationId: r.station_id,
+      stationName: r.station_name || '',
+      name: r.name,
+      category: r.category || '',
+      weight: Number(r.weight) || 0,
+    }));
+    res.json({
+      success: true,
+      data: {
+        shift: row.shift_name || 'N/A',
+        operator: row.operator_name || 'N/A',
+        date: row.start_time ? new Date(row.start_time).toLocaleDateString() : '',
+        isActive: row.is_active,
+        totalOutputs,
+        totalWeight,
+        byStation,
+        remark: row.end_remark || '',
+        byProducts,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching shift summary:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
 // 8.5 PPIC: Update closed shift remark (edit any data from PC production)
 router.put('/closed-shift/:shiftId/remark', authenticateToken, async (req, res) => {
   const { shiftId } = req.params;
