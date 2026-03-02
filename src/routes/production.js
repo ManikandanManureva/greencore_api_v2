@@ -277,14 +277,30 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
     if (stationCode === 'CRS' && subLine) {
       if (subLine === '3E') {
         finalStationCode = 'C3E';
+        stationDisplayName = `${stationName}-3E`;
       } else if (subLine === 'Rapid') {
         finalStationCode = 'CRP';
+        stationDisplayName = `${stationName}-Rapid`;
       } else if (subLine === 'Betty') {
         finalStationCode = 'CBT';
+        stationDisplayName = `${stationName}-Betty`;
+      // PE Crusher-Washing output type codes
+      } else if (subLine === 'FPS') {
+        finalStationCode = 'FPS';
+        stationDisplayName = 'Crusher-Washing-Flakes PE Super';
+      } else if (subLine === 'FP1') {
+        finalStationCode = 'FP1';
+        stationDisplayName = 'Crusher-Washing-Flakes PE 1';
+      } else if (subLine === 'FES') {
+        finalStationCode = 'FES';
+        stationDisplayName = 'Crusher-Washing-Flakes EVA Super';
+      } else if (subLine === 'FE1') {
+        finalStationCode = 'FE1';
+        stationDisplayName = 'Crusher-Washing-Flakes EVA 1';
       } else {
         finalStationCode = 'CRP'; // Default fallback
+        stationDisplayName = `${stationName}-${subLine}`;
       }
-      stationDisplayName = `${stationName}-${subLine}`;
     } else if (stationCode === 'WSH' && subLine) {
       if (subLine === 'Washing 1') {
         finalStationCode = 'W1';
@@ -310,6 +326,19 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
       } else if (subLine === 'Mixture') {
         finalStationCode = 'MIX';
         stationDisplayName = `${stationName}-MIX`;
+      // PE Extruder output type codes
+      } else if (subLine === 'PPS') {
+        finalStationCode = 'PPS';
+        stationDisplayName = 'Extruder-Pellet PE Super';
+      } else if (subLine === 'PP1') {
+        finalStationCode = 'PP1';
+        stationDisplayName = 'Extruder-Pellet PE 1';
+      } else if (subLine === 'PES') {
+        finalStationCode = 'PES';
+        stationDisplayName = 'Extruder-Pellet EVA Super';
+      } else if (subLine === 'PV1') {
+        finalStationCode = 'PV1';
+        stationDisplayName = 'Extruder-Pellet EVA 1';
       }
     }
 
