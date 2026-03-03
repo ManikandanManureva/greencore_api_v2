@@ -127,17 +127,39 @@ router.get('/active-shift', authenticateToken, async (req, res) => {
   }
 });
 
+// 7a. Get the most recent shift (active or closed) for the logged-in user — today only
+router.get('/latest-shift', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const result = await pool.query(
+      `SELECT id, is_active, start_time, end_time, shift_type_id, user_id
+       FROM operator_shifts
+       WHERE user_id = $1
+         AND start_time::date = CURRENT_DATE
+       ORDER BY start_time DESC
+       LIMIT 1`,
+      [userId]
+    );
+    if (result.rows.length === 0) {
+      return res.json({ success: true, data: null });
+    }
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error('Error fetching latest shift:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
 // 7. Check shift status
 router.get('/shift-status/:shiftId', authenticateToken, async (req, res) => {
   const { shiftId } = req.params;
-  const userId = req.user.id;
 
   try {
     const result = await pool.query(
       `SELECT id, is_active, start_time, end_time, user_id 
        FROM operator_shifts 
-       WHERE id = $1 AND user_id = $2`,
-      [shiftId, userId]
+       WHERE id = $1`,
+      [shiftId]
     );
 
     if (result.rows.length === 0) {
@@ -478,8 +500,8 @@ router.post('/log', authenticateToken, async (req, res) => {
     const isWashing = stationCode === 'WSH' || stationName.toLowerCase().includes('washing');
     const isExtrusion = stationCode === 'EXT' || stationCode === 'EXTR' || stationName.toLowerCase().includes('extrusion');
     if (isCrusher || isWashing || isExtrusion) {
-      // Use worker-selected status (pending = temporary jumbo bag, Completed = final jumbo bag) or default pending
-      finalStatus = (status === 'Completed' || status === 'completed') ? 'Completed' : 'pending';
+      // All crusher/washing/extrusion outputs default to pending until consumed by the next stage
+      finalStatus = 'pending';
     } else {
       finalStatus = status || 'Completed';
     }
@@ -965,7 +987,7 @@ router.get('/logs/:shiftId', authenticateToken, async (req, res) => {
 router.get('/search-logs', authenticateToken, async (req, res) => {
   // source_sub_lines: comma-separated list to restrict which sub-lines can appear as inputs
   // Used by Betty crusher so it only sees 3E/Rapid bags, not its own Betty bags.
-  const { query, stationId, targetStationId: targetStationIdParam, currentStationId, status, source_sub_lines } = req.query;
+  const { query, stationId, targetStationId: targetStationIdParam, currentStationId, status, source_sub_lines, shift_id } = req.query;
   const materialTypeId = req.user.materialTypeId;
 
   try {
@@ -1051,6 +1073,13 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
         sql += ` AND pl.sub_line = ANY($${paramIndex}::text[])`;
         params.push(allowed);
       }
+    }
+
+    // Scope search to the same operator shift (prevents cross-shift bag conflicts)
+    if (shift_id) {
+      paramIndex++;
+      sql += ` AND pl.shift_id = $${paramIndex}`;
+      params.push(parseInt(shift_id));
     }
 
     // Exclude bags that are already processing at the current station.
@@ -1581,6 +1610,186 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Error fetching extrusion logs:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// 10.9 Final Packing logs
+router.get('/final-packing-logs', authenticateToken, async (req, res) => {
+  const { date, search, status, shift_id, page = 1, limit = 10 } = req.query;
+  const materialTypeId = req.user.materialTypeId;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+
+  try {
+    const stationResult = await pool.query(
+      `SELECT id FROM stations WHERE id = 50 OR name ILIKE '%final%' OR name ILIKE '%re-packaging%' LIMIT 1`
+    );
+    if (stationResult.rows.length === 0) {
+      return res.json({ success: true, data: [], pagination: { total: 0, page: 1, limit: 10, totalPages: 0 } });
+    }
+    const stationId = stationResult.rows[0].id;
+
+    let sql = `SELECT pl.*, os.start_time, st.name as shift_name, mt.name as material_name
+               FROM production_logs pl
+               JOIN operator_shifts os ON pl.shift_id = os.id
+               LEFT JOIN shift_types st ON os.shift_type_id = st.id
+               LEFT JOIN material_types mt ON os.material_type_id = mt.id
+               WHERE pl.station_id = $1`;
+    const params = [stationId];
+    let paramIndex = 1;
+
+    if (materialTypeId) {
+      paramIndex++;
+      sql += ` AND os.material_type_id = $${paramIndex}`;
+      params.push(materialTypeId);
+    }
+
+    if (status) {
+      paramIndex++;
+      sql += ` AND pl.status = $${paramIndex}`;
+      params.push(status);
+    }
+
+    if (shift_id) {
+      paramIndex++;
+      sql += ` AND pl.shift_id = $${paramIndex}`;
+      params.push(parseInt(shift_id));
+    } else {
+      const targetDate = date || new Date().toISOString().split('T')[0];
+      paramIndex++;
+      sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
+      params.push(targetDate);
+    }
+
+    if (search) {
+      paramIndex++;
+      sql += ` AND pl.output_bag_qr ILIKE $${paramIndex}`;
+      params.push(`%${search}%`);
+    }
+
+    let countSql = `SELECT COUNT(*) as total FROM production_logs pl
+                    JOIN operator_shifts os ON pl.shift_id = os.id
+                    WHERE pl.station_id = $1`;
+    const countParams = [stationId];
+    let countParamIndex = 1;
+
+    if (materialTypeId) {
+      countParamIndex++;
+      countSql += ` AND os.material_type_id = $${countParamIndex}`;
+      countParams.push(materialTypeId);
+    }
+    if (status) {
+      countParamIndex++;
+      countSql += ` AND pl.status = $${countParamIndex}`;
+      countParams.push(status);
+    }
+    if (shift_id) {
+      countParamIndex++;
+      countSql += ` AND pl.shift_id = $${countParamIndex}`;
+      countParams.push(parseInt(shift_id));
+    } else {
+      const targetDate = date || new Date().toISOString().split('T')[0];
+      countParamIndex++;
+      countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
+      countParams.push(targetDate);
+    }
+    if (search) {
+      countParamIndex++;
+      countSql += ` AND pl.output_bag_qr ILIKE $${countParamIndex}`;
+      countParams.push(`%${search}%`);
+    }
+
+    const countResult = await pool.query(countSql, countParams);
+    const total = parseInt(countResult.rows[0].total);
+
+    sql += ` ORDER BY pl.created_at DESC LIMIT $${paramIndex + 1} OFFSET $${paramIndex + 2}`;
+    params.push(parseInt(limit), offset);
+
+    const result = await pool.query(sql, params);
+    res.json({
+      success: true,
+      data: result.rows,
+      pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / parseInt(limit)) }
+    });
+  } catch (error) {
+    console.error('Error fetching final packing logs:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// 10.10 PPIC Station Overview — all stations, per-station logs, grouped
+router.get('/ppic-station-overview', authenticateToken, async (req, res) => {
+  const { date, shift_type_id } = req.query;
+  const materialTypeId = req.user.materialTypeId;
+  const targetDate = date || new Date().toISOString().split('T')[0];
+
+  try {
+    let sql = `
+      SELECT pl.id, pl.output_bag_qr, pl.weight, pl.status, pl.sub_line, pl.created_at,
+             s.id as station_id, s.name as station_name, s.code as station_code,
+             st.name as shift_name, u.name as operator_name
+      FROM production_logs pl
+      JOIN stations s ON pl.station_id = s.id
+      JOIN operator_shifts os ON pl.shift_id = os.id
+      LEFT JOIN shift_types st ON os.shift_type_id = st.id
+      LEFT JOIN users u ON os.user_id = u.id
+      WHERE DATE(pl.created_at) = $1
+    `;
+    const params = [targetDate];
+    let paramIndex = 1;
+
+    if (materialTypeId) {
+      paramIndex++;
+      sql += ` AND os.material_type_id = $${paramIndex}`;
+      params.push(materialTypeId);
+    }
+
+    if (shift_type_id) {
+      paramIndex++;
+      sql += ` AND os.shift_type_id = $${paramIndex}`;
+      params.push(parseInt(shift_type_id));
+    }
+
+    sql += ` ORDER BY s.id ASC, pl.created_at DESC`;
+
+    const result = await pool.query(sql, params);
+
+    // Group by station
+    const grouped = {};
+    for (const row of result.rows) {
+      const key = row.station_id;
+      if (!grouped[key]) {
+        grouped[key] = {
+          station_id: row.station_id,
+          station_name: row.station_name,
+          station_code: row.station_code,
+          logs: [],
+          total_bags: 0,
+          total_weight: 0,
+        };
+      }
+      grouped[key].logs.push({
+        id: row.id,
+        output_bag_qr: row.output_bag_qr,
+        weight: row.weight,
+        status: row.status,
+        sub_line: row.sub_line,
+        created_at: row.created_at,
+        shift_name: row.shift_name,
+        operator_name: row.operator_name,
+      });
+      grouped[key].total_bags += 1;
+      grouped[key].total_weight += parseFloat(row.weight || 0);
+    }
+
+    const stations = Object.values(grouped).map((g) => ({
+      ...g,
+      total_weight: parseFloat(g.total_weight.toFixed(2)),
+    }));
+
+    res.json({ success: true, data: stations, date: targetDate });
+  } catch (error) {
+    console.error('Error fetching PPIC station overview:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 });
