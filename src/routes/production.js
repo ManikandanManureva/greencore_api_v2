@@ -306,7 +306,7 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
       } else if (subLine === 'Betty') {
         finalStationCode = 'CBT';
         stationDisplayName = `${stationName}-Betty`;
-      // PE Crusher-Washing output type codes
+        // PE Crusher-Washing output type codes
       } else if (subLine === 'FPS') {
         finalStationCode = 'FPS';
         stationDisplayName = 'Crusher-Washing-Flakes PE Super';
@@ -348,7 +348,7 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
       } else if (subLine === 'Mixture') {
         finalStationCode = 'MIX';
         stationDisplayName = `${stationName}-MIX`;
-      // PE Extruder output type codes
+        // PE Extruder output type codes
       } else if (subLine === 'PPS') {
         finalStationCode = 'PPS';
         stationDisplayName = 'Extruder-Pellet PE Super';
@@ -1002,8 +1002,10 @@ router.get('/logs/:shiftId', authenticateToken, async (req, res) => {
 router.get('/search-logs', authenticateToken, async (req, res) => {
   // source_sub_lines: comma-separated list to restrict which sub-lines can appear as inputs
   // Used by Betty crusher so it only sees 3E/Rapid bags, not its own Betty bags.
-  const { query, stationId, targetStationId: targetStationIdParam, currentStationId, status, source_sub_lines, shift_id } = req.query;
+  const { query, stationId, targetStationId: targetStationIdParam, currentStationId, status, source_sub_lines, shift_id, for_input } = req.query;
   const materialTypeId = req.user.materialTypeId;
+  // When for_input=1 (scan/search input from previous station), allow batches from any shift and optionally any material type so S1 bags work in S2
+  const isForInput = for_input === '1' || for_input === 'true';
 
   try {
     // Support both targetStationId (frontend) and stationId (legacy). E.g. extrusion uses
@@ -1064,9 +1066,8 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
       params.push(`%${query}%`);
     }
 
-    // Filter by material type (Role). Use COALESCE so logs with pl.material_type_id
-    // (or NULL) match when shift material type matches user.
-    if (materialTypeId) {
+    // Filter by material type (Role). Skip when for_input=1 so S1 batches can be scanned/consumed in S2 (any shift, any day).
+    if (materialTypeId && !isForInput) {
       paramIndex++;
       sql += ` AND COALESCE(pl.material_type_id, os.material_type_id) = $${paramIndex}`;
       params.push(materialTypeId);
