@@ -398,7 +398,9 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
 
 // 7. Log production data
 router.post('/log', authenticateToken, async (req, res) => {
-  const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, status, subLine, remark, shiftTypeId: shiftTypeIdBody } = req.body;
+  const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, subLine, remark, shiftTypeId: shiftTypeIdBody } = req.body;
+  // Read status explicitly (client sends "Completed" or "pending"); accept any casing
+  const status = req.body.status != null ? String(req.body.status).trim() : null;
   const materialTypeId = req.user.materialTypeId;
 
   try {
@@ -495,15 +497,24 @@ router.post('/log', authenticateToken, async (req, res) => {
     }
 
     // Worker chooses status by jumbo bag type: temporary → pending, final → Completed
+    // Always respect client-sent status when provided (e.g. "Final (Completed)" in label preview).
     let finalStatus;
-    const isCrusher = stationCode === 'CRS' || stationName.toLowerCase().includes('crusher');
-    const isWashing = stationCode === 'WSH' || stationName.toLowerCase().includes('washing');
-    const isExtrusion = stationCode === 'EXT' || stationCode === 'EXTR' || stationName.toLowerCase().includes('extrusion');
-    if (isCrusher || isWashing || isExtrusion) {
-      // All crusher/washing/extrusion outputs default to pending until consumed by the next stage
+    const hasStatusFromClient = status != null && String(status).trim() !== '';
+    const rawStatus = hasStatusFromClient ? String(status).trim() : null;
+    const isCrusher = stationCode === 'CRS' || (stationName && String(stationName).toLowerCase().includes('crusher'));
+    const isWashing = stationCode === 'WSH' || (stationName && String(stationName).toLowerCase().includes('washing'));
+    const isExtrusion = stationCode === 'EXT' || stationCode === 'EXTR' || (stationName && String(stationName).toLowerCase().includes('extrusion'));
+    if (rawStatus !== null) {
+      // Normalize to DB convention: Completed, pending, Cancelled (match existing queries in codebase)
+      const lower = rawStatus.toLowerCase();
+      if (lower === 'completed') finalStatus = 'Completed';
+      else if (lower === 'cancelled') finalStatus = 'Cancelled';
+      else finalStatus = lower; // e.g. pending, Pending -> pending
+    } else if (isCrusher || isWashing || isExtrusion) {
+      // Default: crusher/washing/extrusion outputs are pending until consumed by the next stage
       finalStatus = 'pending';
     } else {
-      finalStatus = status || 'Completed';
+      finalStatus = 'Completed';
     }
 
     const result = await pool.query(
@@ -513,7 +524,11 @@ router.post('/log', authenticateToken, async (req, res) => {
       [shiftId, stationId, materialTypeId, inputBagQr, finalOutputBagQr, weight, photoUrl, finalStatus, subLine, remark || null]
     );
 
-    res.json({ success: true, message: 'Log recorded successfully', data: result.rows[0] });
+    const row = result.rows[0];
+    if (row && row.status !== finalStatus) {
+      row.status = finalStatus;
+    }
+    res.json({ success: true, message: 'Log recorded successfully', data: row });
   } catch (error) {
     console.error('Error recording log:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
@@ -1075,7 +1090,7 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
       }
     }
 
-    // Scope search to the same operator shift (prevents cross-shift bag conflicts)
+    // Optional: scope to a specific shift. When omitted, returns pending batches from any shift/day (status-based consumption).
     if (shift_id) {
       paramIndex++;
       sql += ` AND pl.shift_id = $${paramIndex}`;
