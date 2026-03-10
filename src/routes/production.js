@@ -1060,10 +1060,18 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
     let paramIndex = 0;
 
     // Add search filter only if query is provided and not empty
-    if (query && query.trim().length > 0) {
+    // Use trimmed query; when for_input=1 also allow exact match so full scanned batch IDs (e.g. S1-W3 in S3-EXT) match reliably
+    const q = (query && String(query).trim()) || '';
+    if (q.length > 0) {
       paramIndex++;
-      sql += ` AND pl.output_bag_qr ILIKE $${paramIndex}`;
-      params.push(`%${query}%`);
+      sql += ` AND (pl.output_bag_qr ILIKE $${paramIndex}`;
+      params.push(`%${q}%`);
+      if (isForInput) {
+        paramIndex++;
+        sql += ` OR pl.output_bag_qr = $${paramIndex}`;
+        params.push(q);
+      }
+      sql += ')';
     }
 
     // Filter by material type (Role). Skip when for_input=1 so S1 batches can be scanned/consumed in S2 (any shift, any day).
@@ -1122,7 +1130,12 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
       // Default to 'Completed' for stations other than washing
       sql += ` AND pl.status = 'Completed'`;
     }
-    sql += ` ORDER BY pl.created_at DESC LIMIT 20`;
+    // When for_input=1 (input search/scan): any shift, any date — use larger limit and oldest-first so yesterday's pending shows
+    if (isForInput) {
+      sql += ` ORDER BY pl.created_at ASC LIMIT 200`;
+    } else {
+      sql += ` ORDER BY pl.created_at DESC LIMIT 20`;
+    }
 
     if (req.query.debug === '1') {
       console.log('[search-logs] query params:', { query, targetStationId, currentStationId, status });
