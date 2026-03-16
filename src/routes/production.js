@@ -1271,7 +1271,9 @@ router.put('/logs-update/:id', authenticateToken, async (req, res) => {
 // 11. Get crusher line logs with date filter, search, and pagination
 router.get('/crusher-logs', authenticateToken, async (req, res) => {
   const { subLine, date, search, status, shift_id, page = 1, limit = 10 } = req.query;
-  const materialTypeId = req.user.materialTypeId;
+  const isPpic = (req.user.role || '').toLowerCase() === 'ppic';
+  // PPIC can see all crusher logs and filter by machine (sub_line); operators scope by material type
+  const materialTypeId = isPpic ? null : req.user.materialTypeId;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   try {
@@ -1298,8 +1300,8 @@ router.get('/crusher-logs', authenticateToken, async (req, res) => {
 
     if (subLine) {
       paramIndex++;
-      sql += ` AND pl.sub_line = $${paramIndex}`;
-      params.push(subLine);
+      sql += ` AND LOWER(TRIM(COALESCE(pl.sub_line, ''))) = LOWER(TRIM($${paramIndex}))`;
+      params.push(String(subLine).trim());
     }
 
     if (status) {
@@ -1341,8 +1343,8 @@ router.get('/crusher-logs', authenticateToken, async (req, res) => {
 
     if (subLine) {
       countParamIndex++;
-      countSql += ` AND pl.sub_line = $${countParamIndex}`;
-      countParams.push(subLine);
+      countSql += ` AND LOWER(TRIM(COALESCE(pl.sub_line, ''))) = LOWER(TRIM($${countParamIndex}))`;
+      countParams.push(String(subLine).trim());
     }
 
     if (status) {
