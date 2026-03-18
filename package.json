@@ -7,6 +7,7 @@
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "setup-db": "node src/scripts/setup-db.js",
+    "init-schema": "node src/scripts/init-production-schema.js",
     "create-refresh-tokens": "node src/scripts/create-refresh-tokens-table.js",
     "migrate": "node src/scripts/ensure-schema-migrations.js",
     "create:ppic": "node src/scripts/create-ppic-user.js",
