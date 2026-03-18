@@ -13,16 +13,8 @@ const productionRoutes = require('./routes/production');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CORS: set CORS_ORIGIN (comma-separated) in production, e.g.
-// http://localhost:5173,http://13.229.26.101:5173,http://54.169.140.182:5173
-const corsOrigins = process.env.CORS_ORIGIN
-  ? process.env.CORS_ORIGIN.split(',').map((s) => s.trim()).filter(Boolean)
-  : null;
-if (corsOrigins?.length) {
-  app.use(cors({ origin: corsOrigins, credentials: true }));
-} else {
-  app.use(cors());
-}
+// Middleware
+app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
