@@ -1321,16 +1321,15 @@ router.get('/crusher-logs', authenticateToken, async (req, res) => {
       params.push(status);
     }
 
-    // shift_id takes priority: scope to exact shift; otherwise fall back to date filter
+    // Always apply date filter (selected date or today); optionally narrow by shift_id for "today"
+    const targetDate = date || new Date().toISOString().split('T')[0];
+    paramIndex++;
+    sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
+    params.push(targetDate);
     if (shift_id) {
       paramIndex++;
       sql += ` AND pl.shift_id = $${paramIndex}`;
       params.push(parseInt(shift_id));
-    } else {
-      const targetDate = date || new Date().toISOString().split('T')[0];
-      paramIndex++;
-      sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
-      params.push(targetDate);
     }
 
     if (search) {
@@ -1364,15 +1363,13 @@ router.get('/crusher-logs', authenticateToken, async (req, res) => {
       countParams.push(status);
     }
 
+    countParamIndex++;
+    countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
+    countParams.push(targetDate);
     if (shift_id) {
       countParamIndex++;
       countSql += ` AND pl.shift_id = $${countParamIndex}`;
       countParams.push(parseInt(shift_id));
-    } else {
-      const targetDate = date || new Date().toISOString().split('T')[0];
-      countParamIndex++;
-      countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
-      countParams.push(targetDate);
     }
 
     if (search) {
@@ -1446,16 +1443,15 @@ router.get('/washing-logs', authenticateToken, async (req, res) => {
       params.push(status);
     }
 
-    // shift_id takes priority: scope to exact shift; otherwise fall back to date filter
+    // Always apply date filter; optionally narrow by shift_id for "today"
+    const washingTargetDate = date || new Date().toISOString().split('T')[0];
+    paramIndex++;
+    sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
+    params.push(washingTargetDate);
     if (shift_id) {
       paramIndex++;
       sql += ` AND pl.shift_id = $${paramIndex}`;
       params.push(parseInt(shift_id));
-    } else {
-      const targetDate = date || new Date().toISOString().split('T')[0];
-      paramIndex++;
-      sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
-      params.push(targetDate);
     }
 
     if (search) {
@@ -1489,15 +1485,13 @@ router.get('/washing-logs', authenticateToken, async (req, res) => {
       countParams.push(status);
     }
 
+    countParamIndex++;
+    countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
+    countParams.push(washingTargetDate);
     if (shift_id) {
       countParamIndex++;
       countSql += ` AND pl.shift_id = $${countParamIndex}`;
       countParams.push(parseInt(shift_id));
-    } else {
-      const targetDate = date || new Date().toISOString().split('T')[0];
-      countParamIndex++;
-      countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
-      countParams.push(targetDate);
     }
 
     if (search) {
@@ -1571,16 +1565,15 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
       params.push(status);
     }
 
-    // shift_id takes priority: scope to exact shift; otherwise fall back to date filter
+    // Always apply date filter; optionally narrow by shift_id for "today"
+    const extrusionTargetDate = date || new Date().toISOString().split('T')[0];
+    paramIndex++;
+    sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
+    params.push(extrusionTargetDate);
     if (shift_id) {
       paramIndex++;
       sql += ` AND pl.shift_id = $${paramIndex}`;
       params.push(parseInt(shift_id));
-    } else {
-      const targetDate = date || new Date().toISOString().split('T')[0];
-      paramIndex++;
-      sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
-      params.push(targetDate);
     }
 
     if (search) {
@@ -1614,15 +1607,13 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
       countParams.push(status);
     }
 
+    countParamIndex++;
+    countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
+    countParams.push(extrusionTargetDate);
     if (shift_id) {
       countParamIndex++;
       countSql += ` AND pl.shift_id = $${countParamIndex}`;
       countParams.push(parseInt(shift_id));
-    } else {
-      const targetDate = date || new Date().toISOString().split('T')[0];
-      countParamIndex++;
-      countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
-      countParams.push(targetDate);
     }
 
     if (search) {
@@ -1692,15 +1683,15 @@ router.get('/final-packing-logs', authenticateToken, async (req, res) => {
       params.push(status);
     }
 
+    // Always apply date filter; optionally narrow by shift_id for "today"
+    const packingTargetDate = date || new Date().toISOString().split('T')[0];
+    paramIndex++;
+    sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
+    params.push(packingTargetDate);
     if (shift_id) {
       paramIndex++;
       sql += ` AND pl.shift_id = $${paramIndex}`;
       params.push(parseInt(shift_id));
-    } else {
-      const targetDate = date || new Date().toISOString().split('T')[0];
-      paramIndex++;
-      sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
-      params.push(targetDate);
     }
 
     if (search) {
@@ -1725,15 +1716,13 @@ router.get('/final-packing-logs', authenticateToken, async (req, res) => {
       countSql += ` AND pl.status = $${countParamIndex}`;
       countParams.push(status);
     }
+    countParamIndex++;
+    countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
+    countParams.push(packingTargetDate);
     if (shift_id) {
       countParamIndex++;
       countSql += ` AND pl.shift_id = $${countParamIndex}`;
       countParams.push(parseInt(shift_id));
-    } else {
-      const targetDate = date || new Date().toISOString().split('T')[0];
-      countParamIndex++;
-      countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
-      countParams.push(targetDate);
     }
     if (search) {
       countParamIndex++;
