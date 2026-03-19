@@ -1008,13 +1008,16 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
   const isForInput = for_input === '1' || for_input === 'true';
 
   try {
-    // Support both targetStationId (frontend) and stationId (legacy). E.g. extrusion uses
-    // targetStationId=3&currentStationId=49&status=pending; final packing uses only
-    // query&currentStationId=50 (no targetStationId → "all station batch").
     let targetStationId = targetStationIdParam || stationId;
     let targetStatus = status;
 
-    // Always check currentStationId first to determine if we're searching from Washing or Extrusion station
+    // PE Extrusion input comes from CRS (Crusher-Washing); PC/PET from WSH. Resolve material type name.
+    let materialTypeName = null;
+    if (materialTypeId) {
+      const mtRes = await pool.query('SELECT name FROM material_types WHERE id = $1', [materialTypeId]);
+      if (mtRes.rows.length > 0) materialTypeName = (mtRes.rows[0].name || '').toUpperCase();
+    }
+
     if (currentStationId) {
       const currentStationResult = await pool.query(
         "SELECT code FROM stations WHERE id = $1 LIMIT 1",
@@ -1024,21 +1027,29 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
       if (currentStationResult.rows.length > 0) {
         const currentStationCode = currentStationResult.rows[0].code;
 
-        // If current station is Washing, search for Crusher batches with pending status
+        // Washing: input from Crusher (CRS)
         if (currentStationCode === 'WSH') {
           const crusherStationResult = await pool.query("SELECT id FROM stations WHERE code = 'CRS' LIMIT 1");
           if (crusherStationResult.rows.length > 0) {
-            targetStationId = crusherStationResult.rows[0].id; // Override with Crusher station ID
-            targetStatus = targetStatus || 'pending'; // Default to 'pending' if not explicitly specified
+            targetStationId = crusherStationResult.rows[0].id;
+            targetStatus = targetStatus || 'pending';
           }
         }
 
-        // If current station is Extrusion, search for Washing batches with pending status
+        // Extrusion: PE → CRS (Crusher-Washing) bags; PC/PET → WSH (Washing) bags
         if (currentStationCode === 'EXT' || currentStationCode === 'EXTR') {
-          const washingStationResult = await pool.query("SELECT id FROM stations WHERE code = 'WSH' LIMIT 1");
-          if (washingStationResult.rows.length > 0) {
-            targetStationId = washingStationResult.rows[0].id; // Override with Washing station ID
-            targetStatus = targetStatus || 'pending'; // Default to 'pending' if not explicitly specified
+          if (materialTypeName === 'PE') {
+            const crusherStationResult = await pool.query("SELECT id FROM stations WHERE code = 'CRS' LIMIT 1");
+            if (crusherStationResult.rows.length > 0) {
+              targetStationId = crusherStationResult.rows[0].id;
+              targetStatus = targetStatus || 'pending';
+            }
+          } else {
+            const washingStationResult = await pool.query("SELECT id FROM stations WHERE code = 'WSH' LIMIT 1");
+            if (washingStationResult.rows.length > 0) {
+              targetStationId = washingStationResult.rows[0].id;
+              targetStatus = targetStatus || 'pending';
+            }
           }
         }
       }
@@ -1074,8 +1085,8 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
       sql += ')';
     }
 
-    // Filter by material type (Role). Skip when for_input=1 so S1 batches can be scanned/consumed in S2 (any shift, any day).
-    if (materialTypeId && !isForInput) {
+    // Filter by material type: PC login → only PC QR/batches, PE login → only PE (all inputs and lists).
+    if (materialTypeId) {
       paramIndex++;
       sql += ` AND COALESCE(pl.material_type_id, os.material_type_id) = $${paramIndex}`;
       params.push(materialTypeId);
