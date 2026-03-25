@@ -1036,13 +1036,22 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
           }
         }
 
-        // Extrusion: PE → CRS (Crusher-Washing) bags; PC/PET → WSH (Washing) bags
+        // Extrusion: PE → CRS (Crusher-Washing) bags; PC → WSH; PET Boretech → client passes CRS or WSH (dual-source), else default WSH
         if (currentStationCode === 'EXT' || currentStationCode === 'EXTR') {
           if (materialTypeName === 'PE') {
             const crusherStationResult = await pool.query("SELECT id FROM stations WHERE code = 'CRS' LIMIT 1");
             if (crusherStationResult.rows.length > 0) {
               targetStationId = crusherStationResult.rows[0].id;
               targetStatus = targetStatus || 'pending';
+            }
+          } else if (materialTypeName === 'PET') {
+            targetStatus = targetStatus || 'pending';
+            const explicitTarget = targetStationIdParam || stationId;
+            if (!explicitTarget) {
+              const washingStationResult = await pool.query("SELECT id FROM stations WHERE code = 'WSH' LIMIT 1");
+              if (washingStationResult.rows.length > 0) {
+                targetStationId = washingStationResult.rows[0].id;
+              }
             }
           } else {
             const washingStationResult = await pool.query("SELECT id FROM stations WHERE code = 'WSH' LIMIT 1");
@@ -1101,12 +1110,14 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
     }
 
     // Restrict to specific source sub-lines (e.g. Betty only sees 3E/Rapid bags)
+    // Case-insensitive + trim so "Rapid", "RAPID", "CRP" (if stored as sub_line) all match crusher-logs behavior
     if (source_sub_lines) {
       const allowed = String(source_sub_lines).split(',').map(s => s.trim()).filter(Boolean);
       if (allowed.length > 0) {
+        const allowedLower = allowed.map((a) => String(a).toLowerCase().trim());
         paramIndex++;
-        sql += ` AND pl.sub_line = ANY($${paramIndex}::text[])`;
-        params.push(allowed);
+        sql += ` AND LOWER(TRIM(COALESCE(pl.sub_line, ''))) = ANY($${paramIndex}::text[])`;
+        params.push(allowedLower);
       }
     }
 
@@ -1649,18 +1660,26 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
 
 // 10.9 Final Packing logs
 router.get('/final-packing-logs', authenticateToken, async (req, res) => {
-  const { date, search, status, shift_id, page = 1, limit = 10 } = req.query;
+  const { date, search, status, shift_id, station_id, page = 1, limit = 10 } = req.query;
   const materialTypeId = req.user.materialTypeId;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   try {
-    const stationResult = await pool.query(
-      `SELECT id FROM stations WHERE id = 50 OR name ILIKE '%final%' OR name ILIKE '%re-packaging%' LIMIT 1`
-    );
-    if (stationResult.rows.length === 0) {
-      return res.json({ success: true, data: [], pagination: { total: 0, page: 1, limit: 10, totalPages: 0 } });
+    let stationId;
+    const sid = station_id != null && String(station_id).trim() !== '' ? parseInt(String(station_id), 10) : NaN;
+    if (!Number.isNaN(sid) && sid > 0) {
+      const check = await pool.query('SELECT id FROM stations WHERE id = $1 AND is_active = true', [sid]);
+      if (check.rows.length > 0) stationId = sid;
     }
-    const stationId = stationResult.rows[0].id;
+    if (stationId == null) {
+      const stationResult = await pool.query(
+        `SELECT id FROM stations WHERE id = 50 OR name ILIKE '%final%' OR name ILIKE '%re-packaging%' LIMIT 1`
+      );
+      if (stationResult.rows.length === 0) {
+        return res.json({ success: true, data: [], pagination: { total: 0, page: 1, limit: 10, totalPages: 0 } });
+      }
+      stationId = stationResult.rows[0].id;
+    }
 
     let sql = `SELECT pl.*, os.start_time, st.name as shift_name, mt.name as material_name
                FROM production_logs pl
