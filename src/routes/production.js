@@ -30,23 +30,59 @@ router.get('/stations', authenticateToken, async (req, res) => {
   const materialTypeId = req.user.materialTypeId;
 
   try {
-    let result;
+    let rows;
     if (materialTypeId) {
       // Get stations mapped to this user's material flow
-      result = await pool.query(
+      const result = await pool.query(
         `SELECT s.* FROM stations s
          JOIN material_flow_stations mfs ON s.id = mfs.station_id
          WHERE mfs.material_type_id = $1 AND s.is_active = true
          ORDER BY s.order_index`,
         [materialTypeId]
       );
+      rows = result.rows;
+
+      // Legacy DBs: PE flow was seeded without EXT — append Extrusion so operators see the full line
+      const mt = await pool.query('SELECT name FROM material_types WHERE id = $1', [materialTypeId]);
+      if (mt.rows[0]?.name === 'PE') {
+        const hasExtrusion = rows.some((s) => {
+          const c = String(s.code || '').toUpperCase();
+          const n = (s.name || '').toLowerCase();
+          return (
+            c === 'EXT' ||
+            c === 'EXTR' ||
+            n.includes('extrusion') ||
+            n.includes('extruder') ||
+            n.includes('boretech')
+          );
+        });
+        if (!hasExtrusion) {
+          const extRes = await pool.query(
+            `SELECT * FROM stations WHERE is_active = true
+             AND (
+               UPPER(COALESCE(code, '')) IN ('EXT', 'EXTR')
+               OR LOWER(COALESCE(name, '')) LIKE '%extrusion%'
+               OR LOWER(COALESCE(name, '')) LIKE '%extruder%'
+             )
+             ORDER BY order_index NULLS LAST, id
+             LIMIT 1`
+          );
+          const extRow = extRes.rows[0];
+          if (extRow && !rows.some((r) => r.id === extRow.id)) {
+            rows = [...rows, extRow].sort(
+              (a, b) => (a.order_index ?? 0) - (b.order_index ?? 0) || a.id - b.id
+            );
+          }
+        }
+      }
     } else {
       // Fallback to all active stations
-      result = await pool.query(
+      const result = await pool.query(
         'SELECT * FROM stations WHERE is_active = true ORDER BY order_index'
       );
+      rows = result.rows;
     }
-    res.json({ success: true, data: result.rows });
+    res.json({ success: true, data: rows });
   } catch (error) {
     console.error('Error fetching stations:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
@@ -403,6 +439,14 @@ router.post('/log', authenticateToken, async (req, res) => {
   const status = req.body.status != null ? String(req.body.status).trim() : null;
   const materialTypeId = req.user.materialTypeId;
 
+  const weightNum = Number(weight);
+  if (weight === undefined || weight === null || weight === '' || !Number.isFinite(weightNum) || weightNum <= 0) {
+    return res.status(400).json({
+      success: false,
+      message: 'Valid positive weight (kg) is required',
+    });
+  }
+
   try {
     let finalOutputBagQr = outputBagQr;
     let stationCode = null; // Will be used for status determination
@@ -521,7 +565,7 @@ router.post('/log', authenticateToken, async (req, res) => {
       `INSERT INTO production_logs (shift_id, station_id, material_type_id, input_bag_qr, output_bag_qr, weight, photo_url, status, sub_line, remark)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING *`,
-      [shiftId, stationId, materialTypeId, inputBagQr, finalOutputBagQr, weight, photoUrl, finalStatus, subLine, remark || null]
+      [shiftId, stationId, materialTypeId, inputBagQr, finalOutputBagQr, weightNum, photoUrl, finalStatus, subLine, remark || null]
     );
 
     const row = result.rows[0];
@@ -1225,7 +1269,8 @@ router.put('/update-log-weight', authenticateToken, async (req, res) => {
     return res.status(400).json({ success: false, message: 'logId and weight are required' });
   }
 
-  if (isNaN(weight) || weight < 0) {
+  const w = Number(weight);
+  if (!Number.isFinite(w) || w <= 0) {
     return res.status(400).json({ success: false, message: 'Weight must be a valid positive number' });
   }
 
@@ -1235,7 +1280,7 @@ router.put('/update-log-weight', authenticateToken, async (req, res) => {
        SET weight = $1
        WHERE id = $2
        RETURNING *`,
-      [weight, logId]
+      [w, logId]
     );
 
     if (result.rows.length === 0) {

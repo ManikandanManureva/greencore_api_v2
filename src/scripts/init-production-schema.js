@@ -298,10 +298,10 @@ async function initProductionSchema() {
       }
     }
 
-    // PE Flow: Crusher, Washing, Packaging
+    // PE Flow: Crusher, Washing, Extrusion, Final Packaging (same line as PC minus Label Removal)
     if (matPE.rows[0]) {
       const peId = matPE.rows[0].id;
-      for (const code of ['CRS', 'WSH', 'PKG']) {
+      for (const code of ['CRS', 'WSH', 'EXT', 'PKG']) {
         await addMapping(peId, code);
       }
     }
