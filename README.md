@@ -39,6 +39,27 @@ This will:
 - Create necessary tables
 - Create a default admin user (Employee ID: OP001, Password: password123)
 
+### PPIC user (for testing View / edit closed reports)
+
+To test the app as **PPIC** (review and edit closed shifts, edit waste weights, reprint reports):
+
+1. Create the PPIC user (from `greencore_api_v2` folder):
+   ```bash
+   npm run create:ppic
+   ```
+   Default credentials: **Employee ID: `PPIC`**, **Password: `password123`**.
+
+2. Optional – custom employee ID and password:
+   ```bash
+   node src/scripts/create-ppic-user.js YOUR_ID yourpassword
+   ```
+
+3. In the app, log out (if needed), then log in with:
+   - **Employee ID:** `PPIC`
+   - **Password:** `password123`
+
+4. After login, on the Dashboard you will see **View / edit closed reports** (blue button). Use it to open a closed shift, edit waste weights, and regenerate the PDF.
+
 ## Running the Server
 
 Development mode (with auto-reload):
@@ -125,3 +146,5 @@ Authorization: Bearer <token>
 - JWT tokens are used for authentication
 - Change default credentials in production
 - Use strong JWT_SECRET in production environment
+
+test
