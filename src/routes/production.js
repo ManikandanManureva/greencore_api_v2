@@ -398,6 +398,13 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
         finalStationCode = 'PV1';
         stationDisplayName = 'Extruder-Pellet EVA 1';
       }
+    } else if (stationCode === 'PKG' && subLine) {
+      // PET: same DB station (PKG) for Starlinger outputs (Pellet PET) and Final Packing (Final PET) — label preview must show the correct step name
+      if (subLine === 'Pellet PET') {
+        stationDisplayName = 'Starlinger';
+      } else if (subLine === 'Final PET') {
+        stationDisplayName = stationName || 'Final Packing';
+      }
     }
 
     // Count for increment
@@ -548,13 +555,16 @@ router.post('/log', authenticateToken, async (req, res) => {
     const isCrusher = stationCode === 'CRS' || (stationName && String(stationName).toLowerCase().includes('crusher'));
     const isWashing = stationCode === 'WSH' || (stationName && String(stationName).toLowerCase().includes('washing'));
     const isExtrusion = stationCode === 'EXT' || stationCode === 'EXTR' || (stationName && String(stationName).toLowerCase().includes('extrusion'));
+    const isRepackaging = stationName && String(stationName).toLowerCase().includes('re-packaging');
     if (rawStatus !== null) {
       // Normalize to DB convention: Completed, pending, Cancelled (match existing queries in codebase)
       const lower = rawStatus.toLowerCase();
       if (lower === 'completed') finalStatus = 'Completed';
       else if (lower === 'cancelled') finalStatus = 'Cancelled';
+      // Re-packaging is the final PC product: treat pending as Completed (operators expect finished goods, not WIP)
+      else if (isRepackaging && lower === 'pending') finalStatus = 'Completed';
       else finalStatus = lower; // e.g. pending, Pending -> pending
-    } else if (isCrusher || isWashing || isExtrusion) {
+    } else if ((isCrusher || isWashing || isExtrusion) && !isRepackaging) {
       // Default: crusher/washing/extrusion outputs are pending until consumed by the next stage
       finalStatus = 'pending';
     } else {
@@ -855,17 +865,19 @@ router.get('/closed-shift/:shiftId/summary', authenticateToken, async (req, res)
   const { shiftId } = req.params;
   try {
     const shiftRow = await pool.query(
-      `SELECT os.id, os.start_time, st.name AS shift_name, u.name AS operator_name, os.end_remark
+      `SELECT os.id, os.start_time, st.name AS shift_name, u.name AS operator_name, os.end_remark,
+              mt.name AS material_type_name
        FROM operator_shifts os
        LEFT JOIN shift_types st ON st.id = os.shift_type_id
        LEFT JOIN users u ON u.id = os.user_id
+       LEFT JOIN material_types mt ON mt.id = os.material_type_id
        WHERE os.id = $1 AND os.is_active = false`,
       [shiftId]
     );
     if (shiftRow.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Closed shift not found' });
     }
-    const row = shiftRow.rows[0];
+    const shift = shiftRow.rows[0];
     // Aggregate per station in one query; exclude Cancelled so counts match actual production
     const aggResult = await pool.query(
       `SELECT s.id, s.code, s.name,
@@ -879,16 +891,16 @@ router.get('/closed-shift/:shiftId/summary', authenticateToken, async (req, res)
       [shiftId]
     );
     const byStation = { crusher: { outputs: 0, weight: '0.0' }, washing: { outputs: 0, weight: '0.0' }, extrusion: { outputs: 0, weight: '0.0' } };
-    for (const row of aggResult.rows) {
-      const code = (row.code || '').toUpperCase();
-      const name = (row.name || '').toLowerCase();
+    for (const ar of aggResult.rows) {
+      const code = (ar.code || '').toUpperCase();
+      const name = (ar.name || '').toLowerCase();
       let key = null;
       if (code === 'CRS' || name.includes('crusher')) key = 'crusher';
       else if (code === 'WSH' || name.includes('washing')) key = 'washing';
       else if (code === 'EXT' || code === 'EXTR' || name.includes('extrusion')) key = 'extrusion';
       if (!key) continue;
-      byStation[key].outputs += parseInt(row.cnt, 10);
-      byStation[key].weight = String((Number(byStation[key].weight) + Number(row.tot)).toFixed(1));
+      byStation[key].outputs += parseInt(ar.cnt, 10);
+      byStation[key].weight = String((Number(byStation[key].weight) + Number(ar.tot)).toFixed(1));
     }
     const totalOutputs = byStation.crusher.outputs + byStation.washing.outputs + byStation.extrusion.outputs;
     const totalWeight = (Number(byStation.crusher.weight) + Number(byStation.washing.weight) + Number(byStation.extrusion.weight)).toFixed(1);
@@ -911,14 +923,15 @@ router.get('/closed-shift/:shiftId/summary', authenticateToken, async (req, res)
     res.json({
       success: true,
       data: {
-        shift: row.shift_name || 'N/A',
-        operator: row.operator_name || 'N/A',
-        date: row.start_time ? new Date(row.start_time).toLocaleDateString() : '',
+        shift: shift.shift_name || 'N/A',
+        operator: shift.operator_name || 'N/A',
+        date: shift.start_time ? new Date(shift.start_time).toLocaleDateString() : '',
         totalOutputs,
         totalWeight,
         byStation,
-        remark: row.end_remark || '',
+        remark: shift.end_remark || '',
         byProducts,
+        materialTypeName: shift.material_type_name || null,
       },
     });
   } catch (error) {
@@ -932,10 +945,12 @@ router.get('/shift/:shiftId/summary', authenticateToken, async (req, res) => {
   const { shiftId } = req.params;
   try {
     const shiftRow = await pool.query(
-      `SELECT os.id, os.start_time, os.is_active, st.name AS shift_name, u.name AS operator_name, os.end_remark
+      `SELECT os.id, os.start_time, os.is_active, st.name AS shift_name, u.name AS operator_name, os.end_remark,
+              mt.name AS material_type_name
        FROM operator_shifts os
        LEFT JOIN shift_types st ON st.id = os.shift_type_id
        LEFT JOIN users u ON u.id = os.user_id
+       LEFT JOIN material_types mt ON mt.id = os.material_type_id
        WHERE os.id = $1`,
       [shiftId]
     );
@@ -996,6 +1011,7 @@ router.get('/shift/:shiftId/summary', authenticateToken, async (req, res) => {
         byStation,
         remark: row.end_remark || '',
         byProducts,
+        materialTypeName: row.material_type_name || null,
       },
     });
   } catch (error) {
