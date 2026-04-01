@@ -399,21 +399,27 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
         stationDisplayName = 'Extruder-Pellet EVA 1';
       }
     } else if (stationCode === 'PKG' && subLine) {
-      // PET: same DB station (PKG) for Starlinger outputs (Pellet PET) and Final Packing (Final PET) — label preview must show the correct step name
+      // PET: same DB station id can serve two UI steps; use distinct QR station codes.
       if (subLine === 'Pellet PET') {
+        finalStationCode = 'STL';
         stationDisplayName = 'Starlinger';
       } else if (subLine === 'Final PET') {
+        finalStationCode = 'FPK';
         stationDisplayName = stationName || 'Final Packing';
       }
     }
 
     // Count for increment
-    const countResult = await pool.query(
-      `SELECT COUNT(*) as count 
+    let countSql = `SELECT COUNT(*) as count 
        FROM production_logs 
-       WHERE station_id = $1 AND created_at >= CURRENT_DATE`,
-      [stationId]
-    );
+       WHERE station_id = $1 AND created_at >= CURRENT_DATE`;
+    const countParams = [stationId];
+    // Keep numbering independent for Starlinger vs Final PET outputs.
+    if (stationCode === 'PKG' && (subLine === 'Pellet PET' || subLine === 'Final PET')) {
+      countSql += ` AND sub_line = $2`;
+      countParams.push(subLine);
+    }
+    const countResult = await pool.query(countSql, countParams);
     const increment = String(parseInt(countResult.rows[0].count, 10) + 1).padStart(3, '0');
     const materialCode = (material_name && String(material_name).trim()) || 'PC';
     const safeStationCode = (finalStationCode && String(finalStationCode).trim()) || stationCode || 'UNK';
@@ -527,18 +533,25 @@ router.post('/log', authenticateToken, async (req, res) => {
         else if (subLine === 'Extrusion 2') finalStationCode = 'E2';
         else if (subLine === 'Extrusion 3') finalStationCode = 'E3';
         else if (subLine === 'Mixture') finalStationCode = 'MIX';
+      } else if (stationCode === 'PKG' && subLine) {
+        if (subLine === 'Pellet PET') finalStationCode = 'STL';
+        else if (subLine === 'Final PET') finalStationCode = 'FPK';
       }
 
       // Count for increment
-      const countResult = await pool.query(
-        `SELECT COUNT(*) as count 
+      let countSql = `SELECT COUNT(*) as count 
          FROM production_logs pl
          JOIN operator_shifts os ON pl.shift_id = os.id
          WHERE os.shift_type_id = (SELECT shift_type_id FROM operator_shifts WHERE id = $1)
            AND pl.station_id = $2
-           AND os.start_time::date = $3::date`,
-        [shiftId, stationId, start_time]
-      );
+           AND os.start_time::date = $3::date`;
+      const countParams = [shiftId, stationId, start_time];
+      // Keep numbering independent for Starlinger vs Final PET outputs.
+      if (stationCode === 'PKG' && (subLine === 'Pellet PET' || subLine === 'Final PET')) {
+        countSql += ` AND pl.sub_line = $4`;
+        countParams.push(subLine);
+      }
+      const countResult = await pool.query(countSql, countParams);
 
       const increment = String(parseInt(countResult.rows[0].count) + 1).padStart(3, '0');
 
@@ -1763,15 +1776,17 @@ router.get('/final-packing-logs', authenticateToken, async (req, res) => {
       params.push(status);
     }
 
-    // Always apply date filter; optionally narrow by shift_id for "today"
+    // Prefer shift_id scope when provided (active/current shift), because DATE(created_at)
+    // can hide valid rows around timezone boundaries.
     const packingTargetDate = date || new Date().toISOString().split('T')[0];
-    paramIndex++;
-    sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
-    params.push(packingTargetDate);
     if (shift_id) {
       paramIndex++;
       sql += ` AND pl.shift_id = $${paramIndex}`;
       params.push(parseInt(shift_id));
+    } else {
+      paramIndex++;
+      sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
+      params.push(packingTargetDate);
     }
 
     if (search) {
@@ -1796,13 +1811,14 @@ router.get('/final-packing-logs', authenticateToken, async (req, res) => {
       countSql += ` AND pl.status = $${countParamIndex}`;
       countParams.push(status);
     }
-    countParamIndex++;
-    countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
-    countParams.push(packingTargetDate);
     if (shift_id) {
       countParamIndex++;
       countSql += ` AND pl.shift_id = $${countParamIndex}`;
       countParams.push(parseInt(shift_id));
+    } else {
+      countParamIndex++;
+      countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
+      countParams.push(packingTargetDate);
     }
     if (search) {
       countParamIndex++;
