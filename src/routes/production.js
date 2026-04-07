@@ -1747,7 +1747,10 @@ router.get('/final-packing-logs', authenticateToken, async (req, res) => {
     }
     if (stationId == null) {
       const stationResult = await pool.query(
-        `SELECT id FROM stations WHERE id = 50 OR name ILIKE '%final%' OR name ILIKE '%re-packaging%' LIMIT 1`
+        `SELECT id FROM stations WHERE is_active = true
+         AND (UPPER(TRIM(code)) = 'PKG' OR name ILIKE '%final%' OR name ILIKE '%re-packaging%')
+         ORDER BY CASE WHEN UPPER(TRIM(code)) = 'PKG' THEN 0 ELSE 1 END, id ASC
+         LIMIT 1`
       );
       if (stationResult.rows.length === 0) {
         return res.json({ success: true, data: [], pagination: { total: 0, page: 1, limit: 10, totalPages: 0 } });
@@ -1776,16 +1779,24 @@ router.get('/final-packing-logs', authenticateToken, async (req, res) => {
       params.push(status);
     }
 
-    // Prefer shift_id scope when provided (active/current shift), because DATE(created_at)
-    // can hide valid rows around timezone boundaries.
-    const packingTargetDate = date || new Date().toISOString().split('T')[0];
+    // Optional shift scope (current shift) + calendar day from date picker.
+    // If we only filter by shift_id, multi-day shifts show yesterday's rows while the UI date is "today".
+    const packingTargetDate =
+      date && String(date).trim() !== ''
+        ? String(date).trim().split('T')[0]
+        : new Date().toISOString().split('T')[0];
     if (shift_id) {
       paramIndex++;
       sql += ` AND pl.shift_id = $${paramIndex}`;
-      params.push(parseInt(shift_id));
-    } else {
+      params.push(parseInt(shift_id, 10));
+    }
+    if (date && String(date).trim() !== '') {
       paramIndex++;
-      sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
+      sql += ` AND DATE(pl.created_at) = $${paramIndex}::date`;
+      params.push(packingTargetDate);
+    } else if (!shift_id) {
+      paramIndex++;
+      sql += ` AND DATE(pl.created_at) = $${paramIndex}::date`;
       params.push(packingTargetDate);
     }
 
@@ -1814,10 +1825,15 @@ router.get('/final-packing-logs', authenticateToken, async (req, res) => {
     if (shift_id) {
       countParamIndex++;
       countSql += ` AND pl.shift_id = $${countParamIndex}`;
-      countParams.push(parseInt(shift_id));
-    } else {
+      countParams.push(parseInt(shift_id, 10));
+    }
+    if (date && String(date).trim() !== '') {
       countParamIndex++;
-      countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
+      countSql += ` AND DATE(pl.created_at) = $${countParamIndex}::date`;
+      countParams.push(packingTargetDate);
+    } else if (!shift_id) {
+      countParamIndex++;
+      countSql += ` AND DATE(pl.created_at) = $${countParamIndex}::date`;
       countParams.push(packingTargetDate);
     }
     if (search) {
