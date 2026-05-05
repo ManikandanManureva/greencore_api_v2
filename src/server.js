@@ -13,8 +13,16 @@ const productionRoutes = require('./routes/production');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
+// Middleware — expose headers so browser JS can read filename / row count on cross-origin export
+app.use(
+  cors({
+    exposedHeaders: [
+      'Content-Disposition',
+      'X-Export-Row-Count',
+      'X-Export-Truncated',
+    ],
+  }),
+);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 

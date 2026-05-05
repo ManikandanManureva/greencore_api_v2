@@ -1868,7 +1868,7 @@ router.get('/ppic-station-overview', authenticateToken, async (req, res) => {
 
   try {
     let sql = `
-      SELECT pl.id, pl.output_bag_qr, pl.weight, pl.status, pl.sub_line, pl.created_at,
+      SELECT pl.id, pl.output_bag_qr, pl.weight, pl.status, pl.sub_line, pl.remark, pl.created_at,
              s.id as station_id, s.name as station_name, s.code as station_code,
              st.name as shift_name, u.name as operator_name
       FROM production_logs pl
@@ -1917,6 +1917,7 @@ router.get('/ppic-station-overview', authenticateToken, async (req, res) => {
         weight: row.weight,
         status: row.status,
         sub_line: row.sub_line,
+        remark: row.remark ?? null,
         created_at: row.created_at,
         shift_name: row.shift_name,
         operator_name: row.operator_name,
@@ -1937,44 +1938,45 @@ router.get('/ppic-station-overview', authenticateToken, async (req, res) => {
   }
 });
 
-// 13a. All production logs with filters (for backoffice production-logs page)
-// Query params: date_start, date_end, station_code (CRS|WSH|EXT), sub_line, material_type, shift_type, limit
-router.get('/logs-all', authenticateToken, async (req, res) => {
-  const { date_start, date_end, station_code, sub_line, material_type, shift_type, limit = 500 } = req.query;
-  try {
-    const params = [];
-    const conds = [];
+/**
+ * Shared flat rows for /logs-all (JSON) and /logs-all-export (CSV download).
+ * Query params: date_start, date_end, station_code, sub_line, material_type, shift_type, limit
+ */
+async function fetchLogsAllFlatRows(query) {
+  const { date_start, date_end, station_code, sub_line, material_type, shift_type, limit = 500 } = query;
+  const params = [];
+  const conds = [];
 
-    if (date_start && /^\d{4}-\d{2}-\d{2}$/.test(String(date_start).trim())) {
-      params.push(String(date_start).trim());
-      conds.push(`pl.created_at::date >= $${params.length}`);
-    }
-    if (date_end && /^\d{4}-\d{2}-\d{2}$/.test(String(date_end).trim())) {
-      params.push(String(date_end).trim());
-      conds.push(`pl.created_at::date <= $${params.length}`);
-    }
-    if (station_code && station_code !== 'all') {
-      params.push(String(station_code).toUpperCase().trim());
-      conds.push(`s.code = $${params.length}`);
-    }
-    if (sub_line && sub_line !== 'all') {
-      params.push(String(sub_line).trim());
-      conds.push(`COALESCE(NULLIF(TRIM(COALESCE(pl.sub_line,'')), ''), 'General') = $${params.length}`);
-    }
-    if (material_type && material_type !== 'all') {
-      params.push(String(material_type).trim());
-      conds.push(`mt.name = $${params.length}`);
-    }
-    if (shift_type && shift_type !== 'all') {
-      params.push(String(shift_type).trim());
-      conds.push(`sht.name = $${params.length}`);
-    }
+  if (date_start && /^\d{4}-\d{2}-\d{2}$/.test(String(date_start).trim())) {
+    params.push(String(date_start).trim());
+    conds.push(`pl.created_at::date >= $${params.length}`);
+  }
+  if (date_end && /^\d{4}-\d{2}-\d{2}$/.test(String(date_end).trim())) {
+    params.push(String(date_end).trim());
+    conds.push(`pl.created_at::date <= $${params.length}`);
+  }
+  if (station_code && station_code !== 'all') {
+    params.push(String(station_code).toUpperCase().trim());
+    conds.push(`s.code = $${params.length}`);
+  }
+  if (sub_line && sub_line !== 'all') {
+    params.push(String(sub_line).trim());
+    conds.push(`COALESCE(NULLIF(TRIM(COALESCE(pl.sub_line,'')), ''), 'General') = $${params.length}`);
+  }
+  if (material_type && material_type !== 'all') {
+    params.push(String(material_type).trim());
+    conds.push(`mt.name = $${params.length}`);
+  }
+  if (shift_type && shift_type !== 'all') {
+    params.push(String(shift_type).trim());
+    conds.push(`sht.name = $${params.length}`);
+  }
 
-    const where = conds.length ? 'AND ' + conds.join(' AND ') : '';
-    params.push(Math.min(parseInt(String(limit), 10) || 500, 1000));
-    const limitParam = `$${params.length}`;
+  const where = conds.length ? 'AND ' + conds.join(' AND ') : '';
+  params.push(Math.min(parseInt(String(limit), 10) || 500, 25000));
+  const limitParam = `$${params.length}`;
 
-    const sql = `
+  const sql = `
       SELECT
         pl.id,
         pl.created_at,
@@ -2003,11 +2005,80 @@ router.get('/logs-all', authenticateToken, async (req, res) => {
       LIMIT ${limitParam}
     `;
 
-    const result = await pool.query(sql, params);
+  const result = await pool.query(sql, params);
+  return result.rows;
+}
+
+function csvEscape(val) {
+  if (val == null || val === '') return '';
+  const s = String(val);
+  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+// CSV file download (same filters as logs-all; reliable in browser via Content-Disposition)
+router.get('/logs-all-export', authenticateToken, async (req, res) => {
+  try {
+    const rows = await fetchLogsAllFlatRows(req.query);
+    const headers = [
+      'ID',
+      'Recorded at',
+      'Station code',
+      'Station',
+      'Sub-line',
+      'Material type',
+      'Shift',
+      'Shift ID',
+      'Operator',
+      'Weight (kg)',
+      'Status',
+      'Input QR',
+      'Output QR',
+      'Remark',
+    ];
+    const lines = [headers.join(',')];
+    for (const row of rows) {
+      lines.push([
+        csvEscape(row.id),
+        csvEscape(row.created_at),
+        csvEscape(row.station_code),
+        csvEscape(row.station_name),
+        csvEscape(row.sub_line),
+        csvEscape(row.material_type),
+        csvEscape(row.shift_type),
+        csvEscape(row.shift_id),
+        csvEscape(row.operator_name),
+        csvEscape(row.weight),
+        csvEscape(row.status),
+        csvEscape(row.input_bag_qr),
+        csvEscape(row.output_bag_qr),
+        csvEscape(row.remark),
+      ].join(','));
+    }
+    const csv = '\uFEFF' + lines.join('\r\n');
+    const ds = String(req.query.date_start || '').trim().replace(/[^\d-]/g, '') || 'start';
+    const de = String(req.query.date_end || '').trim().replace(/[^\d-]/g, '') || 'end';
+    const filename = `production-transactions_${ds}_${de}.csv`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('X-Export-Row-Count', String(rows.length));
+    if (rows.length >= 25000) res.setHeader('X-Export-Truncated', '1');
+    res.send(csv);
+  } catch (error) {
+    console.error('[logs-all-export] ERROR:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// 13a. All production logs with filters (for backoffice production-logs page)
+// Query params: date_start, date_end, station_code (CRS|WSH|EXT), sub_line, material_type, shift_type, limit
+router.get('/logs-all', authenticateToken, async (req, res) => {
+  try {
+    const rows = await fetchLogsAllFlatRows(req.query);
 
     // Group by station → sub_line for the response
     const grouped = {};
-    for (const row of result.rows) {
+    for (const row of rows) {
       const stKey = row.station_code || 'OTHER';
       const slKey = row.sub_line || 'General';
       if (!grouped[stKey]) grouped[stKey] = { stationName: row.station_name, stationCode: stKey, subLines: {} };
@@ -2043,7 +2114,7 @@ router.get('/logs-all', authenticateToken, async (req, res) => {
       }
     }
 
-    res.json({ success: true, data: grouped, total: result.rows.length });
+    res.json({ success: true, data: grouped, total: rows.length });
   } catch (error) {
     console.error('[logs-all] ERROR:', error.message);
     res.status(500).json({ success: false, message: error.message });
