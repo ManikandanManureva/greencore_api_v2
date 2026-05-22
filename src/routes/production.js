@@ -3,6 +3,189 @@ const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
+/**
+ * PET bag QR segment codes by process (not raw DB station code).
+ * Boretech = sieving/sorting flakes (BRT). Starlinger = extrusion/pelletizing (EXT).
+ */
+function resolveQrStationCodes(stationCode, stationName, subLine) {
+  let finalStationCode = stationCode || 'UNK';
+  let stationDisplayName = stationName || '';
+
+  if (subLine === 'Flakes PET') {
+    return { finalStationCode: 'BRT', stationDisplayName: 'Boretech' };
+  }
+  if (subLine === 'Pellet PET') {
+    return { finalStationCode: 'EXT', stationDisplayName: 'Starlinger' };
+  }
+  if (subLine === 'Final PET') {
+    return {
+      finalStationCode: 'FPK',
+      stationDisplayName: stationName || 'Final Packing',
+    };
+  }
+
+  const code = String(stationCode || '').toUpperCase();
+  const nameLower = String(stationName || '').toLowerCase();
+
+  if (code === 'CRS' && subLine) {
+    if (subLine === '3E') {
+      finalStationCode = 'C3E';
+      stationDisplayName = `${stationName}-3E`;
+    } else if (subLine === 'Rapid') {
+      finalStationCode = 'CRP';
+      stationDisplayName = `${stationName}-Rapid`;
+    } else if (subLine === 'Betty') {
+      finalStationCode = 'CBT';
+      stationDisplayName = `${stationName}-Betty`;
+    } else if (subLine === 'FPS') {
+      finalStationCode = 'FPS';
+      stationDisplayName = 'Crusher-Washing-Flakes PE Super';
+    } else if (subLine === 'FP1') {
+      finalStationCode = 'FP1';
+      stationDisplayName = 'Crusher-Washing-Flakes PE 1';
+    } else if (subLine === 'FES') {
+      finalStationCode = 'FES';
+      stationDisplayName = 'Crusher-Washing-Flakes EVA Super';
+    } else if (subLine === 'FE1') {
+      finalStationCode = 'FE1';
+      stationDisplayName = 'Crusher-Washing-Flakes EVA 1';
+    } else {
+      finalStationCode = 'CRP';
+      stationDisplayName = `${stationName}-${subLine}`;
+    }
+  } else if (code === 'WSH' && subLine) {
+    if (subLine === 'Washing 1') {
+      finalStationCode = 'W1';
+      stationDisplayName = `${stationName}-W1`;
+    } else if (subLine === 'Washing 2') {
+      finalStationCode = 'W2';
+      stationDisplayName = `${stationName}-W2`;
+    } else if (subLine === 'Washing 3') {
+      finalStationCode = 'W3';
+      stationDisplayName = `${stationName}-W3`;
+    }
+  } else if (
+    (code === 'EXT' ||
+      code === 'EXTR' ||
+      nameLower.includes('extrusion') ||
+      nameLower.includes('boretech')) &&
+    subLine
+  ) {
+    if (subLine === 'Extrusion 1') {
+      finalStationCode = 'E1';
+      stationDisplayName = `${stationName}-E1`;
+    } else if (subLine === 'Extrusion 2') {
+      finalStationCode = 'E2';
+      stationDisplayName = `${stationName}-E2`;
+    } else if (subLine === 'Extrusion 3') {
+      finalStationCode = 'E3';
+      stationDisplayName = `${stationName}-E3`;
+    } else if (subLine === 'Mixture') {
+      finalStationCode = 'MIX';
+      stationDisplayName = `${stationName}-MIX`;
+    } else if (subLine === 'PPS') {
+      finalStationCode = 'PPS';
+      stationDisplayName = 'Extruder-Pellet PE Super';
+    } else if (subLine === 'PP1') {
+      finalStationCode = 'PP1';
+      stationDisplayName = 'Extruder-Pellet PE 1';
+    } else if (subLine === 'PES') {
+      finalStationCode = 'PES';
+      stationDisplayName = 'Extruder-Pellet EVA Super';
+    } else if (subLine === 'PV1') {
+      finalStationCode = 'PV1';
+      stationDisplayName = 'Extruder-Pellet EVA 1';
+    }
+  } else if (code === 'PKG' && subLine) {
+    if (subLine === 'Pellet PET') {
+      finalStationCode = 'EXT';
+      stationDisplayName = 'Starlinger';
+    } else if (subLine === 'Final PET') {
+      finalStationCode = 'FPK';
+      stationDisplayName = stationName || 'Final Packing';
+    }
+  } else if (nameLower.includes('starlinger') && subLine === 'Pellet PET') {
+    finalStationCode = 'EXT';
+    stationDisplayName = 'Starlinger';
+  }
+
+  return { finalStationCode, stationDisplayName };
+}
+
+/** Append sub_line filter for PET when counting bag numbers (independent sequences per process). */
+function appendPetSubLineCountFilter(countSql, countParams, subLine) {
+  if (subLine === 'Pellet PET' || subLine === 'Final PET' || subLine === 'Flakes PET') {
+    countParams.push(subLine);
+    return `${countSql} AND sub_line = $${countParams.length}`;
+  }
+  return countSql;
+}
+
+/** Station buckets for dashboard / closed-shift reports (includes PET line). */
+function createEmptyByStation() {
+  return {
+    crusher: { outputs: 0, weight: '0.0' },
+    washing: { outputs: 0, weight: '0.0' },
+    extrusion: { outputs: 0, weight: '0.0' },
+    boretech: { outputs: 0, weight: '0.0' },
+    starlinger: { outputs: 0, weight: '0.0' },
+    final_packing: { outputs: 0, weight: '0.0' },
+  };
+}
+
+function sumByStationTotals(byStation) {
+  let totalOutputs = 0;
+  let totalWeight = 0;
+  for (const st of Object.values(byStation)) {
+    totalOutputs += st.outputs;
+    totalWeight += Number(st.weight) || 0;
+  }
+  return { totalOutputs, totalWeight: totalWeight.toFixed(1) };
+}
+
+/**
+ * Map a production log row to a dashboard station key.
+ * PET: Boretech (BRT), Starlinger (EXT), Final Packing — not lumped into generic extrusion.
+ */
+function classifyDashboardStation(stationName, stationCode, subLine, materialTypeName) {
+  const n = (stationName || '').toLowerCase();
+  const c = (stationCode || '').toUpperCase();
+  const mat = String(materialTypeName || '').trim().toUpperCase();
+  const sl = String(subLine || '').trim();
+
+  if (sl === 'Flakes PET') return 'boretech';
+  if (sl === 'Pellet PET') return 'starlinger';
+  if (sl === 'Final PET') return 'final_packing';
+
+  if (n.includes('boretech')) return 'boretech';
+  if (n.includes('starlinger') || (n.includes('re-pack') && mat === 'PET')) return 'starlinger';
+  if (n.includes('final') && (n.includes('pack') || n.includes('packaging'))) return 'final_packing';
+  if (c === 'STL') return 'starlinger';
+
+  if (c === 'CRS' || n.includes('crusher')) return 'crusher';
+  if (c === 'WSH' || n.includes('washing')) return 'washing';
+
+  if (c === 'EXT' || c === 'EXTR' || n.includes('extrusion')) {
+    if (mat === 'PET' && (n.includes('packaging') || n.includes('boretech'))) return 'boretech';
+    return 'extrusion';
+  }
+
+  if (c === 'PKG') return 'final_packing';
+
+  return null;
+}
+
+function applyAggRowsToByStation(byStation, aggRows, materialTypeName) {
+  for (const sr of aggRows) {
+    const key = classifyDashboardStation(sr.name, sr.code, sr.sub_line, materialTypeName);
+    if (!key || !byStation[key]) continue;
+    byStation[key].outputs += parseInt(sr.cnt, 10) || 0;
+    byStation[key].weight = String(
+      (Number(byStation[key].weight) + Number(sr.tot || 0)).toFixed(1),
+    );
+  }
+}
+
 // 2. Get all shift types
 router.get('/shifts', authenticateToken, async (req, res) => {
   try {
@@ -27,7 +210,9 @@ router.get('/materials', authenticateToken, async (req, res) => {
 
 // 4. Get all active stations for the user's material flow (Role)
 router.get('/stations', authenticateToken, async (req, res) => {
-  const materialTypeId = req.user.materialTypeId;
+  const isPpic = (req.user.role || '').toLowerCase() === 'ppic';
+  // PPIC must see every line (PC, PE, PET) when viewing reports / overview
+  const materialTypeId = isPpic ? null : req.user.materialTypeId;
 
   try {
     let rows;
@@ -142,13 +327,18 @@ router.get('/active-shift', authenticateToken, async (req, res) => {
   const userId = req.user.id;
 
   try {
-    let query = 'SELECT * FROM operator_shifts WHERE user_id = $1 AND is_active = true';
+    let query = `SELECT os.*, st.name AS shift_type_name
+      FROM operator_shifts os
+      LEFT JOIN shift_types st ON st.id = os.shift_type_id
+      WHERE os.user_id = $1 AND os.is_active = true`;
     const params = [userId];
 
     if (shiftTypeId) {
-      params.push(shiftTypeId);
-      query += ` AND shift_type_id = $${params.length}`;
+      params.push(Number(shiftTypeId));
+      query += ` AND os.shift_type_id = $${params.length}`;
     }
+
+    query += ' ORDER BY os.start_time DESC LIMIT 1';
 
     const result = await pool.query(query, params);
 
@@ -239,20 +429,48 @@ router.post('/end-shift/:shiftId', authenticateToken, async (req, res) => {
 
     const shift = checkResult.rows[0];
     if (!shift.is_active) {
-      console.log(`Shift ${shiftId} is already ended`);
-      return res.status(400).json({ success: false, message: 'Shift is already ended' });
+      const ended = await pool.query(
+        `SELECT * FROM operator_shifts WHERE id = $1 AND user_id = $2`,
+        [shiftId, userId]
+      );
+      console.log(`Shift ${shiftId} already ended — idempotent OK`);
+      return res.json({
+        success: true,
+        message: 'Shift already ended',
+        alreadyEnded: true,
+        data: ended.rows[0] || shift,
+      });
     }
+
+    const remarkVal =
+      remark && String(remark).trim() ? String(remark).trim() : null;
 
     // Now end the shift (save optional end_remark)
     const result = await pool.query(
       `UPDATE operator_shifts 
-       SET is_active = false, end_time = CURRENT_TIMESTAMP, end_remark = $1
+       SET is_active = false, end_time = CURRENT_TIMESTAMP, end_remark = COALESCE($1, end_remark)
        WHERE id = $2 AND user_id = $3 AND is_active = true
        RETURNING *`,
-      [remark && String(remark).trim() ? String(remark).trim() : null, shiftId, userId]
+      [remarkVal, shiftId, userId]
     );
 
     if (result.rows.length === 0) {
+      const recheck = await pool.query(
+        `SELECT id, is_active FROM operator_shifts WHERE id = $1 AND user_id = $2`,
+        [shiftId, userId]
+      );
+      if (recheck.rows[0] && !recheck.rows[0].is_active) {
+        const ended = await pool.query(
+          `SELECT * FROM operator_shifts WHERE id = $1`,
+          [shiftId]
+        );
+        return res.json({
+          success: true,
+          message: 'Shift already ended',
+          alreadyEnded: true,
+          data: ended.rows[0],
+        });
+      }
       console.log(`Failed to end shift ${shiftId} - no rows updated`);
       return res.status(404).json({ success: false, message: 'Active shift not found' });
     }
@@ -324,101 +542,21 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
       console.log('DEBUG: Using shift_name fallback (no param):', shift_name, '-> shiftNum:', shiftNum);
     }
 
-    // Get Station Code and Name from DB
     const stationResult = await pool.query('SELECT code, name FROM stations WHERE id = $1', [stationId]);
     const stationCode = stationResult.rows[0]?.code || 'UNK';
     const stationName = stationResult.rows[0]?.name || '';
 
-    // Handle Sub-line for Crusher and Washing
-    let finalStationCode = stationCode;
-    let stationDisplayName = stationName;
-    if (stationCode === 'CRS' && subLine) {
-      if (subLine === '3E') {
-        finalStationCode = 'C3E';
-        stationDisplayName = `${stationName}-3E`;
-      } else if (subLine === 'Rapid') {
-        finalStationCode = 'CRP';
-        stationDisplayName = `${stationName}-Rapid`;
-      } else if (subLine === 'Betty') {
-        finalStationCode = 'CBT';
-        stationDisplayName = `${stationName}-Betty`;
-        // PE Crusher-Washing output type codes
-      } else if (subLine === 'FPS') {
-        finalStationCode = 'FPS';
-        stationDisplayName = 'Crusher-Washing-Flakes PE Super';
-      } else if (subLine === 'FP1') {
-        finalStationCode = 'FP1';
-        stationDisplayName = 'Crusher-Washing-Flakes PE 1';
-      } else if (subLine === 'FES') {
-        finalStationCode = 'FES';
-        stationDisplayName = 'Crusher-Washing-Flakes EVA Super';
-      } else if (subLine === 'FE1') {
-        finalStationCode = 'FE1';
-        stationDisplayName = 'Crusher-Washing-Flakes EVA 1';
-      } else {
-        finalStationCode = 'CRP'; // Default fallback
-        stationDisplayName = `${stationName}-${subLine}`;
-      }
-    } else if (stationCode === 'WSH' && subLine) {
-      if (subLine === 'Washing 1') {
-        finalStationCode = 'W1';
-        stationDisplayName = `${stationName}-W1`;
-      } else if (subLine === 'Washing 2') {
-        finalStationCode = 'W2';
-        stationDisplayName = `${stationName}-W2`;
-      } else if (subLine === 'Washing 3') {
-        finalStationCode = 'W3';
-        stationDisplayName = `${stationName}-W3`;
-      }
-    } else if ((stationCode === 'EXT' || stationCode === 'EXTR' || (stationName && String(stationName).toLowerCase().includes('extrusion'))) && subLine) {
-      // Handle Extrusion sub-lines (by code or by station name)
-      if (subLine === 'Extrusion 1') {
-        finalStationCode = 'E1';
-        stationDisplayName = `${stationName}-E1`;
-      } else if (subLine === 'Extrusion 2') {
-        finalStationCode = 'E2';
-        stationDisplayName = `${stationName}-E2`;
-      } else if (subLine === 'Extrusion 3') {
-        finalStationCode = 'E3';
-        stationDisplayName = `${stationName}-E3`;
-      } else if (subLine === 'Mixture') {
-        finalStationCode = 'MIX';
-        stationDisplayName = `${stationName}-MIX`;
-        // PE Extruder output type codes
-      } else if (subLine === 'PPS') {
-        finalStationCode = 'PPS';
-        stationDisplayName = 'Extruder-Pellet PE Super';
-      } else if (subLine === 'PP1') {
-        finalStationCode = 'PP1';
-        stationDisplayName = 'Extruder-Pellet PE 1';
-      } else if (subLine === 'PES') {
-        finalStationCode = 'PES';
-        stationDisplayName = 'Extruder-Pellet EVA Super';
-      } else if (subLine === 'PV1') {
-        finalStationCode = 'PV1';
-        stationDisplayName = 'Extruder-Pellet EVA 1';
-      }
-    } else if (stationCode === 'PKG' && subLine) {
-      // PET: same DB station id can serve two UI steps; use distinct QR station codes.
-      if (subLine === 'Pellet PET') {
-        finalStationCode = 'STL';
-        stationDisplayName = 'Starlinger';
-      } else if (subLine === 'Final PET') {
-        finalStationCode = 'FPK';
-        stationDisplayName = stationName || 'Final Packing';
-      }
-    }
+    const { finalStationCode, stationDisplayName } = resolveQrStationCodes(
+      stationCode,
+      stationName,
+      subLine
+    );
 
-    // Count for increment
     let countSql = `SELECT COUNT(*) as count 
        FROM production_logs 
        WHERE station_id = $1 AND created_at >= CURRENT_DATE`;
     const countParams = [stationId];
-    // Keep numbering independent for Starlinger vs Final PET outputs.
-    if (stationCode === 'PKG' && (subLine === 'Pellet PET' || subLine === 'Final PET')) {
-      countSql += ` AND sub_line = $2`;
-      countParams.push(subLine);
-    }
+    countSql = appendPetSubLineCountFilter(countSql, countParams, subLine);
     const countResult = await pool.query(countSql, countParams);
     const increment = String(parseInt(countResult.rows[0].count, 10) + 1).padStart(3, '0');
     const materialCode = (material_name && String(material_name).trim()) || 'PC';
@@ -512,33 +650,8 @@ router.post('/log', authenticateToken, async (req, res) => {
         shiftNum = shiftMap[String(shift_name || '').trim()] || '1';
       }
 
-      // Handle Sub-line for Crusher, Washing, and Extrusion
-      let finalStationCode = stationCode;
-      if (stationCode === 'CRS' && subLine) {
-        if (subLine === '3E') {
-          finalStationCode = 'C3E';
-        } else if (subLine === 'Rapid') {
-          finalStationCode = 'CRP';
-        } else if (subLine === 'Betty') {
-          finalStationCode = 'CBT';
-        } else {
-          finalStationCode = 'CRP'; // Default fallback
-        }
-      } else if (stationCode === 'WSH' && subLine) {
-        if (subLine === 'Washing 1') finalStationCode = 'W1';
-        else if (subLine === 'Washing 2') finalStationCode = 'W2';
-        else if (subLine === 'Washing 3') finalStationCode = 'W3';
-      } else if ((stationCode === 'EXT' || stationCode === 'EXTR' || (stationName && String(stationName).toLowerCase().includes('extrusion'))) && subLine) {
-        if (subLine === 'Extrusion 1') finalStationCode = 'E1';
-        else if (subLine === 'Extrusion 2') finalStationCode = 'E2';
-        else if (subLine === 'Extrusion 3') finalStationCode = 'E3';
-        else if (subLine === 'Mixture') finalStationCode = 'MIX';
-      } else if (stationCode === 'PKG' && subLine) {
-        if (subLine === 'Pellet PET') finalStationCode = 'STL';
-        else if (subLine === 'Final PET') finalStationCode = 'FPK';
-      }
+      const { finalStationCode } = resolveQrStationCodes(stationCode, stationName, subLine);
 
-      // Count for increment
       let countSql = `SELECT COUNT(*) as count 
          FROM production_logs pl
          JOIN operator_shifts os ON pl.shift_id = os.id
@@ -546,11 +659,7 @@ router.post('/log', authenticateToken, async (req, res) => {
            AND pl.station_id = $2
            AND os.start_time::date = $3::date`;
       const countParams = [shiftId, stationId, start_time];
-      // Keep numbering independent for Starlinger vs Final PET outputs.
-      if (stationCode === 'PKG' && (subLine === 'Pellet PET' || subLine === 'Final PET')) {
-        countSql += ` AND pl.sub_line = $4`;
-        countParams.push(subLine);
-      }
+      countSql = appendPetSubLineCountFilter(countSql, countParams, subLine);
       const countResult = await pool.query(countSql, countParams);
 
       const increment = String(parseInt(countResult.rows[0].count) + 1).padStart(3, '0');
@@ -743,25 +852,75 @@ router.get('/closed-shifts', authenticateToken, async (req, res) => {
     date: dateFilterLegacy,
     date_start, date_end,
     shift_type, material_type, operator,
+    include_active,
   } = req.query;
   // Legacy shiftTypeId filter (mobile app)
   const shiftTypeIdFilter = req.query.shiftTypeId ?? req.query.shifttypeid;
   try {
     const stationIds = await getStationIdsByCode();
     const params = [];
-    const conds = ['os.is_active = false'];
+    const conds = [];
 
-    // Date range (new API)
-    if (date_start && /^\d{4}-\d{2}-\d{2}$/.test(String(date_start).trim())) {
-      params.push(String(date_start).trim());
-      conds.push(`os.start_time::date >= $${params.length}::date`);
-    } else if (dateFilterLegacy && /^\d{4}-\d{2}-\d{2}$/.test(String(dateFilterLegacy).trim())) {
-      params.push(String(dateFilterLegacy).trim());
-      conds.push(`os.start_time::date = $${params.length}::date`);
+    const showActive =
+      include_active === 'true' ||
+      include_active === '1' ||
+      include_active === true;
+    if (!showActive) {
+      conds.push('os.is_active = false');
     }
-    if (date_end && /^\d{4}-\d{2}-\d{2}$/.test(String(date_end).trim())) {
-      params.push(String(date_end).trim());
-      conds.push(`os.start_time::date <= $${params.length}::date`);
+
+    const ds =
+      date_start && /^\d{4}-\d{2}-\d{2}$/.test(String(date_start).trim())
+        ? String(date_start).trim()
+        : null;
+    const de =
+      date_end && /^\d{4}-\d{2}-\d{2}$/.test(String(date_end).trim())
+        ? String(date_end).trim()
+        : null;
+    const legacyDate =
+      !ds && dateFilterLegacy && /^\d{4}-\d{2}-\d{2}$/.test(String(dateFilterLegacy).trim())
+        ? String(dateFilterLegacy).trim()
+        : null;
+
+    // Match Production Logs: shift start date OR any log recorded on that date
+    if (ds && de) {
+      params.push(ds, de);
+      conds.push(`(
+        (os.start_time::date >= $${params.length - 1}::date AND os.start_time::date <= $${params.length}::date)
+        OR EXISTS (
+          SELECT 1 FROM production_logs pl
+          WHERE pl.shift_id = os.id
+            AND pl.created_at::date >= $${params.length - 1}::date
+            AND pl.created_at::date <= $${params.length}::date
+        )
+      )`);
+    } else if (ds) {
+      params.push(ds);
+      conds.push(`(
+        os.start_time::date >= $${params.length}::date
+        OR EXISTS (
+          SELECT 1 FROM production_logs pl
+          WHERE pl.shift_id = os.id AND pl.created_at::date >= $${params.length}::date
+        )
+      )`);
+    } else if (de) {
+      params.push(de);
+      conds.push(`(
+        os.start_time::date <= $${params.length}::date
+        OR EXISTS (
+          SELECT 1 FROM production_logs pl
+          WHERE pl.shift_id = os.id AND pl.created_at::date <= $${params.length}::date
+        )
+      )`);
+    } else if (legacyDate) {
+      params.push(legacyDate);
+      conds.push(`(
+        os.start_time::date = $${params.length}::date
+        OR EXISTS (
+          SELECT 1 FROM production_logs pl
+          WHERE pl.shift_id = os.id AND pl.created_at::date = $${params.length}::date
+        )
+      )`);
     }
     // Shift type by name (new) or by ID (legacy)
     if (shift_type && shift_type !== 'all') {
@@ -790,7 +949,7 @@ router.get('/closed-shifts', authenticateToken, async (req, res) => {
       conds.push(`EXISTS (SELECT 1 FROM production_logs pl WHERE pl.shift_id = os.id)`);
     }
 
-    const where = conds.join(' AND ');
+    const where = conds.length ? conds.join(' AND ') : '1=1';
 
     // Count query for pagination
     const countSql = `SELECT COUNT(*) AS total
@@ -808,7 +967,7 @@ router.get('/closed-shifts', authenticateToken, async (req, res) => {
     const offset = (pageNum - 1) * limitNum;
     params.push(limitNum, offset);
 
-    const sql = `SELECT os.id, os.start_time, os.end_time, os.end_remark,
+    const sql = `SELECT os.id, os.start_time, os.end_time, os.end_remark, os.is_active,
        st.name AS shift_name, u.name AS operator_name, mt.name AS material_type_name
        FROM operator_shifts os
        LEFT JOIN shift_types st ON st.id = os.shift_type_id
@@ -820,44 +979,30 @@ router.get('/closed-shifts', authenticateToken, async (req, res) => {
 
     const result = await pool.query(sql, params);
     const list = await Promise.all(result.rows.map(async (row) => {
-      const byStation = {
-        crusher: { outputs: 0, weight: '0.0' },
-        washing: { outputs: 0, weight: '0.0' },
-        extrusion: { outputs: 0, weight: '0.0' },
-      };
-      // Single aggregated query per shift, excluding Cancelled logs for accuracy
+      const materialTypeName = row.material_type_name || null;
+      const byStation = createEmptyByStation();
       const aggRows = await pool.query(
-        `SELECT s.code, s.name,
+        `SELECT s.code, s.name, pl.sub_line,
                 COUNT(pl.id) AS cnt,
                 COALESCE(SUM(pl.weight), 0) AS tot
          FROM production_logs pl
          JOIN stations s ON s.id = pl.station_id
          WHERE pl.shift_id = $1 AND pl.status != 'Cancelled'
-         GROUP BY s.code, s.name`,
+         GROUP BY s.code, s.name, pl.sub_line`,
         [row.id]
       );
-      for (const sr of aggRows.rows) {
-        const code = (sr.code || '').toUpperCase();
-        const name = (sr.name || '').toLowerCase();
-        let key = null;
-        if (code === 'CRS' || name.includes('crusher')) key = 'crusher';
-        else if (code === 'WSH' || name.includes('washing')) key = 'washing';
-        else if (code === 'EXT' || code === 'EXTR' || name.includes('extrusion')) key = 'extrusion';
-        if (!key) continue;
-        byStation[key].outputs += parseInt(sr.cnt, 10);
-        byStation[key].weight = String((Number(byStation[key].weight) + Number(sr.tot)).toFixed(1));
-      }
-      const totalOutputs = byStation.crusher.outputs + byStation.washing.outputs + byStation.extrusion.outputs;
-      const totalWeight = (Number(byStation.crusher.weight) + Number(byStation.washing.weight) + Number(byStation.extrusion.weight)).toFixed(1);
+      applyAggRowsToByStation(byStation, aggRows.rows, materialTypeName);
+      const { totalOutputs, totalWeight } = sumByStationTotals(byStation);
       return {
         shiftId: row.id,
         shiftName: (row.shift_name && String(row.shift_name).trim()) ? String(row.shift_name).trim() : 'Shift',
         operatorName: row.operator_name || 'N/A',
-        materialTypeName: (row.material_type_name && String(row.material_type_name).trim()) ? String(row.material_type_name).trim() : null,
+        materialTypeName: (materialTypeName && String(materialTypeName).trim()) ? String(materialTypeName).trim() : null,
         startTime: row.start_time,
         endTime: row.end_time,
         endRemark: row.end_remark || '',
-        date: row.start_time ? new Date(row.start_time).toLocaleDateString() : '',
+        isActive: row.is_active === true,
+        date: row.start_time ? new Date(row.start_time).toLocaleDateString('en-CA') : '',
         totalOutputs,
         totalWeight,
         byStation,
@@ -893,30 +1038,19 @@ router.get('/closed-shift/:shiftId/summary', authenticateToken, async (req, res)
     const shift = shiftRow.rows[0];
     // Aggregate per station in one query; exclude Cancelled so counts match actual production
     const aggResult = await pool.query(
-      `SELECT s.id, s.code, s.name,
+      `SELECT s.id, s.code, s.name, pl.sub_line,
               COUNT(pl.id) AS cnt,
               COALESCE(SUM(pl.weight), 0) AS tot
        FROM production_logs pl
        JOIN stations s ON s.id = pl.station_id
        WHERE pl.shift_id = $1
          AND pl.status != 'Cancelled'
-       GROUP BY s.id, s.code, s.name`,
+       GROUP BY s.id, s.code, s.name, pl.sub_line`,
       [shiftId]
     );
-    const byStation = { crusher: { outputs: 0, weight: '0.0' }, washing: { outputs: 0, weight: '0.0' }, extrusion: { outputs: 0, weight: '0.0' } };
-    for (const ar of aggResult.rows) {
-      const code = (ar.code || '').toUpperCase();
-      const name = (ar.name || '').toLowerCase();
-      let key = null;
-      if (code === 'CRS' || name.includes('crusher')) key = 'crusher';
-      else if (code === 'WSH' || name.includes('washing')) key = 'washing';
-      else if (code === 'EXT' || code === 'EXTR' || name.includes('extrusion')) key = 'extrusion';
-      if (!key) continue;
-      byStation[key].outputs += parseInt(ar.cnt, 10);
-      byStation[key].weight = String((Number(byStation[key].weight) + Number(ar.tot)).toFixed(1));
-    }
-    const totalOutputs = byStation.crusher.outputs + byStation.washing.outputs + byStation.extrusion.outputs;
-    const totalWeight = (Number(byStation.crusher.weight) + Number(byStation.washing.weight) + Number(byStation.extrusion.weight)).toFixed(1);
+    const byStation = createEmptyByStation();
+    applyAggRowsToByStation(byStation, aggResult.rows, shift.material_type_name);
+    const { totalOutputs, totalWeight } = sumByStationTotals(byStation);
     const byProductsRes = await pool.query(
       `SELECT b.id, b.shift_id, b.station_id, s.name AS station_name, b.name, b.category, b.weight
        FROM by_product_logs b
@@ -938,7 +1072,7 @@ router.get('/closed-shift/:shiftId/summary', authenticateToken, async (req, res)
       data: {
         shift: shift.shift_name || 'N/A',
         operator: shift.operator_name || 'N/A',
-        date: shift.start_time ? new Date(shift.start_time).toLocaleDateString() : '',
+        date: shift.start_time ? new Date(shift.start_time).toLocaleDateString('en-CA') : '',
         totalOutputs,
         totalWeight,
         byStation,
@@ -972,30 +1106,19 @@ router.get('/shift/:shiftId/summary', authenticateToken, async (req, res) => {
     }
     const row = shiftRow.rows[0];
     const aggResult = await pool.query(
-      `SELECT s.id, s.code, s.name,
+      `SELECT s.id, s.code, s.name, pl.sub_line,
               COUNT(pl.id) AS cnt,
               COALESCE(SUM(pl.weight), 0) AS tot
        FROM production_logs pl
        JOIN stations s ON s.id = pl.station_id
        WHERE pl.shift_id = $1
          AND pl.status != 'Cancelled'
-       GROUP BY s.id, s.code, s.name`,
+       GROUP BY s.id, s.code, s.name, pl.sub_line`,
       [shiftId]
     );
-    const byStation = { crusher: { outputs: 0, weight: '0.0' }, washing: { outputs: 0, weight: '0.0' }, extrusion: { outputs: 0, weight: '0.0' } };
-    for (const r of aggResult.rows) {
-      const code = (r.code || '').toUpperCase();
-      const name = (r.name || '').toLowerCase();
-      let key = null;
-      if (code === 'CRS' || name.includes('crusher')) key = 'crusher';
-      else if (code === 'WSH' || name.includes('washing')) key = 'washing';
-      else if (code === 'EXT' || code === 'EXTR' || name.includes('extrusion')) key = 'extrusion';
-      if (!key) continue;
-      byStation[key].outputs += parseInt(r.cnt, 10);
-      byStation[key].weight = String((Number(byStation[key].weight) + Number(r.tot)).toFixed(1));
-    }
-    const totalOutputs = byStation.crusher.outputs + byStation.washing.outputs + byStation.extrusion.outputs;
-    const totalWeight = (Number(byStation.crusher.weight) + Number(byStation.washing.weight) + Number(byStation.extrusion.weight)).toFixed(1);
+    const byStation = createEmptyByStation();
+    applyAggRowsToByStation(byStation, aggResult.rows, row.material_type_name);
+    const { totalOutputs, totalWeight } = sumByStationTotals(byStation);
     const byProductsRes = await pool.query(
       `SELECT b.id, b.shift_id, b.station_id, s.name AS station_name, b.name, b.category, b.weight
        FROM by_product_logs b
@@ -1017,7 +1140,7 @@ router.get('/shift/:shiftId/summary', authenticateToken, async (req, res) => {
       data: {
         shift: row.shift_name || 'N/A',
         operator: row.operator_name || 'N/A',
-        date: row.start_time ? new Date(row.start_time).toLocaleDateString() : '',
+        date: row.start_time ? new Date(row.start_time).toLocaleDateString('en-CA') : '',
         isActive: row.is_active,
         totalOutputs,
         totalWeight,
@@ -1491,7 +1614,8 @@ router.get('/crusher-logs', authenticateToken, async (req, res) => {
 // 12. Get washing line logs with date filter, search, and pagination
 router.get('/washing-logs', authenticateToken, async (req, res) => {
   const { subLine, date, search, status, shift_id, page = 1, limit = 10 } = req.query;
-  const materialTypeId = req.user.materialTypeId;
+  const isPpic = (req.user.role || '').toLowerCase() === 'ppic';
+  const materialTypeId = isPpic ? null : req.user.materialTypeId;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   try {
@@ -1613,7 +1737,8 @@ router.get('/washing-logs', authenticateToken, async (req, res) => {
 // 13. Get extrusion line logs with date filter, search, and pagination
 router.get('/extrusion-logs', authenticateToken, async (req, res) => {
   const { subLine, date, search, status, shift_id, page = 1, limit = 10 } = req.query;
-  const materialTypeId = req.user.materialTypeId;
+  const isPpic = (req.user.role || '').toLowerCase() === 'ppic';
+  const materialTypeId = isPpic ? null : req.user.materialTypeId;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   try {
@@ -1735,7 +1860,8 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
 // 10.9 Final Packing logs
 router.get('/final-packing-logs', authenticateToken, async (req, res) => {
   const { date, search, status, shift_id, station_id, page = 1, limit = 10 } = req.query;
-  const materialTypeId = req.user.materialTypeId;
+  const isPpic = (req.user.role || '').toLowerCase() === 'ppic';
+  const materialTypeId = isPpic ? null : req.user.materialTypeId;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   try {
@@ -1862,26 +1988,33 @@ router.get('/final-packing-logs', authenticateToken, async (req, res) => {
 
 // 10.10 PPIC Station Overview — all stations, per-station logs, grouped
 router.get('/ppic-station-overview', authenticateToken, async (req, res) => {
-  const { date, shift_type_id } = req.query;
-  const materialTypeId = req.user.materialTypeId;
+  const { date, shift_type_id, material_type } = req.query;
+  const isPpic = (req.user.role || '').toLowerCase() === 'ppic';
+  const materialTypeId = isPpic ? null : req.user.materialTypeId;
   const targetDate = date || new Date().toISOString().split('T')[0];
 
   try {
     let sql = `
       SELECT pl.id, pl.output_bag_qr, pl.weight, pl.status, pl.sub_line, pl.remark, pl.created_at,
              s.id as station_id, s.name as station_name, s.code as station_code,
-             st.name as shift_name, u.name as operator_name
+             st.name as shift_name, u.name as operator_name,
+             mt.name as material_type_name
       FROM production_logs pl
       JOIN stations s ON pl.station_id = s.id
       JOIN operator_shifts os ON pl.shift_id = os.id
       LEFT JOIN shift_types st ON os.shift_type_id = st.id
       LEFT JOIN users u ON os.user_id = u.id
+      LEFT JOIN material_types mt ON os.material_type_id = mt.id
       WHERE DATE(pl.created_at) = $1
     `;
     const params = [targetDate];
     let paramIndex = 1;
 
-    if (materialTypeId) {
+    if (material_type && String(material_type).trim() && String(material_type).trim() !== 'all') {
+      paramIndex++;
+      sql += ` AND mt.name = $${paramIndex}`;
+      params.push(String(material_type).trim());
+    } else if (materialTypeId) {
       paramIndex++;
       sql += ` AND os.material_type_id = $${paramIndex}`;
       params.push(materialTypeId);
@@ -1921,6 +2054,7 @@ router.get('/ppic-station-overview', authenticateToken, async (req, res) => {
         created_at: row.created_at,
         shift_name: row.shift_name,
         operator_name: row.operator_name,
+        material_type_name: row.material_type_name ?? null,
       });
       grouped[key].total_bags += 1;
       grouped[key].total_weight += parseFloat(row.weight || 0);
@@ -2211,6 +2345,7 @@ router.get('/dashboard-summary', authenticateToken, async (req, res) => {
         s.code                                                    AS station_code,
         COALESCE(NULLIF(TRIM(pl.sub_line::text), ''), 'General') AS sub_line,
         COALESCE(sht.name, 'Unknown')                            AS shift_name,
+        MAX(mt.name)                                             AS material_type_name,
         COUNT(*)::int                                            AS outputs,
         COUNT(CASE WHEN pl.input_bag_qr IS NOT NULL
                         AND pl.input_bag_qr <> '' THEN 1 END)::int AS inputs,
@@ -2250,21 +2385,20 @@ router.get('/dashboard-summary', authenticateToken, async (req, res) => {
       pool.query(operatorSql, params),
     ]);
 
-    // ── Step 4: Classify each station row into crusher / washing / extrusion
-    //    Uses the same name-matching logic as the mobile app / active-shifts
-    const classifyStation = (name, code) => {
-      const n = (name || '').toLowerCase();
-      const c = (code || '').toUpperCase();
-      if (c === 'CRS' || n.includes('crusher')) return 'crusher';
-      if (c === 'WSH' || n.includes('washing')) return 'washing';
-      if (c === 'EXT' || c === 'EXTR' || n.includes('extrusion')) return 'extrusion';
-      // fallback: use the station name itself as key (so unknown stations still show up)
-      return n.replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '') || 'other';
-    };
-
     const stationMap = {};
     for (const row of stationResult.rows) {
-      const stKey = classifyStation(row.station_name, row.station_code);
+      const stKey =
+        classifyDashboardStation(
+          row.station_name,
+          row.station_code,
+          row.sub_line,
+          row.material_type_name || material_type,
+        ) ||
+        (row.station_name || '')
+          .toLowerCase()
+          .replace(/\s+/g, '_')
+          .replace(/[^a-z0-9_]/g, '') ||
+        'other';
 
       if (!stationMap[stKey]) {
         stationMap[stKey] = {
