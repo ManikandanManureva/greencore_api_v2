@@ -3,12 +3,13 @@
 --
 -- Seeds:
 --   role                       (6 rows)
---   module_stations            (15 rows)
---   user_station_assignments   (16 rows)
+--   module_stations            (15 rows, keyed by module_code — no serial)
+--   user_station_assignments   (16 rows, PK assignment_id)
 --   raw_material               (1053 rows of actual gate entries)
 --   bag_tracking               (6 rows)
 --
 -- Run AFTER 01-gate-entry-tables-schema-only.sql and 04-seed-users.sql.
+-- Re-runnable: every table block is TRUNCATE'd first.
 -- ════════════════════════════════════════════════════════════════
 BEGIN;
 
@@ -22,8 +23,7 @@ INSERT INTO "role" ("id","Name","isActive","createdBy","updatedBy","createdAt","
   (5,'pe operator',1,'system','system','2025-12-11 18:37:58','2025-12-11 18:37:58'),
   (6,'pet operator',1,'system','system','2025-12-24 18:04:42','2025-12-24 18:04:42');
 SELECT setval(pg_get_serial_sequence('"role"','id'),
-       COALESCE((SELECT MAX(id) FROM "role"), 1));
-
+       COALESCE((SELECT MAX("id") FROM "role"), 1));
 
 TRUNCATE TABLE "module_stations" RESTART IDENTITY CASCADE;
 -- module_stations: 15 rows
@@ -43,9 +43,6 @@ INSERT INTO "module_stations" ("module_code","station_code","station_display_nam
   ('PET','LABEL_REMOVAL','Label Removal Station',1,1),
   ('PET','STARLINGER_EXTRUSION','Starlinger Extrusion',6,1),
   ('PET','WASHING','Washing Station',3,1);
-SELECT setval(pg_get_serial_sequence('"module_stations"','id'),
-       COALESCE((SELECT MAX(id) FROM "module_stations"), 1));
-
 
 TRUNCATE TABLE "user_station_assignments" RESTART IDENTITY CASCADE;
 -- user_station_assignments: 16 rows
@@ -66,9 +63,8 @@ INSERT INTO "user_station_assignments" ("assignment_id","user_id","module_code",
   (14,36,'PET','BORRETEC_SIZING','2026-01-11 19:31:26','system',1,NULL,NULL),
   (15,37,'PET','FLAKE_SORTING','2026-01-11 19:31:58','system',1,NULL,NULL),
   (16,38,'PET','STARLINGER_EXTRUSION','2026-01-11 19:32:20','system',1,NULL,NULL);
-SELECT setval(pg_get_serial_sequence('"user_station_assignments"','id'),
-       COALESCE((SELECT MAX(id) FROM "user_station_assignments"), 1));
-
+SELECT setval(pg_get_serial_sequence('"user_station_assignments"','assignment_id'),
+       COALESCE((SELECT MAX("assignment_id") FROM "user_station_assignments"), 1));
 
 TRUNCATE TABLE "raw_material" RESTART IDENTITY CASCADE;
 -- raw_material: 1053 rows
@@ -1127,8 +1123,7 @@ INSERT INTO "raw_material" ("id","refId","entrydate","entrytime","exitdate","exi
   (1231,'RM-230526-1231','2026-05-23','02:30','2026-05-23','12:29','Z 9209 T','PT. TIRTA INVESTAMA','PC',13550,8530,5020,'5069330116','',15000,'Pending',NULL,NULL,'2026-05-23 11:14:50','2026-05-23 11:14:50','SPLIT JUG AQUA 19L PC 55M',NULL,NULL,NULL,NULL,NULL,NULL,NULL,'26001369','SEMARANG'),
   (1232,'RM-230526-1232','2026-05-23','10:56','2026-05-23','13:53','L 9768 UM','PT. GREENCORR RESOURCES INDONE','PE',5590,3380,2210,'PE20260523-01','PE SUPER (20 BAL)\nEVA SUPER (7 BAL)\nPE 1 (17 BAL)',NULL,'Pending',NULL,NULL,'2026-05-23 12:32:07','2026-05-23 12:32:07','PE SUPER,,EVA SUPER,,PE 1',NULL,NULL,NULL,NULL,NULL,NULL,NULL,'26001370','KLATEN');
 SELECT setval(pg_get_serial_sequence('"raw_material"','id'),
-       COALESCE((SELECT MAX(id) FROM "raw_material"), 1));
-
+       COALESCE((SELECT MAX("id") FROM "raw_material"), 1));
 
 TRUNCATE TABLE "bag_tracking" RESTART IDENTITY CASCADE;
 -- bag_tracking: 6 rows
@@ -1140,8 +1135,7 @@ INSERT INTO "bag_tracking" ("id","bag_id","batch_id","status","generated_at","ac
   (5,'JB-PC-LR-20260113-0002','PC-LR-260113-0002','GENERATED','2026-01-13 11:15:09',NULL,NULL,NULL,NULL,NULL,NULL,850,850,'PC_CLEAN_BOTTLES','LABEL_REMOVAL',NULL,'2026-01-13 11:15:09','2026-01-13 11:27:41'),
   (6,'JB-PC-LR-20260116-0001','PC-LR-260116-0001','GENERATED','2026-01-16 10:24:12',NULL,NULL,NULL,NULL,NULL,NULL,12,12,'PC_CLEAN_BOTTLES','LABEL_REMOVAL',NULL,'2026-01-16 10:24:12','2026-01-16 11:21:47');
 SELECT setval(pg_get_serial_sequence('"bag_tracking"','id'),
-       COALESCE((SELECT MAX(id) FROM "bag_tracking"), 1));
-
+       COALESCE((SELECT MAX("id") FROM "bag_tracking"), 1));
 
 COMMIT;
 
