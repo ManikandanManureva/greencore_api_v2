@@ -1,6 +1,6 @@
 /**
  * Create a PE (Polyethylene) operator user.
- * PE flow: Crusher → Washing → Packaging (no Label Removal, no Extrusion)
+ * PE flow: Crusher → Washing → Extrusion → Final Packaging (no Label Removal)
  * QR codes will carry the "PE" prefix automatically.
  *
  * Usage:
