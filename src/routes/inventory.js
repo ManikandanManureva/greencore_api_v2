@@ -8,16 +8,18 @@ const { authenticateToken } = require('../middleware/auth');
  * Restricted to PPIC and Super Admin roles.
  */
 const ALLOWED_ROLES = ['ppic', 'super_admin', 'admin'];
+// QC is limited to the gate-entry (Receipts) endpoints only: the raw_material list,
+// a single record + update (status/notes), and the summary KPIs.
+const QC_ALLOWED_PATHS = [/^\/raw-materials(\/|$)/, /^\/summary(\/|$)/];
 
 function requireInventoryRole(req, res, next) {
   const role = String(req.user && req.user.role ? req.user.role : '').toLowerCase();
-  if (!ALLOWED_ROLES.includes(role)) {
-    return res.status(403).json({
-      success: false,
-      message: 'You are not authorized to access the Inventory module',
-    });
-  }
-  next();
+  if (ALLOWED_ROLES.includes(role)) return next();
+  if (role === 'qc' && QC_ALLOWED_PATHS.some((re) => re.test(req.path))) return next();
+  return res.status(403).json({
+    success: false,
+    message: 'You are not authorized to access the Inventory module',
+  });
 }
 
 // Every inventory route requires a valid token AND an allowed role.

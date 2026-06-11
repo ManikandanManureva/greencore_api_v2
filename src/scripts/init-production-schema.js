@@ -254,7 +254,8 @@ async function initProductionSchema() {
       ['Crusher', 'CRS', 'Bottle crushing into flakes', 2],
       ['Washing', 'WSH', 'Intensive flake washing', 3],
       ['Extrusion', 'EXT', 'Melting and forming pellets', 4],
-      ['Final Packaging', 'PKG', 'Bagging and weighing', 5]
+      ['Final Packaging', 'PKG', 'Bagging and weighing', 5],
+      ['Pellet Packing', 'PLT', 'Packing of pellets from Final Packaging and Extrusion outputs', 6]
     ];
     for (const [name, code, desc, order] of stations) {
       await client.query(`
@@ -293,7 +294,7 @@ async function initProductionSchema() {
     // PC Flow: All stations
     if (matPC.rows[0]) {
       const pcId = matPC.rows[0].id;
-      for (const code of ['LBL', 'CRS', 'WSH', 'EXT', 'PKG']) {
+      for (const code of ['LBL', 'CRS', 'WSH', 'EXT', 'PKG', 'PLT']) {
         await addMapping(pcId, code);
       }
     }
@@ -301,7 +302,7 @@ async function initProductionSchema() {
     // PE Flow: Crusher, Washing, Extrusion, Final Packaging (same line as PC minus Label Removal)
     if (matPE.rows[0]) {
       const peId = matPE.rows[0].id;
-      for (const code of ['CRS', 'WSH', 'EXT', 'PKG']) {
+      for (const code of ['CRS', 'WSH', 'EXT', 'PKG', 'PLT']) {
         await addMapping(peId, code);
       }
     }
@@ -309,7 +310,7 @@ async function initProductionSchema() {
     // PET Flow: All stations
     if (matPET.rows[0]) {
       const petId = matPET.rows[0].id;
-      for (const code of ['LBL', 'CRS', 'WSH', 'EXT', 'PKG']) {
+      for (const code of ['LBL', 'CRS', 'WSH', 'EXT', 'PKG', 'PLT']) {
         await addMapping(petId, code);
       }
     }

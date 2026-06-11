@@ -130,6 +130,7 @@ function createEmptyByStation() {
     boretech: { outputs: 0, weight: '0.0' },
     starlinger: { outputs: 0, weight: '0.0' },
     final_packing: { outputs: 0, weight: '0.0' },
+    pellet_packing: { outputs: 0, weight: '0.0' },
   };
 }
 
@@ -152,6 +153,8 @@ function classifyDashboardStation(stationName, stationCode, subLine, materialTyp
   const c = (stationCode || '').toUpperCase();
   const mat = String(materialTypeName || '').trim().toUpperCase();
   const sl = String(subLine || '').trim();
+
+  if (c === 'PLT' || n.includes('pellet pack')) return 'pellet_packing';
 
   if (sl === 'Flakes PET') return 'boretech';
   if (sl === 'Pellet PET') return 'starlinger';
@@ -1206,6 +1209,7 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
   try {
     let targetStationId = targetStationIdParam || stationId;
     let targetStatus = status;
+    let isPelletPacking = false;
 
     // PE Extrusion input comes from CRS (Crusher-Washing); PC/PET from WSH. Resolve material type name.
     let materialTypeName = null;
@@ -1254,6 +1258,20 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
             if (washingStationResult.rows.length > 0) {
               targetStationId = washingStationResult.rows[0].id;
               targetStatus = targetStatus || 'pending';
+            }
+          }
+        }
+
+        // Pellet Packing (PLT): inputs = Final Packaging outputs (Completed) + Extrusion outputs (pending).
+        // Client makes one call per source with explicit targetStationId + status and merges client-side.
+        // Default (no explicit target): Final Packaging Completed bags.
+        if (currentStationCode === 'PLT') {
+          isPelletPacking = true;
+          if (!targetStationIdParam && !stationId) {
+            const pkgStationResult = await pool.query("SELECT id FROM stations WHERE code = 'PKG' LIMIT 1");
+            if (pkgStationResult.rows.length > 0) {
+              targetStationId = pkgStationResult.rows[0].id;
+              targetStatus = targetStatus || 'Completed';
             }
           }
         }
@@ -1326,12 +1344,15 @@ router.get('/search-logs', authenticateToken, async (req, res) => {
 
     // Exclude bags that are already processing at the current station.
     // Use NOT EXISTS instead of NOT IN to avoid NULL edge cases.
+    // Pellet Packing: source bags (Final Packaging) stay 'Completed' after consumption,
+    // so also exclude bags already consumed (Completed rows at PLT), not just Processing.
     if (currentStationId) {
       paramIndex++;
+      const consumedStatuses = isPelletPacking ? `IN ('Processing', 'Completed')` : `= 'Processing'`;
       sql += ` AND NOT EXISTS (
         SELECT 1 FROM production_logs px
         WHERE px.station_id = $${paramIndex}
-          AND px.status = 'Processing'
+          AND px.status ${consumedStatuses}
           AND px.input_bag_qr IS NOT NULL
           AND px.input_bag_qr = pl.output_bag_qr
       )`;
@@ -2077,7 +2098,7 @@ router.get('/ppic-station-overview', authenticateToken, async (req, res) => {
  * Query params: date_start, date_end, station_code, sub_line, material_type, shift_type, limit
  */
 async function fetchLogsAllFlatRows(query) {
-  const { date_start, date_end, station_code, sub_line, material_type, shift_type, limit = 500 } = query;
+  const { date_start, date_end, station_code, sub_line, material_type, shift_type, operator_id, limit = 500 } = query;
   const params = [];
   const conds = [];
 
@@ -2104,6 +2125,10 @@ async function fetchLogsAllFlatRows(query) {
   if (shift_type && shift_type !== 'all') {
     params.push(String(shift_type).trim());
     conds.push(`sht.name = $${params.length}`);
+  }
+  if (operator_id && String(operator_id) !== 'all' && /^\d+$/.test(String(operator_id).trim())) {
+    params.push(parseInt(String(operator_id).trim(), 10));
+    conds.push(`os.user_id = $${params.length}`);
   }
 
   const where = conds.length ? 'AND ' + conds.join(' AND ') : '';
@@ -2255,6 +2280,25 @@ router.get('/logs-all', authenticateToken, async (req, res) => {
   }
 });
 
+// 12c. Production operators — all active line operators (PC/PE/PET), for the export filter.
+// Listed regardless of whether they have logs yet, so every line is always selectable.
+router.get('/operators', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT u.id, u.name, COALESCE(mt.name, '') AS material_type
+      FROM users u
+      LEFT JOIN material_types mt ON u.material_type_id = mt.id
+      WHERE u.is_active = true
+        AND LOWER(COALESCE(u.role, '')) IN ('pc', 'pe', 'pet')
+      ORDER BY mt.name NULLS LAST, u.name
+    `);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('[operators] ERROR:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // 13b. Live active shifts — all currently running operator sessions
 router.get('/active-shifts', authenticateToken, async (req, res) => {
   try {
@@ -2357,6 +2401,11 @@ router.get('/dashboard-summary', authenticateToken, async (req, res) => {
       LEFT JOIN material_types mt ON os.material_type_id = mt.id
       WHERE 1=1
         ${whereClause}
+        -- Pellet Packing: only count finished (Completed) bags; all other stations count every status
+        AND (
+          NOT (UPPER(COALESCE(s.code, '')) = 'PLT' OR LOWER(COALESCE(s.name, '')) LIKE '%pellet pack%')
+          OR pl.status = 'Completed'
+        )
       GROUP BY s.id, s.name, s.code, sub_line, sht.name
       ORDER BY s.name, weight DESC
     `;

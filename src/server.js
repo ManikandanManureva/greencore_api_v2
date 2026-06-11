@@ -10,6 +10,7 @@ if (!process.env.JWT_SECRET || String(process.env.JWT_SECRET).trim() === '') {
 const authRoutes = require('./routes/auth');
 const productionRoutes = require('./routes/production');
 const inventoryRoutes = require('./routes/inventory');
+const partsRoutes = require('./routes/parts');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -59,6 +60,8 @@ app.use('/api/production', productionRoutes);
 app.use('/production', productionRoutes);
 app.use('/api/inventory', inventoryRoutes);
 app.use('/inventory', inventoryRoutes);
+app.use('/api/parts', partsRoutes);
+app.use('/parts', partsRoutes);
 
 // 404 handler
 app.use((req, res) => {
