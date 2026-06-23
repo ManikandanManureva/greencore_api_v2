@@ -588,7 +588,7 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
 
 // 7. Log production data
 router.post('/log', authenticateToken, async (req, res) => {
-  const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, subLine, remark, shiftTypeId: shiftTypeIdBody } = req.body;
+  const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, subLine, remark, shiftTypeId: shiftTypeIdBody, dnNo } = req.body;
   // Read status explicitly (client sends "Completed" or "pending"); accept any casing
   const status = req.body.status != null ? String(req.body.status).trim() : null;
   const materialTypeId = req.user.materialTypeId;
@@ -697,10 +697,10 @@ router.post('/log', authenticateToken, async (req, res) => {
     }
 
     const result = await pool.query(
-      `INSERT INTO production_logs (shift_id, station_id, material_type_id, input_bag_qr, output_bag_qr, weight, photo_url, status, sub_line, remark)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      `INSERT INTO production_logs (shift_id, station_id, material_type_id, input_bag_qr, output_bag_qr, weight, photo_url, status, sub_line, remark, dn_no)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
-      [shiftId, stationId, materialTypeId, inputBagQr, finalOutputBagQr, weightNum, photoUrl, finalStatus, subLine, remark || null]
+      [shiftId, stationId, materialTypeId, inputBagQr, finalOutputBagQr, weightNum, photoUrl, finalStatus, subLine, remark || null, dnNo ?? null]
     );
 
     const row = result.rows[0];
@@ -1628,6 +1628,35 @@ router.get('/crusher-logs', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Error fetching crusher logs:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// 11.5 Get active DN number for current PET crusher shift
+router.get('/crusher-active-dn', authenticateToken, async (req, res) => {
+  const { shift_id } = req.query;
+  if (!shift_id) return res.status(400).json({ success: false, message: 'shift_id is required' });
+  try {
+    const stationResult = await pool.query("SELECT id FROM stations WHERE code = 'CRS' LIMIT 1");
+    if (stationResult.rows.length === 0) return res.json({ success: true, data: { dn_no: null } });
+    const crusherStationId = stationResult.rows[0].id;
+
+    const result = await pool.query(
+      `SELECT pl.dn_no
+       FROM production_logs pl
+       JOIN operator_shifts os ON pl.shift_id = os.id
+       JOIN material_types mt ON os.material_type_id = mt.id
+       WHERE pl.station_id = $1
+         AND pl.shift_id = $2
+         AND pl.dn_no IS NOT NULL
+         AND UPPER(mt.name) = 'PET'
+       ORDER BY pl.created_at DESC
+       LIMIT 1`,
+      [crusherStationId, parseInt(shift_id)]
+    );
+    res.json({ success: true, data: { dn_no: result.rows[0]?.dn_no ?? null } });
+  } catch (error) {
+    console.error('Error fetching active DN:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 });

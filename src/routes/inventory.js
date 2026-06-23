@@ -496,48 +496,86 @@ const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
  * Body: { from_date, to_date, pc_kg, pe_kg, pet_kg, notes? }
  * Always INSERTS a new row — never updates — so every change is preserved.
  */
+const ITEM_FIELDS = [
+  // PC
+  'pc_gallon_kg', 'pc_crusher_kg', 'pc_washing_kg', 'pc_pellet_kg',
+  // PE
+  'pe_super_kg', 'pe_1_kg', 'eva_super_kg', 'eva_1_kg',
+  'flakes_pe_super_kg', 'flakes_pe_1_kg', 'flakes_eva_super_kg', 'flakes_eva_1_kg',
+  'pellet_pe_super_kg', 'pellet_pe_1_kg',
+  // PET
+  'pet_gallon_kg', 'pet_crusher_kg', 'pet_washing_kg', 'pet_boretech_kg', 'pet_pellet_kg',
+];
+
+function parseItem(v) {
+  if (v === undefined || v === null || v === '') return 0;
+  const n = Number(v);
+  return Number.isNaN(n) || n < 0 ? 0 : n;
+}
+
 router.post('/opening-stock', async (req, res) => {
   try {
     const body = req.body || {};
 
-    const fromDate = String(body.from_date || '').trim();
-    const toDate = String(body.to_date || '').trim();
-    if (!ISO_DATE_RE.test(fromDate) || !ISO_DATE_RE.test(toDate)) {
+    const stockDate = String(body.stock_date || '').trim();
+    if (!ISO_DATE_RE.test(stockDate)) {
       return res.status(400).json({
         success: false,
-        message: 'from_date and to_date must be YYYY-MM-DD',
-      });
-    }
-    if (toDate < fromDate) {
-      return res.status(400).json({
-        success: false,
-        message: 'to_date cannot be earlier than from_date',
+        message: 'stock_date must be YYYY-MM-DD',
       });
     }
 
-    const numField = (v) => {
-      if (v === undefined || v === null || v === '') return 0;
-      const n = Number(v);
-      if (Number.isNaN(n) || n < 0) return null;
-      return n;
-    };
-    const pc = numField(body.pc_kg);
-    const pe = numField(body.pe_kg);
-    const pet = numField(body.pet_kg);
-    if (pc === null || pe === null || pet === null) {
-      return res.status(400).json({
-        success: false,
-        message: 'pc_kg / pe_kg / pet_kg must be zero or a positive number',
-      });
-    }
+    // Parse all 19 item fields
+    const items = {};
+    for (const f of ITEM_FIELDS) items[f] = parseItem(body[f]);
+
+    // Compute group totals
+    const pc_kg  = items.pc_gallon_kg + items.pc_crusher_kg + items.pc_washing_kg + items.pc_pellet_kg;
+    const pe_kg  = items.pe_super_kg + items.pe_1_kg + items.eva_super_kg + items.eva_1_kg
+                 + items.flakes_pe_super_kg + items.flakes_pe_1_kg
+                 + items.flakes_eva_super_kg + items.flakes_eva_1_kg
+                 + items.pellet_pe_super_kg + items.pellet_pe_1_kg;
+    const pet_kg = items.pet_gallon_kg + items.pet_crusher_kg + items.pet_washing_kg
+                 + items.pet_boretech_kg + items.pet_pellet_kg;
+
+    // Support legacy callers that send pc_kg/pe_kg/pet_kg directly (no item breakdown)
+    const finalPc  = pc_kg  || parseItem(body.pc_kg);
+    const finalPe  = pe_kg  || parseItem(body.pe_kg);
+    const finalPet = pet_kg || parseItem(body.pet_kg);
 
     const result = await pool.query(
-      `INSERT INTO opening_stock
-         (from_date, to_date, pc_kg, pe_kg, pet_kg, notes, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, from_date, to_date, pc_kg, pe_kg, pet_kg, total_kg, notes,
-                 created_by, created_at`,
-      [fromDate, toDate, pc, pe, pet, body.notes || null, actorName(req)],
+      `INSERT INTO opening_stock (
+         stock_date, notes, created_by,
+         pc_kg, pe_kg, pet_kg,
+         pc_gallon_kg, pc_crusher_kg, pc_washing_kg, pc_pellet_kg,
+         pe_super_kg, pe_1_kg, eva_super_kg, eva_1_kg,
+         flakes_pe_super_kg, flakes_pe_1_kg, flakes_eva_super_kg, flakes_eva_1_kg,
+         pellet_pe_super_kg, pellet_pe_1_kg,
+         pet_gallon_kg, pet_crusher_kg, pet_washing_kg, pet_boretech_kg, pet_pellet_kg
+       ) VALUES (
+         $1, $2, $3,
+         $4, $5, $6,
+         $7, $8, $9, $10,
+         $11, $12, $13, $14,
+         $15, $16, $17, $18,
+         $19, $20,
+         $21, $22, $23, $24, $25
+       )
+       RETURNING id, TO_CHAR(stock_date, 'YYYY-MM-DD') AS stock_date, pc_kg, pe_kg, pet_kg, total_kg, notes, created_by, created_at,
+                 pc_gallon_kg, pc_crusher_kg, pc_washing_kg, pc_pellet_kg,
+                 pe_super_kg, pe_1_kg, eva_super_kg, eva_1_kg,
+                 flakes_pe_super_kg, flakes_pe_1_kg, flakes_eva_super_kg, flakes_eva_1_kg,
+                 pellet_pe_super_kg, pellet_pe_1_kg,
+                 pet_gallon_kg, pet_crusher_kg, pet_washing_kg, pet_boretech_kg, pet_pellet_kg`,
+      [
+        stockDate, body.notes || null, actorName(req),
+        finalPc, finalPe, finalPet,
+        items.pc_gallon_kg, items.pc_crusher_kg, items.pc_washing_kg, items.pc_pellet_kg,
+        items.pe_super_kg, items.pe_1_kg, items.eva_super_kg, items.eva_1_kg,
+        items.flakes_pe_super_kg, items.flakes_pe_1_kg, items.flakes_eva_super_kg, items.flakes_eva_1_kg,
+        items.pellet_pe_super_kg, items.pellet_pe_1_kg,
+        items.pet_gallon_kg, items.pet_crusher_kg, items.pet_washing_kg, items.pet_boretech_kg, items.pet_pellet_kg,
+      ],
     );
 
     res.status(201).json({ success: true, data: result.rows[0] });
@@ -563,15 +601,15 @@ router.get('/opening-stock', async (req, res) => {
 
     const conds = [];
     const params = [];
-    const from = String(req.query.from_date || '').trim();
+    const from = String(req.query.date_from || '').trim();
     if (ISO_DATE_RE.test(from)) {
       params.push(from);
-      conds.push(`to_date >= $${params.length}`);
+      conds.push(`stock_date >= $${params.length}`);
     }
-    const to = String(req.query.to_date || '').trim();
+    const to = String(req.query.date_to || '').trim();
     if (ISO_DATE_RE.test(to)) {
       params.push(to);
-      conds.push(`from_date <= $${params.length}`);
+      conds.push(`stock_date <= $${params.length}`);
     }
     const search = String(req.query.search || '').trim();
     if (search) {
@@ -590,10 +628,15 @@ router.get('/opening-stock', async (req, res) => {
     const dataParams = params.slice();
     dataParams.push(limit, offset);
     const listResult = await pool.query(
-      `SELECT id, from_date, to_date, pc_kg, pe_kg, pet_kg, total_kg, notes,
-              created_by, created_at
+      `SELECT id, TO_CHAR(stock_date, 'YYYY-MM-DD') AS stock_date,
+              pc_kg, pe_kg, pet_kg, total_kg, notes, created_by, created_at,
+              pc_gallon_kg, pc_crusher_kg, pc_washing_kg, pc_pellet_kg,
+              pe_super_kg, pe_1_kg, eva_super_kg, eva_1_kg,
+              flakes_pe_super_kg, flakes_pe_1_kg, flakes_eva_super_kg, flakes_eva_1_kg,
+              pellet_pe_super_kg, pellet_pe_1_kg,
+              pet_gallon_kg, pet_crusher_kg, pet_washing_kg, pet_boretech_kg, pet_pellet_kg
          FROM opening_stock ${whereSql}
-         ORDER BY created_at DESC
+         ORDER BY stock_date DESC, created_at DESC
          LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`,
       dataParams,
     );
@@ -620,8 +663,13 @@ router.get('/opening-stock', async (req, res) => {
 router.get('/opening-stock/latest', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, from_date, to_date, pc_kg, pe_kg, pet_kg, total_kg, notes,
-              created_by, created_at
+      `SELECT id, TO_CHAR(stock_date, 'YYYY-MM-DD') AS stock_date,
+              pc_kg, pe_kg, pet_kg, total_kg, notes, created_by, created_at,
+              pc_gallon_kg, pc_crusher_kg, pc_washing_kg, pc_pellet_kg,
+              pe_super_kg, pe_1_kg, eva_super_kg, eva_1_kg,
+              flakes_pe_super_kg, flakes_pe_1_kg, flakes_eva_super_kg, flakes_eva_1_kg,
+              pellet_pe_super_kg, pellet_pe_1_kg,
+              pet_gallon_kg, pet_crusher_kg, pet_washing_kg, pet_boretech_kg, pet_pellet_kg
          FROM opening_stock
          ORDER BY created_at DESC
          LIMIT 1`,
@@ -779,15 +827,18 @@ router.get('/ledger', async (req, res) => {
     const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 25));
 
     // ── 1. OPENING events (one row per material per opening_stock record) ──
+    const openParams = [];
+    const openConds = [];
+    if (hasFrom) { openParams.push(fromDate); openConds.push(`stock_date >= $${openParams.length}`); }
+    if (hasTo)   { openParams.push(toDate);   openConds.push(`stock_date <= $${openParams.length}`); }
+    const openWhere = openConds.length ? `WHERE ${openConds.join(' AND ')}` : '';
     const openingsRaw = await pool.query(
-      `SELECT id, from_date AS occurred_date, pc_kg, pe_kg, pet_kg, notes,
+      `SELECT id, stock_date AS occurred_date, pc_kg, pe_kg, pet_kg, notes,
               created_by, created_at
          FROM opening_stock
-         ${hasFrom || hasTo ? 'WHERE 1=1' : ''}
-         ${hasFrom ? 'AND from_date >= $1' : ''}
-         ${hasFrom && hasTo ? 'AND from_date <= $2' : (hasTo ? 'AND from_date <= $1' : '')}
-         ORDER BY from_date ASC, created_at ASC`,
-      hasFrom && hasTo ? [fromDate, toDate] : hasFrom ? [fromDate] : hasTo ? [toDate] : [],
+         ${openWhere}
+         ORDER BY stock_date ASC, created_at ASC`,
+      openParams,
     );
     const openings = [];
     for (const r of openingsRaw.rows) {
@@ -983,6 +1034,143 @@ router.get('/ledger', async (req, res) => {
   } catch (err) {
     console.error('Ledger error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to load ledger' });
+  }
+});
+
+/* ════════════════════════════════════════════════════════════════
+ * Stock Balance — current stock per material derived from latest
+ * opening stock + received - consumed since that opening date.
+ * ════════════════════════════════════════════════════════════════ */
+
+router.get('/stock-balance', async (req, res) => {
+  try {
+    const asOf = ISO_DATE_RE.test(String(req.query.as_of || '').trim())
+      ? String(req.query.as_of).trim()
+      : new Date().toISOString().slice(0, 10);
+
+    // ── Step 1: Latest opening stock ──────────────────────────────
+    const osResult = await pool.query(`
+      SELECT id, TO_CHAR(stock_date, 'YYYY-MM-DD') AS stock_date,
+             pc_kg, pe_kg, pet_kg,
+             pc_gallon_kg, pc_crusher_kg, pc_washing_kg, pc_pellet_kg,
+             pe_super_kg, pe_1_kg, eva_super_kg, eva_1_kg,
+             flakes_pe_super_kg, flakes_pe_1_kg, flakes_eva_super_kg, flakes_eva_1_kg,
+             pellet_pe_super_kg, pellet_pe_1_kg,
+             pet_gallon_kg, pet_crusher_kg, pet_washing_kg, pet_boretech_kg, pet_pellet_kg
+      FROM opening_stock
+      ORDER BY stock_date DESC, created_at DESC
+      LIMIT 1
+    `);
+
+    const os = osResult.rows[0] || null;
+    const openingDate = os ? os.stock_date : null;
+
+    // ── Step 2: Received AFTER opening date up to as_of ──────────
+    const recResult = await pool.query(`
+      SELECT UPPER(TRIM("materialType")) AS material,
+             COALESCE(SUM("netWeight"), 0) AS received_kg
+      FROM raw_material
+      WHERE status = 'Accepted'
+        AND exitdate::date > $1::date
+        AND exitdate::date <= $2::date
+      GROUP BY UPPER(TRIM("materialType"))
+    `, [openingDate || '1970-01-01', asOf]);
+
+    const received = { PC: 0, PE: 0, PET: 0 };
+    for (const r of recResult.rows) {
+      if (received[r.material] !== undefined) received[r.material] = Number(r.received_kg) || 0;
+    }
+
+    // ── Step 3: Crusher consumption AFTER opening date up to as_of ─
+    const consResult = await pool.query(`
+      SELECT UPPER(TRIM(mt.name)) AS material,
+             COALESCE(SUM(pl.weight), 0) AS consumed_kg
+      FROM production_logs pl
+      JOIN stations s ON s.id = pl.station_id
+      JOIN operator_shifts os ON pl.shift_id = os.id
+      LEFT JOIN material_types mt ON os.material_type_id = mt.id
+      WHERE pl.status != 'Cancelled'
+        AND (s.code = 'CRS' OR LOWER(s.name) LIKE '%crusher%')
+        AND pl.created_at::date > $1::date
+        AND pl.created_at::date <= $2::date
+      GROUP BY UPPER(TRIM(mt.name))
+    `, [openingDate || '1970-01-01', asOf]);
+
+    const consumed = { PC: 0, PE: 0, PET: 0 };
+    for (const r of consResult.rows) {
+      if (consumed[r.material] !== undefined) consumed[r.material] = Number(r.consumed_kg) || 0;
+    }
+
+    // ── Step 4: Build response ────────────────────────────────────
+    const n = (v) => Number(v) || 0;
+
+    const pcOpening  = n(os?.pc_kg);
+    const peOpening  = n(os?.pe_kg);
+    const petOpening = n(os?.pet_kg);
+
+    const pcCurrent  = pcOpening  + received.PC  - consumed.PC;
+    const peCurrent  = peOpening  + received.PE  - consumed.PE;
+    const petCurrent = petOpening + received.PET - consumed.PET;
+
+    res.json({
+      success: true,
+      data: {
+        as_of: asOf,
+        opening_stock_date: openingDate,
+        opening_stock_id: os?.id ?? null,
+
+        PC: {
+          opening_kg:      pcOpening,
+          received_kg:     received.PC,
+          consumed_kg:     consumed.PC,
+          current_stock_kg: pcCurrent,
+          breakdown: {
+            gallon_kg:  n(os?.pc_gallon_kg),
+            crusher_kg: n(os?.pc_crusher_kg),
+            washing_kg: n(os?.pc_washing_kg),
+            pellet_kg:  n(os?.pc_pellet_kg),
+          },
+        },
+
+        PE: {
+          opening_kg:      peOpening,
+          received_kg:     received.PE,
+          consumed_kg:     consumed.PE,
+          current_stock_kg: peCurrent,
+          breakdown: {
+            pe_super_kg:         n(os?.pe_super_kg),
+            pe_1_kg:             n(os?.pe_1_kg),
+            eva_super_kg:        n(os?.eva_super_kg),
+            eva_1_kg:            n(os?.eva_1_kg),
+            flakes_pe_super_kg:  n(os?.flakes_pe_super_kg),
+            flakes_pe_1_kg:      n(os?.flakes_pe_1_kg),
+            flakes_eva_super_kg: n(os?.flakes_eva_super_kg),
+            flakes_eva_1_kg:     n(os?.flakes_eva_1_kg),
+            pellet_pe_super_kg:  n(os?.pellet_pe_super_kg),
+            pellet_pe_1_kg:      n(os?.pellet_pe_1_kg),
+          },
+        },
+
+        PET: {
+          opening_kg:      petOpening,
+          received_kg:     received.PET,
+          consumed_kg:     consumed.PET,
+          current_stock_kg: petCurrent,
+          breakdown: {
+            gallon_kg:   n(os?.pet_gallon_kg),
+            crusher_kg:  n(os?.pet_crusher_kg),
+            washing_kg:  n(os?.pet_washing_kg),
+            boretech_kg: n(os?.pet_boretech_kg),
+            pellet_kg:   n(os?.pet_pellet_kg),
+          },
+        },
+
+        total_kg: pcCurrent + peCurrent + petCurrent,
+      },
+    });
+  } catch (err) {
+    console.error('Stock balance error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to load stock balance' });
   }
 });
 

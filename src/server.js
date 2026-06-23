@@ -11,6 +11,7 @@ const authRoutes = require('./routes/auth');
 const productionRoutes = require('./routes/production');
 const inventoryRoutes = require('./routes/inventory');
 const partsRoutes = require('./routes/parts');
+const partsInventoryRoutes = require('./routes/parts-inventory');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -62,6 +63,8 @@ app.use('/api/inventory', inventoryRoutes);
 app.use('/inventory', inventoryRoutes);
 app.use('/api/parts', partsRoutes);
 app.use('/parts', partsRoutes);
+app.use('/api/parts-inventory', partsInventoryRoutes);
+app.use('/parts-inventory', partsInventoryRoutes);
 
 // 404 handler
 app.use((req, res) => {
