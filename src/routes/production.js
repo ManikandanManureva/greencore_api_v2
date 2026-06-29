@@ -1411,6 +1411,9 @@ router.put('/update-log-status', authenticateToken, async (req, res) => {
       updateFields.push(`used_line = $${paramIndex}`);
       params.push(finalUsedLine);
       paramIndex++;
+      updateFields.push(`used_datetime = $${paramIndex}`);
+      params.push(new Date());
+      paramIndex++;
     }
 
     params.push(outputBagQr); // outputBagQr is always the last parameter for WHERE clause
@@ -2174,6 +2177,8 @@ async function fetchLogsAllFlatRows(query) {
         pl.input_bag_qr,
         pl.output_bag_qr,
         pl.remark,
+        pl.used_line,
+        pl.used_datetime,
         u.name                          AS operator_name,
         s.name                          AS station_name,
         s.code                          AS station_code,
