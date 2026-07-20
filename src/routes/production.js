@@ -788,6 +788,56 @@ router.get('/shift/:shiftId/by-products', authenticateToken, async (req, res) =>
   }
 });
 
+// 8.15 Get by-products across a date range (PPIC report)
+router.get('/by-products/range', authenticateToken, async (req, res) => {
+  const { date_start, date_end, material_type } = req.query;
+  if (!date_start || !date_end) {
+    return res.status(400).json({ success: false, message: 'date_start and date_end are required' });
+  }
+  try {
+    const params = [date_start, date_end];
+    let materialFilter = '';
+    if (material_type && material_type !== 'all') {
+      params.push(String(material_type));
+      materialFilter = `AND mt.name = $${params.length}`;
+    }
+    const result = await pool.query(
+      `SELECT b.id, b.name, b.category, b.weight,
+              s.name  AS station_name,
+              mt.name AS material_type_name,
+              st.name AS shift_name,
+              u.name  AS operator_name,
+              os.start_time
+       FROM by_product_logs b
+       LEFT JOIN stations        s  ON s.id  = b.station_id
+       LEFT JOIN operator_shifts os ON os.id = b.shift_id
+       LEFT JOIN shift_types     st ON st.id = os.shift_type_id
+       LEFT JOIN users           u  ON u.id  = os.user_id
+       LEFT JOIN material_types  mt ON mt.id = os.material_type_id
+       WHERE os.start_time::date >= $1::date
+         AND os.start_time::date <= $2::date
+         ${materialFilter}
+       ORDER BY os.start_time DESC, b.id ASC`,
+      params
+    );
+    const rows = result.rows.map((r) => ({
+      id:           r.id,
+      name:         r.name,
+      category:     r.category || '',
+      weight:       Number(r.weight) || 0,
+      stationName:  r.station_name || '',
+      materialType: r.material_type_name || '',
+      shift:        r.shift_name || '',
+      operator:     r.operator_name || '',
+      date:         r.start_time ? new Date(r.start_time).toISOString().slice(0, 10) : '',
+    }));
+    res.json({ success: true, data: rows, total: rows.length });
+  } catch (error) {
+    console.error('Error fetching by-products range:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
 // 8.2 Update by-products for a shift (replace all)
 router.put('/shift/:shiftId/by-products', authenticateToken, async (req, res) => {
   const { shiftId } = req.params;
