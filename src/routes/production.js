@@ -788,52 +788,178 @@ router.get('/shift/:shiftId/by-products', authenticateToken, async (req, res) =>
   }
 });
 
-// 8.15 Get by-products across a date range (PPIC report)
+// ── Shared helper: fetch by-product flat rows for a date range ───────────────
+async function fetchByProductRows(date_start, date_end, material_type) {
+  const params = [date_start, date_end];
+  let materialFilter = '';
+  if (material_type && material_type !== 'all') {
+    params.push(String(material_type));
+    materialFilter = `AND mt.name = $${params.length}`;
+  }
+  const result = await pool.query(
+    `SELECT b.id, b.name, b.category, b.weight,
+            s.name  AS station_name,
+            mt.name AS material_type_name,
+            st.name AS shift_name,
+            st.id   AS shift_type_id,
+            u.name  AS operator_name,
+            os.start_time
+     FROM by_product_logs b
+     LEFT JOIN stations        s  ON s.id  = b.station_id
+     LEFT JOIN operator_shifts os ON os.id = b.shift_id
+     LEFT JOIN shift_types     st ON st.id = os.shift_type_id
+     LEFT JOIN users           u  ON u.id  = os.user_id
+     LEFT JOIN material_types  mt ON mt.id = os.material_type_id
+     WHERE os.start_time::date >= $1::date
+       AND os.start_time::date <= $2::date
+       ${materialFilter}
+     ORDER BY os.start_time::date ASC, st.id ASC, b.id ASC`,
+    params
+  );
+  return result.rows;
+}
+
+// ── Group flat rows into day → shift → items + daily total ───────────────────
+function groupByProductRows(rows) {
+  // days map: date string → { date, shifts: { shiftName → { shiftName, items[], shiftTotal } }, dayTotal }
+  const daysMap = {};
+  for (const r of rows) {
+    const date   = r.start_time ? new Date(r.start_time).toISOString().slice(0, 10) : 'Unknown';
+    const shift  = r.shift_name || 'Unknown';
+    const weight = Number(r.weight) || 0;
+
+    if (!daysMap[date]) daysMap[date] = { date, shifts: {}, dayTotal: 0 };
+    if (!daysMap[date].shifts[shift]) daysMap[date].shifts[shift] = { shiftName: shift, items: [], shiftTotal: 0 };
+
+    daysMap[date].shifts[shift].items.push({
+      id:          r.id,
+      name:        r.name,
+      category:    r.category || '',
+      weight,
+      stationName: r.station_name || '',
+      materialType: r.material_type_name || '',
+      operator:    r.operator_name || '',
+    });
+    daysMap[date].shifts[shift].shiftTotal += weight;
+    daysMap[date].dayTotal += weight;
+  }
+
+  // Convert to array, sort descending by date
+  return Object.values(daysMap)
+    .sort((a, b) => (a.date < b.date ? 1 : -1))
+    .map(d => ({
+      date:     d.date,
+      dayTotal: Math.round(d.dayTotal * 100) / 100,
+      shifts:   Object.values(d.shifts).map(s => ({
+        shiftName:  s.shiftName,
+        shiftTotal: Math.round(s.shiftTotal * 100) / 100,
+        items:      s.items,
+      })),
+    }));
+}
+
+// 8.15 Get by-products across a date range — grouped by day → shift
 router.get('/by-products/range', authenticateToken, async (req, res) => {
   const { date_start, date_end, material_type } = req.query;
   if (!date_start || !date_end) {
     return res.status(400).json({ success: false, message: 'date_start and date_end are required' });
   }
   try {
-    const params = [date_start, date_end];
-    let materialFilter = '';
-    if (material_type && material_type !== 'all') {
-      params.push(String(material_type));
-      materialFilter = `AND mt.name = $${params.length}`;
-    }
-    const result = await pool.query(
-      `SELECT b.id, b.name, b.category, b.weight,
-              s.name  AS station_name,
-              mt.name AS material_type_name,
-              st.name AS shift_name,
-              u.name  AS operator_name,
-              os.start_time
-       FROM by_product_logs b
-       LEFT JOIN stations        s  ON s.id  = b.station_id
-       LEFT JOIN operator_shifts os ON os.id = b.shift_id
-       LEFT JOIN shift_types     st ON st.id = os.shift_type_id
-       LEFT JOIN users           u  ON u.id  = os.user_id
-       LEFT JOIN material_types  mt ON mt.id = os.material_type_id
-       WHERE os.start_time::date >= $1::date
-         AND os.start_time::date <= $2::date
-         ${materialFilter}
-       ORDER BY os.start_time DESC, b.id ASC`,
-      params
-    );
-    const rows = result.rows.map((r) => ({
-      id:           r.id,
-      name:         r.name,
-      category:     r.category || '',
-      weight:       Number(r.weight) || 0,
-      stationName:  r.station_name || '',
-      materialType: r.material_type_name || '',
-      shift:        r.shift_name || '',
-      operator:     r.operator_name || '',
-      date:         r.start_time ? new Date(r.start_time).toISOString().slice(0, 10) : '',
-    }));
-    res.json({ success: true, data: rows, total: rows.length });
+    const rows = await fetchByProductRows(date_start, date_end, material_type);
+    const grouped = groupByProductRows(rows);
+    res.json({ success: true, data: grouped, total: rows.length });
   } catch (error) {
     console.error('Error fetching by-products range:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// 8.16 Export by-products as Excel (.xlsx) — same structure as range view
+router.get('/by-products/range/export', authenticateToken, async (req, res) => {
+  const { date_start, date_end, material_type } = req.query;
+  if (!date_start || !date_end) {
+    return res.status(400).json({ success: false, message: 'date_start and date_end are required' });
+  }
+  try {
+    const ExcelJS = require('exceljs');
+    const rows    = await fetchByProductRows(date_start, date_end, material_type);
+    const grouped = groupByProductRows(rows);
+
+    const wb = new ExcelJS.Workbook();
+    wb.creator = 'Greencore API';
+    const ws = wb.addWorksheet('By-Products Report');
+
+    // ── Column widths ──
+    ws.columns = [
+      { key: 'date',     width: 14 },
+      { key: 'shift',    width: 14 },
+      { key: 'name',     width: 28 },
+      { key: 'category', width: 18 },
+      { key: 'station',  width: 20 },
+      { key: 'operator', width: 22 },
+      { key: 'weight',   width: 14 },
+    ];
+
+    // ── Header row ──
+    const headerRow = ws.addRow(['Date', 'Shift', 'By-Product Name', 'Category', 'Station', 'Operator', 'Weight (kg)']);
+    headerRow.eachCell(cell => {
+      cell.font      = { bold: true, color: { argb: 'FFFFFFFF' } };
+      cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F5C2E' } };
+      cell.alignment = { vertical: 'middle', horizontal: 'center' };
+      cell.border    = { bottom: { style: 'thin' } };
+    });
+    ws.getRow(1).height = 20;
+
+    const LIGHT_GREEN  = 'FFE8F5E9';
+    const SHIFT_BLUE   = 'FFE3F2FD';
+    const DAY_YELLOW   = 'FFFFF9C4';
+
+    for (const day of grouped) {
+      // ── Day header row ──
+      const dayRow = ws.addRow([day.date, '', '', '', '', 'Day Total', day.dayTotal]);
+      dayRow.eachCell(cell => {
+        cell.font = { bold: true };
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: DAY_YELLOW } };
+      });
+      dayRow.getCell(7).numFmt = '0.00';
+
+      for (const shift of day.shifts) {
+        // ── Shift sub-header ──
+        const shiftRow = ws.addRow(['', shift.shiftName, '', '', '', 'Shift Total', shift.shiftTotal]);
+        shiftRow.eachCell(cell => {
+          cell.font = { bold: true, italic: true };
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: SHIFT_BLUE } };
+        });
+        shiftRow.getCell(7).numFmt = '0.00';
+
+        // ── Item rows ──
+        for (const item of shift.items) {
+          const itemRow = ws.addRow(['', '', item.name, item.category, item.stationName, item.operator, item.weight]);
+          itemRow.eachCell(cell => {
+            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: LIGHT_GREEN } };
+          });
+          itemRow.getCell(7).numFmt = '0.00';
+        }
+      }
+    }
+
+    // ── Grand total row ──
+    const grandTotal = grouped.reduce((s, d) => s + d.dayTotal, 0);
+    const totalRow = ws.addRow(['Grand Total', '', '', '', '', '', Math.round(grandTotal * 100) / 100]);
+    totalRow.eachCell(cell => {
+      cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F5C2E' } };
+    });
+    totalRow.getCell(7).numFmt = '0.00';
+
+    // ── Stream response ──
+    const filename = `by-products_${date_start}_to_${date_end}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error('Error exporting by-products:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 });
