@@ -2294,6 +2294,8 @@ router.get('/logs-all', authenticateToken, async (req, res) => {
         materialType: row.material_type,
         shiftType: row.shift_type,
         shiftId: row.shift_id,
+        used_line: row.used_line,
+        used_datetime: row.used_datetime,
       });
       sl.totalWeight += Number(row.weight) || 0;
       sl.totalOutputs += 1;
