@@ -21,6 +21,17 @@ function paginate(query) {
   return { limit, offset: (page - 1) * limit };
 }
 
+// Accept DD-MM-YYYY (from frontend display format) or YYYY-MM-DD (ISO); always return YYYY-MM-DD for DB.
+function parseDate(val) {
+  if (!val) return null;
+  const s = String(val).trim();
+  if (/^\d{2}-\d{2}-\d{4}$/.test(s)) {
+    const [dd, mm, yyyy] = s.split('-');
+    return `${yyyy}-${mm}-${dd}`;
+  }
+  return s; // already YYYY-MM-DD or ISO
+}
+
 async function availableQty(client, partId) {
   const r = await client.query(`
     SELECT
@@ -183,7 +194,8 @@ router.post('/stock-in', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const { purchase_order_id, entry_date, supplier_name, part_id, quantity_received, unit_price, notes } = req.body || {};
+    const { purchase_order_id, supplier_name, part_id, quantity_received, unit_price, notes } = req.body || {};
+    const entry_date = parseDate(req.body.entry_date);
     const received_by = req.body.received_by || (req.user && req.user.name) || 'system';
     if (!entry_date || !supplier_name || !part_id || !quantity_received)
       return res.status(400).json({ success: false, message: 'entry_date, supplier_name, part_id, quantity_received are required' });
@@ -280,7 +292,8 @@ router.post('/stock-correction', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const { correction_date, part_id, current_stock, counted_stock, reason, notes } = req.body || {};
+    const { part_id, current_stock, counted_stock, reason, notes } = req.body || {};
+    const correction_date = parseDate(req.body.correction_date);
     const corrected_by = req.body.corrected_by || (req.user && req.user.name) || 'system';
     if (!correction_date || part_id == null || current_stock == null || counted_stock == null || !reason)
       return res.status(400).json({ success: false, message: 'correction_date, part_id, current_stock, counted_stock, reason are required' });
@@ -316,6 +329,7 @@ router.put('/stock-correction/:id', async (req, res) => {
       return res.status(404).json({ success: false, message: 'Record not found' });
     const prev = existing.rows[0];
     const body = req.body || {};
+    if (body.correction_date) body.correction_date = parseDate(body.correction_date);
     const sets = []; const vals = [];
     for (const f of ['correction_date', 'current_stock', 'counted_stock', 'reason', 'corrected_by', 'notes', 'status']) {
       if (body[f] !== undefined) { vals.push(body[f] === '' ? null : body[f]); sets.push(`${f}=$${vals.length}`); }
@@ -389,7 +403,8 @@ router.post('/outgoing', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const { outgoing_date, reference_id, part_id, quantity_sent, destination, purpose, received_by, notes } = req.body || {};
+    const { reference_id, part_id, quantity_sent, destination, purpose, received_by, notes } = req.body || {};
+    const outgoing_date = parseDate(req.body.outgoing_date);
     const issued_by = req.body.issued_by || (req.user && req.user.name) || 'system';
     if (!outgoing_date || !reference_id || !part_id || !quantity_sent || !destination || !purpose)
       return res.status(400).json({ success: false, message: 'outgoing_date, reference_id, part_id, quantity_sent, destination, purpose are required' });
@@ -439,6 +454,7 @@ router.put('/outgoing/:id', async (req, res) => {
       return res.status(404).json({ success: false, message: 'Record not found' });
     const prev = existing.rows[0];
     const body = req.body || {};
+    if (body.outgoing_date) body.outgoing_date = parseDate(body.outgoing_date);
     const sets = []; const vals = [];
     for (const f of ['outgoing_date', 'reference_id', 'quantity_sent', 'destination', 'purpose', 'issued_by', 'received_by', 'notes', 'status']) {
       if (body[f] !== undefined) { vals.push(body[f] === '' ? null : body[f]); sets.push(`${f}=$${vals.length}`); }
@@ -506,7 +522,8 @@ router.post('/damage-waste', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const { incident_date, part_id, quantity_affected, incident_type, root_cause, location, approver, notes } = req.body || {};
+    const { part_id, quantity_affected, incident_type, root_cause, location, approver, notes } = req.body || {};
+    const incident_date = parseDate(req.body.incident_date);
     const reported_by = req.body.reported_by || (req.user && req.user.name) || 'system';
     if (!incident_date || !part_id || !quantity_affected || !incident_type || !root_cause || !location)
       return res.status(400).json({ success: false, message: 'incident_date, part_id, quantity_affected, incident_type, root_cause, location are required' });
@@ -544,6 +561,7 @@ router.put('/damage-waste/:id', async (req, res) => {
       return res.status(404).json({ success: false, message: 'Record not found' });
     const prev = existing.rows[0];
     const body = req.body || {};
+    if (body.incident_date) body.incident_date = parseDate(body.incident_date);
     const sets = []; const vals = [];
     for (const f of ['incident_date', 'quantity_affected', 'incident_type', 'root_cause', 'location', 'reported_by', 'approver', 'notes', 'status']) {
       if (body[f] !== undefined) { vals.push(body[f] === '' ? null : body[f]); sets.push(`${f}=$${vals.length}`); }
