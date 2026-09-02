@@ -59,13 +59,13 @@ async function run() {
       CREATE TABLE IF NOT EXISTS parts_outgoing (
         id                SERIAL PRIMARY KEY,
         outgoing_date     DATE NOT NULL,
-        reference_id      VARCHAR(100) NOT NULL,
+        reference_id      VARCHAR(100),
         part_id           INTEGER NOT NULL REFERENCES pm_item(id),
         part_code         VARCHAR(40),
         part_description  TEXT,
         uom               VARCHAR(10),
         quantity_sent     NUMERIC(14,2) NOT NULL,
-        destination       VARCHAR(200) NOT NULL,
+        destination       VARCHAR(200),
         purpose           VARCHAR(20) NOT NULL,
         issued_by         VARCHAR(120) NOT NULL,
         received_by       VARCHAR(120),
@@ -75,6 +75,9 @@ async function run() {
         updated_at        TIMESTAMPTZ DEFAULT NOW()
       )
     `);
+    // Migration: reference_id & destination are now optional on existing installs
+    await client.query(`ALTER TABLE parts_outgoing ALTER COLUMN reference_id DROP NOT NULL`);
+    await client.query(`ALTER TABLE parts_outgoing ALTER COLUMN destination DROP NOT NULL`);
     console.log('✅ parts_outgoing table ensured');
 
     await client.query(`

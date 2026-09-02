@@ -406,8 +406,8 @@ router.post('/outgoing', async (req, res) => {
     const { reference_id, part_id, quantity_sent, destination, purpose, received_by, notes } = req.body || {};
     const outgoing_date = parseDate(req.body.outgoing_date);
     const issued_by = req.body.issued_by || (req.user && req.user.name) || 'system';
-    if (!outgoing_date || !reference_id || !part_id || !quantity_sent || !destination || !purpose)
-      return res.status(400).json({ success: false, message: 'outgoing_date, reference_id, part_id, quantity_sent, destination, purpose are required' });
+    if (!outgoing_date || !part_id || !quantity_sent || !purpose)
+      return res.status(400).json({ success: false, message: 'outgoing_date, part_id, quantity_sent, purpose are required' });
     if (!['production', 'sale', 'sample', 'return', 'other'].includes(purpose))
       return res.status(400).json({ success: false, message: 'purpose must be one of: production, sale, sample, return, other' });
     const qty = parseFloat(quantity_sent);
@@ -423,8 +423,8 @@ router.post('/outgoing', async (req, res) => {
          quantity_sent, destination, purpose, issued_by, received_by, notes, status)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'issued')
       RETURNING *
-    `, [outgoing_date, reference_id, part_id, part.code, part.description, part.uom,
-        qty, destination, purpose, issued_by, received_by || null, notes || null]);
+    `, [outgoing_date, reference_id || null, part_id, part.code, part.description, part.uom,
+        qty, destination || null, purpose, issued_by, received_by || null, notes || null]);
     const inserted = r.rows[0];
     const bal = await availableQty(client, part_id);
     await writeLedger(client, {
