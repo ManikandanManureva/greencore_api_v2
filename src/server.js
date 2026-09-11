@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const path = require('path');
 require('dotenv').config();
 
 if (!process.env.JWT_SECRET || String(process.env.JWT_SECRET).trim() === '') {
@@ -28,6 +29,9 @@ app.use(
 );
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Uploaded batch photos — served as static files, e.g. /uploads/production/<file>.jpg
+app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
 
 // Health check endpoint
 app.get('/health', (req, res) => {

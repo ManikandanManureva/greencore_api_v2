@@ -2,6 +2,30 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const multer = require('multer');
+
+const PHOTO_UPLOAD_DIR = path.join(__dirname, '..', '..', 'uploads', 'production');
+fs.mkdirSync(PHOTO_UPLOAD_DIR, { recursive: true });
+
+const photoUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, PHOTO_UPLOAD_DIR),
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname || '').toLowerCase() || '.jpg';
+      cb(null, `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`);
+    },
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!/^image\//.test(file.mimetype)) {
+      return cb(new Error('Only image uploads are allowed'));
+    }
+    cb(null, true);
+  },
+});
 
 /**
  * PET bag QR segment codes by process (not raw DB station code).
@@ -595,6 +619,20 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
     console.error('Error generating next QR:', error);
     res.status(500).json({ success: false, message: 'Server error' });
   }
+});
+
+// Upload a batch photo — returns a permanent, publicly-reachable URL to store as photoUrl.
+router.post('/upload-photo', authenticateToken, (req, res) => {
+  photoUpload.single('photo')(req, res, (err) => {
+    if (err) {
+      return res.status(400).json({ success: false, message: err.message || 'Upload failed' });
+    }
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: 'No photo file provided' });
+    }
+    const url = `${req.protocol}://${req.get('host')}/uploads/production/${req.file.filename}`;
+    res.json({ success: true, url });
+  });
 });
 
 // 7. Log production data
@@ -1670,7 +1708,7 @@ router.put('/logs-update/:id', authenticateToken, async (req, res) => {
   if (!id || isNaN(Number(id))) {
     return res.status(400).json({ success: false, message: 'Valid log id is required' });
   }
-  const { weight, status, sub_line, remark } = req.body;
+  const { weight, status, sub_line, remark, photo_url } = req.body;
   const sets = [];
   const params = [];
 
@@ -1685,6 +1723,9 @@ router.put('/logs-update/:id', authenticateToken, async (req, res) => {
   }
   if (remark !== undefined) {
     params.push(remark === '' ? null : String(remark).trim()); sets.push(`remark = $${params.length}`);
+  }
+  if (photo_url !== undefined) {
+    params.push(photo_url === '' ? null : String(photo_url)); sets.push(`photo_url = $${params.length}`);
   }
   if (sets.length === 0) {
     return res.status(400).json({ success: false, message: 'No valid fields to update' });
