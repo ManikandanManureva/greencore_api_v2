@@ -501,7 +501,7 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
 
     // Get shift details (use shift_type_id for correct S1/S2/S3 in QR)
     const shiftInfo = await pool.query(
-      `SELECT os.shift_type_id, st.name as shift_name, os.start_time, mt.name as material_name
+      `SELECT os.shift_type_id, os.material_type_id, st.name as shift_name, os.start_time, mt.name as material_name
        FROM operator_shifts os
        LEFT JOIN shift_types st ON os.shift_type_id = st.id
        LEFT JOIN material_types mt ON os.material_type_id = mt.id
@@ -518,6 +518,7 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
     const shift_name = row.shift_name;
     const start_time = row.start_time;
     const material_name = row.material_name;
+    const material_type_id = row.material_type_id;
 
     const shiftDate = new Date(start_time);
     const year = shiftDate.getFullYear();
@@ -555,10 +556,20 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
       subLine
     );
 
-    let countSql = `SELECT COUNT(*) as count 
-       FROM production_logs 
-       WHERE station_id = $1 AND created_at >= CURRENT_DATE`;
-    const countParams = [stationId];
+    // PET bag numbers reset monthly (not daily) per the PET line's numbering convention
+    const isPetMaterial = String(material_name || '').trim().toUpperCase() === 'PET';
+    const periodCondition = isPetMaterial
+      ? `date_trunc('month', os.start_time) = date_trunc('month', $3::date)`
+      : `os.start_time::date = $3::date`;
+
+    let countSql = `SELECT COUNT(*) as count
+       FROM production_logs pl
+       JOIN operator_shifts os ON pl.shift_id = os.id
+       WHERE pl.station_id = $1
+         AND os.shift_type_id = $2
+         AND ${periodCondition}
+         AND pl.material_type_id = $4`;
+    const countParams = [stationId, shift_type_id, start_time, material_type_id];
     countSql = appendPetSubLineCountFilter(countSql, countParams, subLine);
     const countResult = await pool.query(countSql, countParams);
     const increment = String(parseInt(countResult.rows[0].count, 10) + 1).padStart(3, '0');
@@ -655,13 +666,20 @@ router.post('/log', authenticateToken, async (req, res) => {
 
       const { finalStationCode } = resolveQrStationCodes(stationCode, stationName, subLine);
 
-      let countSql = `SELECT COUNT(*) as count 
+      // PET bag numbers reset monthly (not daily) per the PET line's numbering convention
+      const isPetMaterial = String(material_name || '').trim().toUpperCase() === 'PET';
+      const periodCondition = isPetMaterial
+        ? `date_trunc('month', os.start_time) = date_trunc('month', $3::date)`
+        : `os.start_time::date = $3::date`;
+
+      let countSql = `SELECT COUNT(*) as count
          FROM production_logs pl
          JOIN operator_shifts os ON pl.shift_id = os.id
          WHERE os.shift_type_id = (SELECT shift_type_id FROM operator_shifts WHERE id = $1)
            AND pl.station_id = $2
-           AND os.start_time::date = $3::date`;
-      const countParams = [shiftId, stationId, start_time];
+           AND ${periodCondition}
+           AND pl.material_type_id = $4`;
+      const countParams = [shiftId, stationId, start_time, materialTypeId];
       countSql = appendPetSubLineCountFilter(countSql, countParams, subLine);
       const countResult = await pool.query(countSql, countParams);
 
@@ -2224,7 +2242,7 @@ router.get('/ppic-station-overview', authenticateToken, async (req, res) => {
 
   try {
     let sql = `
-      SELECT pl.id, pl.output_bag_qr, pl.weight, pl.status, pl.sub_line, pl.remark, pl.created_at,
+      SELECT pl.id, pl.output_bag_qr, pl.weight, pl.status, pl.sub_line, pl.remark, pl.created_at, pl.photo_url,
              s.id as station_id, s.name as station_name, s.code as station_code,
              st.name as shift_name, u.name as operator_name,
              mt.name as material_type_name
@@ -2284,6 +2302,7 @@ router.get('/ppic-station-overview', authenticateToken, async (req, res) => {
         shift_name: row.shift_name,
         operator_name: row.operator_name,
         material_type_name: row.material_type_name ?? null,
+        photo_url: row.photo_url ?? null,
       });
       grouped[key].total_bags += 1;
       grouped[key].total_weight += parseFloat(row.weight || 0);
