@@ -43,6 +43,7 @@ const FIELDS = {
   quantity: 'quantity',
   status: 'status',
   materialDescription: '"materialDescription"',
+  region: 'region',
   returnentrydate: 'returnentrydate',
   returnentrytime: 'returnentrytime',
   returnExitDate: '"returnExitDate"',
@@ -66,6 +67,8 @@ const NUMERIC_FIELDS = new Set([
 
 const VALID_STATUS = ['Pending', 'Accepted', 'Rejected'];
 const VALID_STATIONS = ['PC', 'PE', 'PET'];
+// PET incoming material: fixed set of Indonesian regions, editable by PPIC.
+const VALID_REGIONS = ['Jawa Barat', 'Jawa Timur', 'Jawa Tengah', 'Sumatra', 'Sulawesi', 'Bali'];
 
 // Normalise an incoming value: '' -> null, numeric strings -> Number.
 function cleanValue(field, value) {
@@ -398,6 +401,10 @@ router.post('/raw-materials', async (req, res) => {
     if (body.status && !VALID_STATUS.includes(body.status)) {
       return res.status(400).json({ success: false, message: 'Invalid status value' });
     }
+    if (body.region === '') delete body.region;
+    if (body.region && !VALID_REGIONS.includes(body.region)) {
+      return res.status(400).json({ success: false, message: 'Invalid region value' });
+    }
 
     const columns = [];
     const placeholders = [];
@@ -447,6 +454,10 @@ router.put('/raw-materials/:id', async (req, res) => {
     if (body.status === '') delete body.status;
     if (body.status && !VALID_STATUS.includes(body.status)) {
       return res.status(400).json({ success: false, message: 'Invalid status value' });
+    }
+    if (body.region === '') delete body.region;
+    if (body.region && !VALID_REGIONS.includes(body.region)) {
+      return res.status(400).json({ success: false, message: 'Invalid region value' });
     }
 
     const sets = [];
