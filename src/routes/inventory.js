@@ -53,6 +53,11 @@ const FIELDS = {
   returnNetWeight: '"returnNetWeight"',
   recordNoWBS: '"recordNoWBS"',
   plant: 'plant',
+  // PE only: per-grade weights entered together; netWeight is their sum.
+  peSuperWeight: '"peSuperWeight"',
+  pe1Weight: '"pe1Weight"',
+  evaSuperWeight: '"evaSuperWeight"',
+  eva1Weight: '"eva1Weight"',
 };
 
 const NUMERIC_FIELDS = new Set([
@@ -63,6 +68,10 @@ const NUMERIC_FIELDS = new Set([
   'returnEntryWeight',
   'returnExitWeight',
   'returnNetWeight',
+  'peSuperWeight',
+  'pe1Weight',
+  'evaSuperWeight',
+  'eva1Weight',
 ]);
 
 const VALID_STATUS = ['Pending', 'Accepted', 'Rejected'];
