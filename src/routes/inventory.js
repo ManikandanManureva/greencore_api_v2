@@ -505,6 +505,27 @@ router.put('/raw-materials/:id', async (req, res) => {
   }
 });
 
+/**
+ * DELETE /inventory/raw-materials/:id  — remove a gate-entry record.
+ * QC can view/update gate entries but not delete them.
+ */
+router.delete('/raw-materials/:id', async (req, res) => {
+  const role = String(req.user && req.user.role ? req.user.role : '').toLowerCase();
+  if (!ALLOWED_ROLES.includes(role)) {
+    return res.status(403).json({ success: false, message: 'Not authorized to delete gate-entry records' });
+  }
+  try {
+    const result = await pool.query('DELETE FROM raw_material WHERE id = $1 RETURNING id', [req.params.id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Record not found' });
+    }
+    res.json({ success: true, message: 'Record deleted' });
+  } catch (err) {
+    console.error('Inventory delete error:', err.message);
+    res.status(500).json({ success: false, message: err.message || 'Failed to delete record' });
+  }
+});
+
 /* ════════════════════════════════════════════════════════════════
  * Opening Stock — append-only versioned record (see opening_stock table).
  * ════════════════════════════════════════════════════════════════ */
@@ -605,6 +626,22 @@ router.post('/opening-stock', async (req, res) => {
       success: false,
       message: err.message || 'Failed to save opening stock',
     });
+  }
+});
+
+/**
+ * DELETE /inventory/opening-stock/:id — remove one saved version.
+ */
+router.delete('/opening-stock/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM opening_stock WHERE id = $1 RETURNING id', [req.params.id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Record not found' });
+    }
+    res.json({ success: true, message: 'Record deleted' });
+  } catch (err) {
+    console.error('Opening stock delete error:', err.message);
+    res.status(500).json({ success: false, message: err.message || 'Failed to delete record' });
   }
 });
 
@@ -749,6 +786,22 @@ router.post('/outgoing', async (req, res) => {
   } catch (err) {
     console.error('Outgoing create error:', err.message);
     res.status(500).json({ success: false, message: err.message || 'Failed to record outgoing entry' });
+  }
+});
+
+/**
+ * DELETE /inventory/outgoing/:id
+ */
+router.delete('/outgoing/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM outgoing_entries WHERE id = $1 RETURNING id', [req.params.id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Record not found' });
+    }
+    res.json({ success: true, message: 'Record deleted' });
+  } catch (err) {
+    console.error('Outgoing delete error:', err.message);
+    res.status(500).json({ success: false, message: err.message || 'Failed to delete record' });
   }
 });
 

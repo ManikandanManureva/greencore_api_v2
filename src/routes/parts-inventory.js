@@ -259,6 +259,17 @@ router.put('/stock-in/:id', async (req, res) => {
   } finally { client.release(); }
 });
 
+router.delete('/stock-in/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM parts_stock_in WHERE id=$1 RETURNING id', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ success: false, message: 'Record not found' });
+    res.json({ success: true, message: 'Record deleted' });
+  } catch (err) {
+    console.error('Stock-in delete error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to delete stock-in record' });
+  }
+});
+
 // ─── 3. Stock Correction ──────────────────────────────────────────────────────
 router.get('/stock-correction', async (req, res) => {
   try {
@@ -365,6 +376,17 @@ router.put('/stock-correction/:id', async (req, res) => {
     console.error('Stock-correction update error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to update stock correction' });
   } finally { client.release(); }
+});
+
+router.delete('/stock-correction/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM parts_stock_correction WHERE id=$1 RETURNING id', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ success: false, message: 'Record not found' });
+    res.json({ success: true, message: 'Record deleted' });
+  } catch (err) {
+    console.error('Stock-correction delete error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to delete stock correction' });
+  }
 });
 
 // ─── 4. Outgoing ──────────────────────────────────────────────────────────────
@@ -488,6 +510,17 @@ router.put('/outgoing/:id', async (req, res) => {
   } finally { client.release(); }
 });
 
+router.delete('/outgoing/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM parts_outgoing WHERE id=$1 RETURNING id', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ success: false, message: 'Record not found' });
+    res.json({ success: true, message: 'Record deleted' });
+  } catch (err) {
+    console.error('Outgoing delete error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to delete outgoing record' });
+  }
+});
+
 // ─── 5. Damage & Waste ────────────────────────────────────────────────────────
 router.get('/damage-waste', async (req, res) => {
   try {
@@ -593,6 +626,17 @@ router.put('/damage-waste/:id', async (req, res) => {
     console.error('Damage-waste update error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to update damage/waste record' });
   } finally { client.release(); }
+});
+
+router.delete('/damage-waste/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM parts_damage_waste WHERE id=$1 RETURNING id', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ success: false, message: 'Record not found' });
+    res.json({ success: true, message: 'Record deleted' });
+  } catch (err) {
+    console.error('Damage-waste delete error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to delete damage/waste record' });
+  }
 });
 
 // ─── 6. Stock Ledger ──────────────────────────────────────────────────────────

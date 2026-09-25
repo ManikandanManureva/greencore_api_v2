@@ -135,4 +135,23 @@ router.put('/:id', async (req, res) => {
   }
 });
 
+// DELETE /parts/:id — remove a part. Blocked if it already has transaction history
+// (stock-in / correction / outgoing / damage records reference it).
+router.delete('/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM pm_item WHERE id = $1 RETURNING id', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ success: false, message: 'Part not found' });
+    res.json({ success: true, message: 'Part deleted' });
+  } catch (err) {
+    if (err.code === '23503') {
+      return res.status(409).json({
+        success: false,
+        message: 'This part has transaction history (stock in/out, corrections, or damage records) and cannot be deleted. Set it to Inactive instead.',
+      });
+    }
+    console.error('Parts delete error:', err.message);
+    res.status(500).json({ success: false, message: err.message || 'Failed to delete part' });
+  }
+});
+
 module.exports = router;
