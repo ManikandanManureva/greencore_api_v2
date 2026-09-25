@@ -370,7 +370,7 @@ router.put('/stock-correction/:id', async (req, res) => {
 // ─── 4. Outgoing ──────────────────────────────────────────────────────────────
 router.get('/outgoing', async (req, res) => {
   try {
-    const { search, status, purpose } = req.query;
+    const { search, status, purpose, date_from, date_to } = req.query;
     const { limit, offset } = paginate(req.query);
     const params = [];
     const conds = [];
@@ -384,6 +384,8 @@ router.get('/outgoing', async (req, res) => {
     if (purpose && ['production', 'sale', 'sample', 'return', 'other'].includes(purpose)) {
       params.push(purpose); conds.push(`purpose=$${params.length}`);
     }
+    if (date_from) { params.push(parseDate(date_from)); conds.push(`outgoing_date >= $${params.length}`); }
+    if (date_to) { params.push(parseDate(date_to)); conds.push(`outgoing_date <= $${params.length}`); }
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
     const countRes = await pool.query(`SELECT COUNT(*) FROM parts_outgoing ${where}`, params);
     const total = parseInt(countRes.rows[0].count);
