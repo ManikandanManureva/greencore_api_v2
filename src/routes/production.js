@@ -6,18 +6,54 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const multer = require('multer');
+const { isS3Configured, uploadBuffer, getSignedUrlForKey, keyFromS3Url } = require('../config/s3');
 
 const PHOTO_UPLOAD_DIR = path.join(__dirname, '..', '..', 'uploads', 'production');
 fs.mkdirSync(PHOTO_UPLOAD_DIR, { recursive: true });
 
+function makePhotoFilename(originalname) {
+  const ext = path.extname(originalname || '').toLowerCase() || '.jpg';
+  return `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`;
+}
+
+// The bucket is private, so what we store for an S3 photo is the bare object key (e.g.
+// "production/167...jpg"), not a URL — URLs expire, keys don't. A value is only treated as a
+// key when it isn't itself a usable URL (old local-disk rows stay as full http(s) URLs).
+function normalizeForStorage(value) {
+  if (!value) return value;
+  return String(value).split(',').map((part) => {
+    const trimmed = part.trim();
+    if (!trimmed) return trimmed;
+    const key = keyFromS3Url(trimmed);
+    if (key) return key;
+    return trimmed; // already a bare key, or a non-S3 URL (local disk) — keep as-is
+  }).filter(Boolean).join(',');
+}
+
+// Turn whatever is stored back into something a client can actually load right now:
+// local-disk URLs pass through unchanged; bare S3 keys get a freshly-signed GET URL.
+async function resolvePhotoUrl(value) {
+  if (!value) return value;
+  const parts = String(value).split(',').map((s) => s.trim()).filter(Boolean);
+  const resolved = await Promise.all(parts.map(async (part) => {
+    if (/^https?:\/\//i.test(part)) return part;
+    if (isS3Configured()) {
+      try {
+        return await getSignedUrlForKey(part);
+      } catch (err) {
+        console.error('Failed to sign photo URL for key', part, err);
+        return part;
+      }
+    }
+    return part;
+  }));
+  return resolved.join(',');
+}
+
+// Buffered in memory so the same file can go to S3 (preferred) or local disk (fallback
+// when S3 env vars aren't set) without writing twice.
 const photoUpload = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => cb(null, PHOTO_UPLOAD_DIR),
-    filename: (req, file, cb) => {
-      const ext = path.extname(file.originalname || '').toLowerCase() || '.jpg';
-      cb(null, `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`);
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (!/^image\//.test(file.mimetype)) {
@@ -621,17 +657,31 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
   }
 });
 
-// Upload a batch photo — returns a permanent, publicly-reachable URL to store as photoUrl.
+// Upload a batch photo — returns a URL the client can use right away to preview it.
+// Goes to S3 when configured (AWS_REGION + AWS_S3_BUCKET), as a signed URL since the bucket
+// is private; otherwise falls back to local disk under /uploads/production. Whatever URL is
+// echoed back here and later sent to /log gets normalized to a bare S3 key for storage.
 router.post('/upload-photo', authenticateToken, (req, res) => {
-  photoUpload.single('photo')(req, res, (err) => {
+  photoUpload.single('photo')(req, res, async (err) => {
     if (err) {
       return res.status(400).json({ success: false, message: err.message || 'Upload failed' });
     }
     if (!req.file) {
       return res.status(400).json({ success: false, message: 'No photo file provided' });
     }
-    const url = `${req.protocol}://${req.get('host')}/uploads/production/${req.file.filename}`;
-    res.json({ success: true, url });
+    const filename = makePhotoFilename(req.file.originalname);
+    try {
+      if (isS3Configured()) {
+        const url = await uploadBuffer(req.file.buffer, `production/${filename}`, req.file.mimetype);
+        return res.json({ success: true, url });
+      }
+      fs.writeFileSync(path.join(PHOTO_UPLOAD_DIR, filename), req.file.buffer);
+      const url = `${req.protocol}://${req.get('host')}/uploads/production/${filename}`;
+      res.json({ success: true, url });
+    } catch (uploadErr) {
+      console.error('Photo upload failed:', uploadErr);
+      res.status(500).json({ success: false, message: 'Upload failed' });
+    }
   });
 });
 
@@ -756,12 +806,15 @@ router.post('/log', authenticateToken, async (req, res) => {
       `INSERT INTO production_logs (shift_id, station_id, material_type_id, input_bag_qr, output_bag_qr, weight, photo_url, status, sub_line, remark, dn_no)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
-      [shiftId, stationId, materialTypeId, inputBagQr, finalOutputBagQr, weightNum, photoUrl, finalStatus, subLine, remark || null, dnNo ?? null]
+      [shiftId, stationId, materialTypeId, inputBagQr, finalOutputBagQr, weightNum, normalizeForStorage(photoUrl), finalStatus, subLine, remark || null, dnNo ?? null]
     );
 
     const row = result.rows[0];
     if (row && row.status !== finalStatus) {
       row.status = finalStatus;
+    }
+    if (row) {
+      row.photo_url = await resolvePhotoUrl(row.photo_url);
     }
     res.json({ success: true, message: 'Log recorded successfully', data: row });
   } catch (error) {
@@ -1695,7 +1748,9 @@ router.put('/update-log-weight', authenticateToken, async (req, res) => {
       return res.status(404).json({ success: false, message: 'Production log not found' });
     }
 
-    res.json({ success: true, message: 'Weight updated successfully', data: result.rows[0] });
+    const row = result.rows[0];
+    row.photo_url = await resolvePhotoUrl(row.photo_url);
+    res.json({ success: true, message: 'Weight updated successfully', data: row });
   } catch (error) {
     console.error('Error updating log weight:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
@@ -1725,7 +1780,7 @@ router.put('/logs-update/:id', authenticateToken, async (req, res) => {
     params.push(remark === '' ? null : String(remark).trim()); sets.push(`remark = $${params.length}`);
   }
   if (photo_url !== undefined) {
-    params.push(photo_url === '' ? null : String(photo_url)); sets.push(`photo_url = $${params.length}`);
+    params.push(photo_url === '' ? null : normalizeForStorage(String(photo_url))); sets.push(`photo_url = $${params.length}`);
   }
   if (sets.length === 0) {
     return res.status(400).json({ success: false, message: 'No valid fields to update' });
@@ -1739,7 +1794,9 @@ router.put('/logs-update/:id', authenticateToken, async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Log not found' });
     }
-    res.json({ success: true, message: 'Log updated', data: result.rows[0] });
+    const row = result.rows[0];
+    row.photo_url = await resolvePhotoUrl(row.photo_url);
+    res.json({ success: true, message: 'Log updated', data: row });
   } catch (error) {
     console.error('[logs-update] ERROR:', error.message);
     res.status(500).json({ success: false, message: error.message });
@@ -2317,10 +2374,11 @@ router.get('/ppic-station-overview', authenticateToken, async (req, res) => {
     sql += ` ORDER BY s.id ASC, pl.created_at DESC`;
 
     const result = await pool.query(sql, params);
+    const resolvedPhotoUrls = await Promise.all(result.rows.map((row) => resolvePhotoUrl(row.photo_url)));
 
     // Group by station
     const grouped = {};
-    for (const row of result.rows) {
+    result.rows.forEach((row, i) => {
       const key = row.station_id;
       if (!grouped[key]) {
         grouped[key] = {
@@ -2343,11 +2401,11 @@ router.get('/ppic-station-overview', authenticateToken, async (req, res) => {
         shift_name: row.shift_name,
         operator_name: row.operator_name,
         material_type_name: row.material_type_name ?? null,
-        photo_url: row.photo_url ?? null,
+        photo_url: resolvedPhotoUrls[i] ?? null,
       });
       grouped[key].total_bags += 1;
       grouped[key].total_weight += parseFloat(row.weight || 0);
-    }
+    });
 
     const stations = Object.values(grouped).map((g) => ({
       ...g,
