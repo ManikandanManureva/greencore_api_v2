@@ -685,6 +685,67 @@ router.post('/upload-photo', authenticateToken, (req, res) => {
   });
 });
 
+// Reads the weight shown on a digital scale display photo via OpenAI vision, so the operator
+// doesn't have to type it in manually. The image is only ever held in memory for this one
+// request — it is never written to disk or S3 by this route. Requires OPENAI_API_KEY in .env.
+router.post('/ocr-weight', authenticateToken, (req, res) => {
+  photoUpload.single('image')(req, res, async (err) => {
+    if (err) {
+      return res.status(400).json({ success: false, message: err.message || 'Upload failed' });
+    }
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: 'No image provided' });
+    }
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ success: false, message: 'OCR is not configured on the server' });
+    }
+    try {
+      const base64 = req.file.buffer.toString('base64');
+      const mime = req.file.mimetype || 'image/jpeg';
+      const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'text',
+                  text:
+                    'This photo shows a digital weighing scale display. Read the numeric weight value ' +
+                    'currently shown on the display. Respond with ONLY the number (e.g. "510.0"), no ' +
+                    'units, no other words. If no readable number is visible, respond with exactly "NONE".',
+                },
+                { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}` } },
+              ],
+            },
+          ],
+          max_tokens: 20,
+          temperature: 0,
+        }),
+      });
+      if (!aiRes.ok) {
+        const errText = await aiRes.text();
+        console.error('OpenAI OCR error:', aiRes.status, errText);
+        return res.status(502).json({ success: false, message: 'OCR service error' });
+      }
+      const aiJson = await aiRes.json();
+      const raw = (aiJson?.choices?.[0]?.message?.content || '').trim();
+      const match = raw.match(/-?\d+(\.\d+)?/);
+      const weight = match ? parseFloat(match[0]) : null;
+      res.json({ success: true, weight, raw });
+    } catch (ocrErr) {
+      console.error('Weight OCR failed:', ocrErr);
+      res.status(500).json({ success: false, message: 'Failed to read weight from photo' });
+    }
+  });
+});
+
 // 7. Log production data
 router.post('/log', authenticateToken, async (req, res) => {
   const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, subLine, remark, shiftTypeId: shiftTypeIdBody, dnNo } = req.body;
