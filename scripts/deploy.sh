@@ -30,7 +30,10 @@ node src/scripts/add-raw-material-pe-grade-weights.js
 node src/scripts/create-pet-batches-tables.js
 
 echo "==> Restarting app under PM2..."
-pm2 restart greencore-api --update-env
+# The running PM2 process on this box is named "server" (not "greencore-api" as its
+# ecosystem.config.cjs name would suggest — it was started directly, not via that file).
+# Must run as root: this app's PM2 process lives under root's PM2 daemon, not ec2-user's.
+pm2 restart server --update-env
 
 echo "==> Done. Recent logs:"
-pm2 logs greencore-api --lines 20 --nostream
+pm2 logs server --lines 20 --nostream
