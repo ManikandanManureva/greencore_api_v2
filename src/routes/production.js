@@ -616,23 +616,26 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
       subLine
     );
 
-    // PET bag numbers reset monthly (not daily) per the PET line's numbering convention
+    // PET bag number = ONE running number per station/line per calendar month, shared by all
+    // shifts (the PET label prints the bag number on its own, so it must be unique within the
+    // month), 4 digits. PC/PE keep their per-shift, per-day, 3-digit sequence unchanged.
     const isPetMaterial = String(material_name || '').trim().toUpperCase() === 'PET';
-    const periodCondition = isPetMaterial
-      ? `date_trunc('month', os.start_time) = date_trunc('month', $3::date)`
-      : `os.start_time::date = $3::date`;
-
+    const countParams = [stationId, start_time, material_type_id];
     let countSql = `SELECT COUNT(*) as count
        FROM production_logs pl
        JOIN operator_shifts os ON pl.shift_id = os.id
        WHERE pl.station_id = $1
-         AND os.shift_type_id = $2
-         AND ${periodCondition}
-         AND pl.material_type_id = $4`;
-    const countParams = [stationId, shift_type_id, start_time, material_type_id];
+         AND ${isPetMaterial
+           ? `date_trunc('month', os.start_time) = date_trunc('month', $2::date)`
+           : `os.start_time::date = $2::date`}
+         AND pl.material_type_id = $3`;
+    if (!isPetMaterial) {
+      countParams.push(shift_type_id);
+      countSql += ` AND os.shift_type_id = $${countParams.length}`;
+    }
     countSql = appendPetSubLineCountFilter(countSql, countParams, subLine);
     const countResult = await pool.query(countSql, countParams);
-    const increment = String(parseInt(countResult.rows[0].count, 10) + 1).padStart(3, '0');
+    const increment = String(parseInt(countResult.rows[0].count, 10) + 1).padStart(isPetMaterial ? 4 : 3, '0');
     const materialCode = (material_name && String(material_name).trim()) || 'PC';
     const safeStationCode = (finalStationCode && String(finalStationCode).trim()) || stationCode || 'UNK';
 
@@ -748,7 +751,7 @@ router.post('/ocr-weight', authenticateToken, (req, res) => {
 
 // 7. Log production data
 router.post('/log', authenticateToken, async (req, res) => {
-  const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, subLine, remark, shiftTypeId: shiftTypeIdBody, dnNo } = req.body;
+  const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, subLine, remark, shiftTypeId: shiftTypeIdBody, dnNo, petBatchNo } = req.body;
   // Read status explicitly (client sends "Completed" or "pending"); accept any casing
   const status = req.body.status != null ? String(req.body.status).trim() : null;
   const materialTypeId = req.user.materialTypeId;
@@ -815,24 +818,26 @@ router.post('/log', authenticateToken, async (req, res) => {
 
       const { finalStationCode } = resolveQrStationCodes(stationCode, stationName, subLine);
 
-      // PET bag numbers reset monthly (not daily) per the PET line's numbering convention
+      // Must match /next-qr exactly: PET = one 4-digit running number per station/line per
+      // month across all shifts; PC/PE = per-shift, per-day, 3-digit.
       const isPetMaterial = String(material_name || '').trim().toUpperCase() === 'PET';
-      const periodCondition = isPetMaterial
-        ? `date_trunc('month', os.start_time) = date_trunc('month', $3::date)`
-        : `os.start_time::date = $3::date`;
-
+      const countParams = [stationId, start_time, materialTypeId];
       let countSql = `SELECT COUNT(*) as count
          FROM production_logs pl
          JOIN operator_shifts os ON pl.shift_id = os.id
-         WHERE os.shift_type_id = (SELECT shift_type_id FROM operator_shifts WHERE id = $1)
-           AND pl.station_id = $2
-           AND ${periodCondition}
-           AND pl.material_type_id = $4`;
-      const countParams = [shiftId, stationId, start_time, materialTypeId];
+         WHERE pl.station_id = $1
+           AND ${isPetMaterial
+             ? `date_trunc('month', os.start_time) = date_trunc('month', $2::date)`
+             : `os.start_time::date = $2::date`}
+           AND pl.material_type_id = $3`;
+      if (!isPetMaterial) {
+        countParams.push(shiftId);
+        countSql += ` AND os.shift_type_id = (SELECT shift_type_id FROM operator_shifts WHERE id = $${countParams.length})`;
+      }
       countSql = appendPetSubLineCountFilter(countSql, countParams, subLine);
       const countResult = await pool.query(countSql, countParams);
 
-      const increment = String(parseInt(countResult.rows[0].count) + 1).padStart(3, '0');
+      const increment = String(parseInt(countResult.rows[0].count) + 1).padStart(isPetMaterial ? 4 : 3, '0');
 
       // Proper QR format including Material Code, without line
       const materialCode = material_name || 'PC';
@@ -864,10 +869,10 @@ router.post('/log', authenticateToken, async (req, res) => {
     }
 
     const result = await pool.query(
-      `INSERT INTO production_logs (shift_id, station_id, material_type_id, input_bag_qr, output_bag_qr, weight, photo_url, status, sub_line, remark, dn_no)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      `INSERT INTO production_logs (shift_id, station_id, material_type_id, input_bag_qr, output_bag_qr, weight, photo_url, status, sub_line, remark, dn_no, pet_batch_no)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING *`,
-      [shiftId, stationId, materialTypeId, inputBagQr, finalOutputBagQr, weightNum, normalizeForStorage(photoUrl), finalStatus, subLine, remark || null, dnNo ?? null]
+      [shiftId, stationId, materialTypeId, inputBagQr, finalOutputBagQr, weightNum, normalizeForStorage(photoUrl), finalStatus, subLine, remark || null, dnNo ?? null, petBatchNo || null]
     );
 
     const row = result.rows[0];
