@@ -64,12 +64,25 @@ const photoUpload = multer({
 });
 
 /**
+ * PET line outputs (Hot Washing → Dry Sorter → Pelletizer). Each output is its own sub_line, so it
+ * gets its own QR segment and its own monthly bag-number sequence. Dry Sorter runs on the Boretech
+ * station row and Pelletizer on the Starlinger one, so dashboards bucket them there.
+ */
+const PET_DRY_SORTER_OUTPUTS = { 'Washed Flakes': 'WFL', 'Under 10mm Flakes': 'U10', 'Sorted Flakes': 'SFL' };
+const PET_PELLETIZER_OUTPUTS = { 'NFG Extruder': 'NFX', 'FG SSP': 'FGS', 'NFG SSP': 'NFS', 'FG SSP (Mixed)': 'FGM' };
+const PET_LINE_OUTPUT_CODES = { ...PET_DRY_SORTER_OUTPUTS, ...PET_PELLETIZER_OUTPUTS };
+
+/**
  * PET bag QR segment codes by process (not raw DB station code).
  * Boretech = sieving/sorting flakes (BRT). Starlinger = extrusion/pelletizing (EXT).
  */
 function resolveQrStationCodes(stationCode, stationName, subLine) {
   let finalStationCode = stationCode || 'UNK';
   let stationDisplayName = stationName || '';
+
+  if (PET_LINE_OUTPUT_CODES[subLine]) {
+    return { finalStationCode: PET_LINE_OUTPUT_CODES[subLine], stationDisplayName: subLine };
+  }
 
   if (subLine === 'Flakes PET') {
     return { finalStationCode: 'BRT', stationDisplayName: 'Boretech' };
@@ -174,7 +187,10 @@ function resolveQrStationCodes(stationCode, stationName, subLine) {
 
 /** Append sub_line filter for PET when counting bag numbers (independent sequences per process). */
 function appendPetSubLineCountFilter(countSql, countParams, subLine) {
-  if (subLine === 'Pellet PET' || subLine === 'Final PET' || subLine === 'Flakes PET') {
+  if (
+    subLine === 'Pellet PET' || subLine === 'Final PET' || subLine === 'Flakes PET' ||
+    PET_LINE_OUTPUT_CODES[subLine]
+  ) {
     countParams.push(subLine);
     return `${countSql} AND sub_line = $${countParams.length}`;
   }
@@ -216,8 +232,8 @@ function classifyDashboardStation(stationName, stationCode, subLine, materialTyp
 
   if (c === 'PLT' || n.includes('pellet pack')) return 'pellet_packing';
 
-  if (sl === 'Flakes PET') return 'boretech';
-  if (sl === 'Pellet PET') return 'starlinger';
+  if (sl === 'Flakes PET' || PET_DRY_SORTER_OUTPUTS[sl]) return 'boretech';
+  if (sl === 'Pellet PET' || PET_PELLETIZER_OUTPUTS[sl]) return 'starlinger';
   if (sl === 'Final PET') return 'final_packing';
 
   if (n.includes('boretech')) return 'boretech';
