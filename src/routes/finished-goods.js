@@ -1,7 +1,52 @@
 const express = require('express');
 const router = express.Router();
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const pdfParse = require('pdf-parse');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { isS3Configured, uploadBuffer, getSignedUrlForKey, keyFromS3Url } = require('../config/s3');
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+
+const PACKING_LIST_UPLOAD_DIR = path.join(__dirname, '..', '..', 'uploads', 'finished-goods');
+fs.mkdirSync(PACKING_LIST_UPLOAD_DIR, { recursive: true });
+
+function makeUploadFilename(originalname) {
+  const ext = path.extname(originalname || '').toLowerCase() || '.pdf';
+  return `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`;
+}
+
+function normalizePackingListForStorage(value) {
+  if (!value) return value;
+  const key = keyFromS3Url(value);
+  return key || value;
+}
+
+async function resolvePackingListUrl(value) {
+  if (!value) return value;
+  if (/^https?:\/\//i.test(value) && !keyFromS3Url(value)) return value;
+  if (isS3Configured()) {
+    const key = keyFromS3Url(value) || value;
+    try { return await getSignedUrlForKey(key); }
+    catch (err) { console.error('Failed to sign packing list URL for key', key, err); return value; }
+  }
+  return value;
+}
+
+async function persistPackingList(req, buffer, mimetype, originalname) {
+  const filename = makeUploadFilename(originalname);
+  if (isS3Configured()) {
+    const key = `finished-goods/${filename}`;
+    const url = await uploadBuffer(buffer, key, mimetype);
+    return { stored: key, url };
+  }
+  fs.writeFileSync(path.join(PACKING_LIST_UPLOAD_DIR, filename), buffer);
+  const url = `${req.protocol}://${req.get('host')}/uploads/finished-goods/${filename}`;
+  return { stored: url, url };
+}
 
 /**
  * Finished Goods — Outgoing / Sales. Quantities only, no pricing.
@@ -100,6 +145,88 @@ router.get('/summary', async (req, res) => {
   }
 });
 
+// ─── Packing list extraction (upload PDF, OpenAI reads it, pre-fills the Record Shipment form) ─
+const MATERIAL_HINTS = `
+  Use these phrases (seen on real packing lists) to identify the material in the "Description" line:
+    - "PC Recycled Pellets", "Grade A - PC Recycled Pellets", "100% Post-Consumer Recycled Pellets",
+      "Polycarbonate Recycled Pellets", "PC WATER BOTTLE GRADE PELLET" -> material is "PC"
+    - "LOW-DENSITY POLYETHYLENE", "LDPE", "PE Recycled Pellets" -> material is "PE"
+    - "PET", "Polyethylene Terephthalate", "rPET" -> material is "PET"
+`.trim();
+
+router.post('/extract-packing-list', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+    if (req.file.mimetype !== 'application/pdf' && !req.file.originalname.toLowerCase().endsWith('.pdf')) {
+      return res.status(400).json({ success: false, message: 'Please upload a PDF packing list / invoice' });
+    }
+
+    const parsed = await pdfParse(req.file.buffer).catch(() => null);
+    const text = (parsed?.text || '').trim();
+    if (!text) {
+      return res.status(422).json({ success: false, message: 'Could not read text from that PDF' });
+    }
+
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ success: false, message: 'OCR is not configured (missing OPENAI_API_KEY)' });
+    }
+
+    const prompt = `You are reading a packing list / shipping invoice from a plastic recycling exporter.
+Extract shipment details as JSON only (no prose, no markdown fences). Fields:
+{
+  "material": "PC" | "PE" | "PET" | null,
+  "weight_kg": number | null,       // the Net Weight in kg
+  "customer": string | null,        // the company name under "Invoicing and shipping address"
+  "destination": string | null,     // the city/country from that same address block
+  "dn_no": string | null,           // the Packing List No. / Invoice No.
+  "shipment_date": "YYYY-MM-DD" | null,  // the Date field on the document
+  "vehicle_no": string | null,      // container number(s) if present, else null
+  "notes": string | null            // short summary of extra shipping details (vessel, pallets, package count, gross weight) if present, else null
+}
+${MATERIAL_HINTS}
+If a field isn't present in the document, use null. Respond with JSON only.
+
+DOCUMENT TEXT:
+"""
+${text.slice(0, 12000)}
+"""`;
+
+    const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 500,
+        temperature: 0,
+      }),
+    });
+    if (!aiRes.ok) {
+      const errText = await aiRes.text().catch(() => '');
+      console.error('Packing list OCR OpenAI error:', aiRes.status, errText);
+      return res.status(502).json({ success: false, message: 'Could not read the packing list right now' });
+    }
+    const aiJson = await aiRes.json();
+    const raw = aiJson?.choices?.[0]?.message?.content || '';
+    let extracted = {};
+    try {
+      const match = raw.match(/\{[\s\S]*\}/);
+      extracted = match ? JSON.parse(match[0]) : {};
+    } catch {
+      extracted = {};
+    }
+    if (extracted.material && !['PC', 'PE', 'PET'].includes(extracted.material)) extracted.material = null;
+
+    const { stored, url } = await persistPackingList(req, req.file.buffer, req.file.mimetype, req.file.originalname);
+
+    res.json({ success: true, data: extracted, stored, packing_list_url: url });
+  } catch (err) {
+    console.error('Packing list extraction error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to extract packing list' });
+  }
+});
+
 // ─── Shipments (Outgoing / Sales) ──────────────────────────────────────────────
 router.get('/shipments', async (req, res) => {
   try {
@@ -135,8 +262,11 @@ router.get('/shipments', async (req, res) => {
       listParams,
     );
     const total = countRes.rows[0].total;
+    const data = await Promise.all(rowsRes.rows.map(async (row) => ({
+      ...row, packing_list_url: await resolvePackingListUrl(row.packing_list_url),
+    })));
     res.json({
-      success: true, data: rowsRes.rows, page: parseInt(page), limit: parseInt(limit),
+      success: true, data, page: parseInt(page), limit: parseInt(limit),
       total, totalPages: Math.max(1, Math.ceil(total / parseInt(limit))),
     });
   } catch (err) {
@@ -148,7 +278,7 @@ router.get('/shipments', async (req, res) => {
 router.post('/shipments', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { material, weight_kg, customer, destination, vehicle_no, dn_no, notes } = req.body || {};
+    const { material, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url } = req.body || {};
     const shipment_date = req.body.shipment_date || null;
     if (!material || !FINISHING_STATIONS[material]) {
       return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
@@ -181,13 +311,14 @@ router.post('/shipments', async (req, res) => {
 
     const r = await client.query(
       `INSERT INTO finished_goods_shipments
-         (shipment_date, material_type_id, weight_kg, customer, destination, vehicle_no, dn_no, notes, "createdBy")
-       VALUES (COALESCE($1::date, CURRENT_DATE), $2, $3, $4, $5, $6, $7, $8, $9)
+         (shipment_date, material_type_id, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, "createdBy")
+       VALUES (COALESCE($1::date, CURRENT_DATE), $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING *`,
-      [shipment_date, materialTypeId, weightNum, customer || null, destination || null, vehicle_no || null, dn_no || null, notes || null, actorName(req)],
+      [shipment_date, materialTypeId, weightNum, customer || null, destination || null, vehicle_no || null, dn_no || null, notes || null, normalizePackingListForStorage(packing_list_url) || null, actorName(req)],
     );
     await client.query('COMMIT');
-    res.status(201).json({ success: true, data: { ...r.rows[0], material } });
+    const resolvedUrl = await resolvePackingListUrl(r.rows[0].packing_list_url);
+    res.status(201).json({ success: true, data: { ...r.rows[0], material, packing_list_url: resolvedUrl } });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('Finished goods shipment create error:', err.message);

@@ -33,6 +33,7 @@ async function run() {
         vehicle_no         VARCHAR(60),
         dn_no              VARCHAR(60),
         notes              TEXT,
+        packing_list_url   TEXT,
         "createdBy"        VARCHAR(120),
         "createdAt"        TIMESTAMPTZ DEFAULT NOW()
       )
