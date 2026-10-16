@@ -4,12 +4,17 @@
  * tables) with one catalog registry + one items table + one log table, so adding a new PET
  * machine (or any future catalog) is a registry row, not a new table and route block.
  *
- *   spare_parts_catalogs — the menu: PC, PE, PET·Starlinger, PET·Boretech, MEC/General, ...
+ *   spare_parts_catalogs — the menu: PC/PE (combined), PET·Starlinger, PET·Boretech, ...
  *   spare_parts_items    — one row per part, tagged to a catalog
  *   spare_parts_log      — Received/Used transactions against an item
  *
+ * PC, PE and the old MEC/General catalog were later combined into one "PC / PE Spare Parts"
+ * catalog (key stays 'pc') — see merge-pcpe-spareparts.js, which also loads its source
+ * workbook's master + usage log. This file's own registry below reflects that end state, so a
+ * fresh environment seeds the right structure without needing the one-off merge script.
+ *
  * Idempotent — safe to re-run. Run migrate-spareparts-v2.js afterwards to carry over the
- * existing Starlinger/MEC data (that script is also idempotent / skips if already migrated).
+ * existing Starlinger data (that script is also idempotent / skips if already migrated).
  *
  * Usage:
  *   node src/scripts/create-spareparts-v2.js
@@ -18,11 +23,9 @@ require('dotenv').config();
 const pool = require('../config/database');
 
 const CATALOGS = [
-  { key: 'pc',             label: 'PC Spare Parts',  material_type: 'PC',  machine: null,         sort_order: 10 },
-  { key: 'pe',             label: 'PE Spare Parts',  material_type: 'PE',  machine: null,         sort_order: 20 },
-  { key: 'pet-starlinger', label: 'Starlinger',      material_type: 'PET', machine: 'Starlinger', sort_order: 30 },
-  { key: 'pet-boretech',   label: 'Boretech',        material_type: 'PET', machine: 'Boretech',   sort_order: 31 },
-  { key: 'mec',            label: 'MEC / General',   material_type: null,  machine: null,         sort_order: 90 },
+  { key: 'pc',             label: 'PC / PE Spare Parts', material_type: null,  machine: null,         sort_order: 10 },
+  { key: 'pet-starlinger', label: 'Starlinger',          material_type: 'PET', machine: 'Starlinger', sort_order: 30 },
+  { key: 'pet-boretech',   label: 'Boretech',            material_type: 'PET', machine: 'Boretech',   sort_order: 31 },
 ];
 
 async function run() {

@@ -1,0 +1,738 @@
+[
+  {
+    "date": "2026-10-01 00:00:00",
+    "part_no": "MEC-012",
+    "transaction_type": "Used",
+    "qty": 5.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-01 00:00:00",
+    "part_no": "MEC-013",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-01 00:00:00",
+    "part_no": "MEC-045",
+    "transaction_type": "Used",
+    "qty": 3.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-01 00:00:00",
+    "part_no": "MEC-327",
+    "transaction_type": "Used",
+    "qty": 7.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-02 00:00:00",
+    "part_no": "MEC-045",
+    "transaction_type": "Used",
+    "qty": 2.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-02 00:00:00",
+    "part_no": "MEC-045",
+    "transaction_type": "Used",
+    "qty": 2.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-02 00:00:00",
+    "part_no": "MEC-192",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-02 00:00:00",
+    "part_no": "MEC-220",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-02 00:00:00",
+    "part_no": "MEC-237",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-02 00:00:00",
+    "part_no": "MEC-257",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-02 00:00:00",
+    "part_no": "MEC-277",
+    "transaction_type": "Used",
+    "qty": 9.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-02 00:00:00",
+    "part_no": "MEC-327",
+    "transaction_type": "Used",
+    "qty": 4.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-03 00:00:00",
+    "part_no": "MEC-046",
+    "transaction_type": "Used",
+    "qty": 8.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-03 00:00:00",
+    "part_no": "MEC-138",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-03 00:00:00",
+    "part_no": "MEC-176",
+    "transaction_type": "Used",
+    "qty": 4.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-03 00:00:00",
+    "part_no": "MEC-252",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-03 00:00:00",
+    "part_no": "MEC-266",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-03 00:00:00",
+    "part_no": "MEC-327",
+    "transaction_type": "Used",
+    "qty": 6.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-03 00:00:00",
+    "part_no": "MEC-327",
+    "transaction_type": "Used",
+    "qty": 7.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-03 00:00:00",
+    "part_no": "MEC-330",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-03 00:00:00",
+    "part_no": "MEC-332",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-04 00:00:00",
+    "part_no": "MEC-002",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-04 00:00:00",
+    "part_no": "MEC-013",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-04 00:00:00",
+    "part_no": "MEC-045",
+    "transaction_type": "Used",
+    "qty": 6.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-04 00:00:00",
+    "part_no": "MEC-148",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-04 00:00:00",
+    "part_no": "MEC-237",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-04 00:00:00",
+    "part_no": "MEC-252",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-04 00:00:00",
+    "part_no": "MEC-257",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-04 00:00:00",
+    "part_no": "MEC-295",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-05 00:00:00",
+    "part_no": "MEC-012",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-05 00:00:00",
+    "part_no": "MEC-013",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-05 00:00:00",
+    "part_no": "MEC-045",
+    "transaction_type": "Used",
+    "qty": 3.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-05 00:00:00",
+    "part_no": "MEC-204",
+    "transaction_type": "Used",
+    "qty": 7.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-05 00:00:00",
+    "part_no": "MEC-227",
+    "transaction_type": "Used",
+    "qty": 90.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-05 00:00:00",
+    "part_no": "MEC-237",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-05 00:00:00",
+    "part_no": "MEC-237",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-05 00:00:00",
+    "part_no": "MEC-240",
+    "transaction_type": "Used",
+    "qty": 5.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-05 00:00:00",
+    "part_no": "MEC-251",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-05 00:00:00",
+    "part_no": "MEC-257",
+    "transaction_type": "Used",
+    "qty": 3.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-05 00:00:00",
+    "part_no": "MEC-373",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-06 00:00:00",
+    "part_no": "MEC-033",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-06 00:00:00",
+    "part_no": "MEC-045",
+    "transaction_type": "Used",
+    "qty": 7.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-06 00:00:00",
+    "part_no": "MEC-240",
+    "transaction_type": "Used",
+    "qty": 5.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-06 00:00:00",
+    "part_no": "MEC-248",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-06 00:00:00",
+    "part_no": "MEC-280",
+    "transaction_type": "Used",
+    "qty": 2.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-06 00:00:00",
+    "part_no": "MEC-327",
+    "transaction_type": "Used",
+    "qty": 7.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-07 00:00:00",
+    "part_no": "MEC-045",
+    "transaction_type": "Used",
+    "qty": 4.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-07 00:00:00",
+    "part_no": "MEC-045",
+    "transaction_type": "Used",
+    "qty": 5.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-07 00:00:00",
+    "part_no": "MEC-046",
+    "transaction_type": "Used",
+    "qty": 18.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-07 00:00:00",
+    "part_no": "MEC-122",
+    "transaction_type": "Used",
+    "qty": 8.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-07 00:00:00",
+    "part_no": "MEC-238",
+    "transaction_type": "Used",
+    "qty": 3.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-07 00:00:00",
+    "part_no": "MEC-242",
+    "transaction_type": "Used",
+    "qty": 3.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-07 00:00:00",
+    "part_no": "MEC-257",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-07 00:00:00",
+    "part_no": "MEC-327",
+    "transaction_type": "Used",
+    "qty": 4.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-07 00:00:00",
+    "part_no": "MEC-327",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-07 00:00:00",
+    "part_no": "MEC-373",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-08 00:00:00",
+    "part_no": "MEC-012",
+    "transaction_type": "Used",
+    "qty": 2.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-08 00:00:00",
+    "part_no": "MEC-140",
+    "transaction_type": "Used",
+    "qty": 2.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-08 00:00:00",
+    "part_no": "MEC-140",
+    "transaction_type": "Used",
+    "qty": 2.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-08 00:00:00",
+    "part_no": "MEC-205",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-08 00:00:00",
+    "part_no": "MEC-238",
+    "transaction_type": "Used",
+    "qty": 30.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-08 00:00:00",
+    "part_no": "MEC-289",
+    "transaction_type": "Used",
+    "qty": 2.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-08 00:00:00",
+    "part_no": "MEC-330",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-09 00:00:00",
+    "part_no": "MEC-045",
+    "transaction_type": "Used",
+    "qty": 4.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-09 00:00:00",
+    "part_no": "MEC-201",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-09 00:00:00",
+    "part_no": "MEC-237",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-09 00:00:00",
+    "part_no": "MEC-312",
+    "transaction_type": "Used",
+    "qty": 2.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-10 00:00:00",
+    "part_no": "MEC-012",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-10 00:00:00",
+    "part_no": "MEC-028",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-10 00:00:00",
+    "part_no": "MEC-255",
+    "transaction_type": "Used",
+    "qty": 3.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-10 00:00:00",
+    "part_no": "MEC-327",
+    "transaction_type": "Used",
+    "qty": 5.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-10 00:00:00",
+    "part_no": "MEC-327",
+    "transaction_type": "Used",
+    "qty": 4.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-11 00:00:00",
+    "part_no": "MEC-176",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-11 00:00:00",
+    "part_no": "MEC-201",
+    "transaction_type": "Used",
+    "qty": 2.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-11 00:00:00",
+    "part_no": "MEC-215",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-11 00:00:00",
+    "part_no": "MEC-257",
+    "transaction_type": "Used",
+    "qty": 3.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-11 00:00:00",
+    "part_no": "MEC-327",
+    "transaction_type": "Used",
+    "qty": 5.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-12 00:00:00",
+    "part_no": "MEC-045",
+    "transaction_type": "Used",
+    "qty": 4.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-12 00:00:00",
+    "part_no": "MEC-238",
+    "transaction_type": "Used",
+    "qty": 4.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-12 00:00:00",
+    "part_no": "MEC-241",
+    "transaction_type": "Used",
+    "qty": 20.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-12 00:00:00",
+    "part_no": "MEC-242",
+    "transaction_type": "Used",
+    "qty": 20.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-12 00:00:00",
+    "part_no": "MEC-257",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-12 00:00:00",
+    "part_no": "MEC-322",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-12 00:00:00",
+    "part_no": "MEC-330",
+    "transaction_type": "Used",
+    "qty": 2.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-13 00:00:00",
+    "part_no": "MEC-045",
+    "transaction_type": "Used",
+    "qty": 4.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-13 00:00:00",
+    "part_no": "MEC-137",
+    "transaction_type": "Used",
+    "qty": 2.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-13 00:00:00",
+    "part_no": "MEC-140",
+    "transaction_type": "Used",
+    "qty": 2.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-13 00:00:00",
+    "part_no": "MEC-189",
+    "transaction_type": "Used",
+    "qty": 10.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-13 00:00:00",
+    "part_no": "MEC-327",
+    "transaction_type": "Used",
+    "qty": 6.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-14 00:00:00",
+    "part_no": "MEC-045",
+    "transaction_type": "Used",
+    "qty": 3.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-14 00:00:00",
+    "part_no": "MEC-327",
+    "transaction_type": "Used",
+    "qty": 6.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-14 00:00:00",
+    "part_no": "MEC-201",
+    "transaction_type": "Used",
+    "qty": 2.0,
+    "description": null,
+    "technician": null
+  }
+]

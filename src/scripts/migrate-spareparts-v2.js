@@ -1,10 +1,15 @@
 /**
- * Carries the existing starlinger_spare_parts(+log) and mec_spare_parts(+log) data into the
- * unified spare_parts_items / spare_parts_log tables (see create-spareparts-v2.js).
- * The old tables are left in place untouched — this only reads from them.
- * Idempotent — skips entirely if spare_parts_items already has rows.
+ * One-time historical migration — already run on this database; kept for reference only.
+ * Carried the original starlinger_spare_parts(+log) and mec_spare_parts(+log) data into the
+ * unified spare_parts_items / spare_parts_log tables (see create-spareparts-v2.js), back when
+ * the catalog registry still had a separate 'mec' entry. MEC was later folded into the combined
+ * PC/PE catalog (see merge-pcpe-spareparts.js), so a FRESH environment's registry has no 'mec'
+ * row and this script's mec branch would not apply — re-running it is a no-op either way, since
+ * it skips entirely once spare_parts_items has any rows.
+ * The old starlinger_spare_parts(+log) / mec_spare_parts(+log) tables are left in place,
+ * untouched — this only reads from them.
  *
- * Usage:
+ * Usage (historical):
  *   node src/scripts/create-spareparts-v2.js   (first, if not already run)
  *   node src/scripts/migrate-spareparts-v2.js
  */
