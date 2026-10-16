@@ -1,0 +1,202 @@
+[
+  {
+    "date": "24/07/2026",
+    "part_no": "FCSS-0001",
+    "transaction_type": "Received",
+    "qty": 4.0,
+    "description": "addded 4 pcs from pet lab",
+    "technician": null
+  },
+  {
+    "date": "27/07/2026",
+    "part_no": "FCSS-0001",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": "to replace the old one because it was run out",
+    "technician": "Starlinger Operator"
+  },
+  {
+    "date": "27/07/2026",
+    "part_no": "AD-00193",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": "to replace the old one because it was broken",
+    "technician": "Yanto"
+  },
+  {
+    "date": "27/07/2026",
+    "part_no": "AP-00017",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": "to replace the old one that was broken",
+    "technician": "Arivin"
+  },
+  {
+    "date": "27/07/2026",
+    "part_no": "AZZK-00372",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": "to replace the old one that has was worn out (in UWP area) as requested by Pak Dewangga",
+    "technician": "Yanto"
+  },
+  {
+    "date": "28/07/2026",
+    "part_no": "AD-00159",
+    "transaction_type": "Used",
+    "qty": 3.0,
+    "description": "to replace the old one that was leaking (in SSP area) (as requested by Pak Dewangga)",
+    "technician": "Yanto"
+  },
+  {
+    "date": "2026-07-29 00:00:00",
+    "part_no": "AZZK-00372",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": "to replace theold one that has was worn out (in UWP area) as requested by Pak Dewangga",
+    "technician": "Yanto"
+  },
+  {
+    "date": "2026-07-30 00:00:00",
+    "part_no": "FCSS-0001",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": "to replace the old one because it was run out",
+    "technician": "Nandha"
+  },
+  {
+    "date": "2026-07-30 00:00:00",
+    "part_no": "AZRE-02976",
+    "transaction_type": "Used",
+    "qty": 100.0,
+    "description": null,
+    "technician": "Nandha"
+  },
+  {
+    "date": "2026-07-30 00:00:00",
+    "part_no": "AZRE-02496",
+    "transaction_type": "Used",
+    "qty": 50.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-08-10 00:00:00",
+    "part_no": "AD-00010",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": "to replace the old one because it was run out",
+    "technician": "Nandha"
+  },
+  {
+    "date": "2026-08-27 00:00:00",
+    "part_no": "AD-00104",
+    "transaction_type": "Received",
+    "qty": 5.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-09-01 00:00:00",
+    "part_no": "OSMP-0001",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-09-28 00:00:00",
+    "part_no": "ARPP-01449",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-09-29 00:00:00",
+    "part_no": "FOF-0001",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": "Ananda"
+  },
+  {
+    "date": "2026-09-30 00:00:00",
+    "part_no": "AZZK-00476",
+    "transaction_type": "Used",
+    "qty": 12.0,
+    "description": "replace the old knives with the new ones",
+    "technician": "Nandha"
+  },
+  {
+    "date": "2026-10-01 00:00:00",
+    "part_no": "AT-01847",
+    "transaction_type": "Used",
+    "qty": 2.0,
+    "description": null,
+    "technician": "Dewangga"
+  },
+  {
+    "date": "2026-10-02 00:00:00",
+    "part_no": "FOF-0001",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": "replace oil filter in DVU",
+    "technician": "Sahrul"
+  },
+  {
+    "date": "2026-10-03 00:00:00",
+    "part_no": "FOF-0001",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": "Sahrul"
+  },
+  {
+    "date": "2026-10-04 00:00:00",
+    "part_no": "FOF-0001",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": "Pak Jalu"
+  },
+  {
+    "date": "2026-10-08 00:00:00",
+    "part_no": "AE-00035",
+    "transaction_type": "Received",
+    "qty": 1.0,
+    "description": null,
+    "technician": null
+  },
+  {
+    "date": "2026-10-11 00:00:00",
+    "part_no": "Z2T-04038",
+    "transaction_type": "Used",
+    "qty": 1.0,
+    "description": null,
+    "technician": "Sahrul"
+  },
+  {
+    "date": "2026-10-13 00:00:00",
+    "part_no": "ANSG-03126",
+    "transaction_type": "Used",
+    "qty": 3.0,
+    "description": null,
+    "technician": "Yanto"
+  },
+  {
+    "date": "2026-10-13 00:00:00",
+    "part_no": "AZZK-00476",
+    "transaction_type": "Used",
+    "qty": 12.0,
+    "description": null,
+    "technician": "Yanto"
+  },
+  {
+    "date": "2026-10-14 00:00:00",
+    "part_no": "AT-00698",
+    "transaction_type": "Used",
+    "qty": 2.0,
+    "description": null,
+    "technician": "Duta"
+  }
+]
