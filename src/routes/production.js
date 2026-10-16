@@ -2804,7 +2804,7 @@ async function fetchLogsAllFlatRows(query) {
       LEFT JOIN shift_types sht    ON os.shift_type_id = sht.id
       WHERE 1=1
         ${where}
-      ORDER BY pl.created_at DESC
+      ORDER BY pl.created_at ASC, pl.id ASC
       LIMIT ${limitParam}
     `;
 
