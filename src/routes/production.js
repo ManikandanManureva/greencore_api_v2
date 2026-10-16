@@ -64,25 +64,12 @@ const photoUpload = multer({
 });
 
 /**
- * PET line outputs (Hot Washing → Dry Sorter → Pelletizer). Each output is its own sub_line, so it
- * gets its own QR segment and its own monthly bag-number sequence. Dry Sorter runs on the Boretech
- * station row and Pelletizer on the Starlinger one, so dashboards bucket them there.
- */
-const PET_DRY_SORTER_OUTPUTS = { 'Washed Flakes': 'WFL', 'Under 10mm Flakes': 'U10', 'Sorted Flakes': 'SFL' };
-const PET_PELLETIZER_OUTPUTS = { 'NFG Extruder': 'NFX', 'FG SSP': 'FGS', 'NFG SSP': 'NFS', 'FG SSP (Mixed)': 'FGM' };
-const PET_LINE_OUTPUT_CODES = { ...PET_DRY_SORTER_OUTPUTS, ...PET_PELLETIZER_OUTPUTS };
-
-/**
  * PET bag QR segment codes by process (not raw DB station code).
  * Boretech = sieving/sorting flakes (BRT). Starlinger = extrusion/pelletizing (EXT).
  */
 function resolveQrStationCodes(stationCode, stationName, subLine) {
   let finalStationCode = stationCode || 'UNK';
   let stationDisplayName = stationName || '';
-
-  if (PET_LINE_OUTPUT_CODES[subLine]) {
-    return { finalStationCode: PET_LINE_OUTPUT_CODES[subLine], stationDisplayName: subLine };
-  }
 
   if (subLine === 'Flakes PET') {
     return { finalStationCode: 'BRT', stationDisplayName: 'Boretech' };
@@ -187,10 +174,7 @@ function resolveQrStationCodes(stationCode, stationName, subLine) {
 
 /** Append sub_line filter for PET when counting bag numbers (independent sequences per process). */
 function appendPetSubLineCountFilter(countSql, countParams, subLine) {
-  if (
-    subLine === 'Pellet PET' || subLine === 'Final PET' || subLine === 'Flakes PET' ||
-    PET_LINE_OUTPUT_CODES[subLine]
-  ) {
+  if (subLine === 'Pellet PET' || subLine === 'Final PET' || subLine === 'Flakes PET') {
     countParams.push(subLine);
     return `${countSql} AND sub_line = $${countParams.length}`;
   }
@@ -232,8 +216,8 @@ function classifyDashboardStation(stationName, stationCode, subLine, materialTyp
 
   if (c === 'PLT' || n.includes('pellet pack')) return 'pellet_packing';
 
-  if (sl === 'Flakes PET' || PET_DRY_SORTER_OUTPUTS[sl]) return 'boretech';
-  if (sl === 'Pellet PET' || PET_PELLETIZER_OUTPUTS[sl]) return 'starlinger';
+  if (sl === 'Flakes PET') return 'boretech';
+  if (sl === 'Pellet PET') return 'starlinger';
   if (sl === 'Final PET') return 'final_packing';
 
   if (n.includes('boretech')) return 'boretech';
@@ -632,26 +616,23 @@ router.get('/next-qr', authenticateToken, async (req, res) => {
       subLine
     );
 
-    // PET bag number = ONE running number per station/line per calendar month, shared by all
-    // shifts (the PET label prints the bag number on its own, so it must be unique within the
-    // month), 4 digits. PC/PE keep their per-shift, per-day, 3-digit sequence unchanged.
+    // PET bag numbers reset monthly (not daily) per the PET line's numbering convention
     const isPetMaterial = String(material_name || '').trim().toUpperCase() === 'PET';
-    const countParams = [stationId, start_time, material_type_id];
+    const periodCondition = isPetMaterial
+      ? `date_trunc('month', os.start_time) = date_trunc('month', $3::date)`
+      : `os.start_time::date = $3::date`;
+
     let countSql = `SELECT COUNT(*) as count
        FROM production_logs pl
        JOIN operator_shifts os ON pl.shift_id = os.id
        WHERE pl.station_id = $1
-         AND ${isPetMaterial
-           ? `date_trunc('month', os.start_time) = date_trunc('month', $2::date)`
-           : `os.start_time::date = $2::date`}
-         AND pl.material_type_id = $3`;
-    if (!isPetMaterial) {
-      countParams.push(shift_type_id);
-      countSql += ` AND os.shift_type_id = $${countParams.length}`;
-    }
+         AND os.shift_type_id = $2
+         AND ${periodCondition}
+         AND pl.material_type_id = $4`;
+    const countParams = [stationId, shift_type_id, start_time, material_type_id];
     countSql = appendPetSubLineCountFilter(countSql, countParams, subLine);
     const countResult = await pool.query(countSql, countParams);
-    const increment = String(parseInt(countResult.rows[0].count, 10) + 1).padStart(isPetMaterial ? 4 : 3, '0');
+    const increment = String(parseInt(countResult.rows[0].count, 10) + 1).padStart(3, '0');
     const materialCode = (material_name && String(material_name).trim()) || 'PC';
     const safeStationCode = (finalStationCode && String(finalStationCode).trim()) || stationCode || 'UNK';
 
@@ -767,7 +748,7 @@ router.post('/ocr-weight', authenticateToken, (req, res) => {
 
 // 7. Log production data
 router.post('/log', authenticateToken, async (req, res) => {
-  const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, subLine, remark, shiftTypeId: shiftTypeIdBody, dnNo, petBatchNo } = req.body;
+  const { shiftId, stationId, inputBagQr, outputBagQr, weight, photoUrl, subLine, remark, shiftTypeId: shiftTypeIdBody, dnNo } = req.body;
   // Read status explicitly (client sends "Completed" or "pending"); accept any casing
   const status = req.body.status != null ? String(req.body.status).trim() : null;
   const materialTypeId = req.user.materialTypeId;
@@ -834,26 +815,24 @@ router.post('/log', authenticateToken, async (req, res) => {
 
       const { finalStationCode } = resolveQrStationCodes(stationCode, stationName, subLine);
 
-      // Must match /next-qr exactly: PET = one 4-digit running number per station/line per
-      // month across all shifts; PC/PE = per-shift, per-day, 3-digit.
+      // PET bag numbers reset monthly (not daily) per the PET line's numbering convention
       const isPetMaterial = String(material_name || '').trim().toUpperCase() === 'PET';
-      const countParams = [stationId, start_time, materialTypeId];
+      const periodCondition = isPetMaterial
+        ? `date_trunc('month', os.start_time) = date_trunc('month', $3::date)`
+        : `os.start_time::date = $3::date`;
+
       let countSql = `SELECT COUNT(*) as count
          FROM production_logs pl
          JOIN operator_shifts os ON pl.shift_id = os.id
-         WHERE pl.station_id = $1
-           AND ${isPetMaterial
-             ? `date_trunc('month', os.start_time) = date_trunc('month', $2::date)`
-             : `os.start_time::date = $2::date`}
-           AND pl.material_type_id = $3`;
-      if (!isPetMaterial) {
-        countParams.push(shiftId);
-        countSql += ` AND os.shift_type_id = (SELECT shift_type_id FROM operator_shifts WHERE id = $${countParams.length})`;
-      }
+         WHERE os.shift_type_id = (SELECT shift_type_id FROM operator_shifts WHERE id = $1)
+           AND pl.station_id = $2
+           AND ${periodCondition}
+           AND pl.material_type_id = $4`;
+      const countParams = [shiftId, stationId, start_time, materialTypeId];
       countSql = appendPetSubLineCountFilter(countSql, countParams, subLine);
       const countResult = await pool.query(countSql, countParams);
 
-      const increment = String(parseInt(countResult.rows[0].count) + 1).padStart(isPetMaterial ? 4 : 3, '0');
+      const increment = String(parseInt(countResult.rows[0].count) + 1).padStart(3, '0');
 
       // Proper QR format including Material Code, without line
       const materialCode = material_name || 'PC';
@@ -885,10 +864,10 @@ router.post('/log', authenticateToken, async (req, res) => {
     }
 
     const result = await pool.query(
-      `INSERT INTO production_logs (shift_id, station_id, material_type_id, input_bag_qr, output_bag_qr, weight, photo_url, status, sub_line, remark, dn_no, pet_batch_no)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      `INSERT INTO production_logs (shift_id, station_id, material_type_id, input_bag_qr, output_bag_qr, weight, photo_url, status, sub_line, remark, dn_no)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
-      [shiftId, stationId, materialTypeId, inputBagQr, finalOutputBagQr, weightNum, normalizeForStorage(photoUrl), finalStatus, subLine, remark || null, dnNo ?? null, petBatchNo || null]
+      [shiftId, stationId, materialTypeId, inputBagQr, finalOutputBagQr, weightNum, normalizeForStorage(photoUrl), finalStatus, subLine, remark || null, dnNo ?? null]
     );
 
     const row = result.rows[0];
