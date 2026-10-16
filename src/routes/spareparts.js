@@ -180,8 +180,11 @@ router.post('/:catalogKey/parts', requireMasterEdit, async (req, res) => {
   }
 });
 
-// Edit master fields — PPIC only. current_qty is NOT editable here (only via log transactions).
+// Edit master fields — PPIC only. current_qty may also be corrected here (e.g. after a
+// physical count) — doing so writes a log entry for the difference, same as any other
+// stock movement, so the change still shows up in the ledger instead of silently vanishing.
 router.put('/:catalogKey/parts/:id', requireMasterEdit, async (req, res) => {
+  const client = await pool.connect();
   try {
     const FIELDS = ['part_no', 'description', 'category', 'shelf', 'floor', 'location',
       'min_stock', 'max_stock', 'unit', 'machine', 'supplier', 'notes'];
@@ -193,20 +196,60 @@ router.put('/:catalogKey/parts/:id', requireMasterEdit, async (req, res) => {
         sets.push(`${f} = $${params.length}`);
       }
     }
-    if (sets.length === 0) return res.status(400).json({ success: false, message: 'No fields to update' });
+
+    const hasQtyEdit = req.body.current_qty !== undefined && req.body.current_qty !== '';
+    const newQty = hasQtyEdit ? Number(req.body.current_qty) : null;
+    if (hasQtyEdit && !Number.isFinite(newQty)) {
+      return res.status(400).json({ success: false, message: 'current_qty must be a number' });
+    }
+
+    if (sets.length === 0 && !hasQtyEdit) {
+      return res.status(400).json({ success: false, message: 'No fields to update' });
+    }
+
+    await client.query('BEGIN');
+    const existing = await client.query(
+      'SELECT * FROM spare_parts_items WHERE id = $1 AND catalog_id = $2 FOR UPDATE',
+      [req.params.id, req.catalog.id],
+    );
+    if (existing.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Part not found' });
+    }
+
+    if (hasQtyEdit) {
+      params.push(newQty);
+      sets.push(`current_qty = $${params.length}`);
+    }
     params.push(actorName(req));
     sets.push(`"updatedBy" = $${params.length}`);
     sets.push(`"updatedAt" = NOW()`);
     params.push(req.params.id, req.catalog.id);
-    const r = await pool.query(
+    const r = await client.query(
       `UPDATE spare_parts_items SET ${sets.join(', ')} WHERE id = $${params.length - 1} AND catalog_id = $${params.length} RETURNING *`,
       params,
     );
-    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Part not found' });
+
+    if (hasQtyEdit) {
+      const delta = newQty - Number(existing.rows[0].current_qty);
+      if (delta !== 0) {
+        await client.query(
+          `INSERT INTO spare_parts_log (item_id, log_date, transaction_type, qty, description, technician, "createdBy")
+           VALUES ($1, CURRENT_DATE, $2, $3, $4, $5, $6)`,
+          [req.params.id, delta > 0 ? 'Received' : 'Used', delta,
+            'Manual stock correction (master edit)', actorName(req), actorName(req)],
+        );
+      }
+    }
+
+    await client.query('COMMIT');
     res.json({ success: true, data: r.rows[0] });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('Spare parts update error:', err.message);
     res.status(500).json({ success: false, message: 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 
@@ -266,6 +309,91 @@ router.post('/:catalogKey/parts/:id/log', (req, res) => logTransaction(req, res,
 router.post('/:catalogKey/stock-in', (req, res) => logTransaction(req, res, req.body?.part_id, 'Received'));
 router.post('/:catalogKey/outgoing', (req, res) => logTransaction(req, res, req.body?.part_id, 'Used'));
 
+// Edit or delete a logged transaction — e.g. to fix an input error. Open to the same roles
+// that can log one in the first place (requireView, applied globally above), since the person
+// who made the mistake is usually the one who needs to fix it. Both reverse the entry's old
+// effect on current_qty and (for edit) reapply the corrected one, atomically.
+router.put('/:catalogKey/log/:logId', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { transaction_type, qty, description, technician, remark, log_date } = req.body || {};
+    if (!['Received', 'Used'].includes(transaction_type)) {
+      return res.status(400).json({ success: false, message: "transaction_type must be 'Received' or 'Used'" });
+    }
+    const qtyNum = Number(qty);
+    if (!Number.isFinite(qtyNum) || qtyNum <= 0) {
+      return res.status(400).json({ success: false, message: 'qty must be a positive number' });
+    }
+    const newSignedQty = transaction_type === 'Used' ? -qtyNum : qtyNum;
+
+    await client.query('BEGIN');
+    const logRes = await client.query(
+      `SELECT l.* FROM spare_parts_log l JOIN spare_parts_items p ON p.id = l.item_id
+       WHERE l.id = $1 AND p.catalog_id = $2`,
+      [req.params.logId, req.catalog.id],
+    );
+    if (logRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Log entry not found' });
+    }
+    const old = logRes.rows[0];
+    const partRes = await client.query('SELECT current_qty FROM spare_parts_items WHERE id = $1 FOR UPDATE', [old.item_id]);
+    const qtyAfterReversal = Number(partRes.rows[0].current_qty) - Number(old.qty);
+    if (transaction_type === 'Used' && qtyNum > qtyAfterReversal) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: `Insufficient stock for this correction. Available (excluding this entry): ${qtyAfterReversal}, Requested: ${qtyNum}` });
+    }
+
+    const updateRes = await client.query(
+      `UPDATE spare_parts_log
+       SET log_date = COALESCE($2::date, log_date), transaction_type = $3, qty = $4,
+           description = $5, technician = $6, remark = $7
+       WHERE id = $1 RETURNING *`,
+      [req.params.logId, log_date || null, transaction_type, newSignedQty, description || null, technician || null, remark || null],
+    );
+    const newQtyOnHand = qtyAfterReversal + newSignedQty;
+    await client.query('UPDATE spare_parts_items SET current_qty = $2, "updatedAt" = NOW() WHERE id = $1', [old.item_id, newQtyOnHand]);
+    await client.query('COMMIT');
+    res.json({ success: true, data: updateRes.rows[0] });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('Spare parts log edit error:', err.message);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+router.delete('/:catalogKey/log/:logId', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const logRes = await client.query(
+      `SELECT l.* FROM spare_parts_log l JOIN spare_parts_items p ON p.id = l.item_id
+       WHERE l.id = $1 AND p.catalog_id = $2`,
+      [req.params.logId, req.catalog.id],
+    );
+    if (logRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Log entry not found' });
+    }
+    const old = logRes.rows[0];
+    await client.query('DELETE FROM spare_parts_log WHERE id = $1', [req.params.logId]);
+    await client.query(
+      'UPDATE spare_parts_items SET current_qty = current_qty - $2, "updatedAt" = NOW() WHERE id = $1',
+      [old.item_id, old.qty],
+    );
+    await client.query('COMMIT');
+    res.json({ success: true, message: 'Log entry deleted' });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('Spare parts log delete error:', err.message);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
 async function listTransactions(req, res, fixedType) {
   try {
     const { search, date_from, date_to, page = 1, limit = 20 } = req.query;
@@ -308,5 +436,38 @@ async function listTransactions(req, res, fixedType) {
 router.get('/:catalogKey/stock-in', (req, res) => listTransactions(req, res, 'Received'));
 router.get('/:catalogKey/outgoing', (req, res) => listTransactions(req, res, 'Used'));
 router.get('/:catalogKey/ledger', (req, res) => listTransactions(req, res, null));
+
+// Outgoing summary — total usage grouped by day, week or month.
+router.get('/:catalogKey/outgoing/summary', async (req, res) => {
+  try {
+    const { group = 'day', date_from, date_to, search } = req.query;
+    const trunc = ['day', 'week', 'month'].includes(group) ? group : 'day';
+    const where = ["p.catalog_id = $1", "l.transaction_type = 'Used'"];
+    const params = [req.catalog.id];
+    if (search && String(search).trim()) {
+      params.push(`%${String(search).trim()}%`);
+      where.push(`(p.part_no ILIKE $${params.length} OR p.description ILIKE $${params.length} OR l.technician ILIKE $${params.length})`);
+    }
+    if (date_from) { params.push(date_from); where.push(`l.log_date >= $${params.length}`); }
+    if (date_to) { params.push(date_to); where.push(`l.log_date <= $${params.length}`); }
+    const whereSql = `WHERE ${where.join(' AND ')}`;
+
+    const r = await pool.query(
+      `SELECT date_trunc('${trunc}', l.log_date)::date AS period,
+              COALESCE(SUM(ABS(l.qty)), 0)::numeric AS total_qty,
+              COUNT(*)::int AS transaction_count,
+              COUNT(DISTINCT l.item_id)::int AS part_count
+       FROM spare_parts_log l JOIN spare_parts_items p ON p.id = l.item_id
+       ${whereSql}
+       GROUP BY period
+       ORDER BY period DESC`,
+      params,
+    );
+    res.json({ success: true, data: r.rows, group: trunc });
+  } catch (err) {
+    console.error('Spare parts outgoing summary error:', err.message);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
 
 module.exports = router;
