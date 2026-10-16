@@ -23,7 +23,7 @@ router.post('/login', async (req, res) => {
 
     // Find user by employee ID
     const result = await pool.query(
-      'SELECT id, employee_id, password, name, email, role, material_type_id, is_active FROM users WHERE employee_id = $1',
+      'SELECT * FROM users WHERE employee_id = $1',
       [employeeId.toUpperCase()]
     );
 
@@ -93,7 +93,8 @@ router.post('/login', async (req, res) => {
         name: user.name,
         email: user.email,
         role: user.role,
-        materialTypeId: user.material_type_id
+        materialTypeId: user.material_type_id,
+        canCorrectProduction: user.can_correct_production === true
       }
     });
   } catch (error) {
@@ -135,6 +136,7 @@ router.post('/refresh', async (req, res) => {
     }
 
     const tokenData = tokenResult.rows[0];
+    const flags = await pool.query('SELECT * FROM users WHERE id = $1', [tokenData.id]);
 
     if (!tokenData.is_active) {
       return res.status(401).json({
@@ -160,7 +162,8 @@ router.post('/refresh', async (req, res) => {
         name: tokenData.name,
         email: tokenData.email,
         role: tokenData.role,
-        materialTypeId: tokenData.material_type_id
+        materialTypeId: tokenData.material_type_id,
+        canCorrectProduction: flags.rows[0]?.can_correct_production === true
       }
     });
   } catch (error) {
@@ -185,7 +188,8 @@ router.get('/verify', authenticateToken, async (req, res) => {
         email: req.user.email,
         role: req.user.role,
         materialTypeId: result.rows[0]?.material_type_id,
-        lastLoginAt: result.rows[0]?.last_login_at
+        lastLoginAt: result.rows[0]?.last_login_at,
+        canCorrectProduction: req.user.canCorrectProduction === true
       }
     });
   } catch (error) {

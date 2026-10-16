@@ -27,6 +27,7 @@ echo "==> Running schema migrations (safe to re-run)..."
 node src/scripts/ensure-schema-migrations.js
 node src/scripts/add-raw-material-region.js
 node src/scripts/add-raw-material-pe-grade-weights.js
+node src/scripts/add-production-corrections.js
 
 echo "==> Restarting app under PM2..."
 # The running PM2 process on this box is named "server" (not "greencore-api" as its

@@ -348,7 +348,9 @@ router.get('/operators', async (req, res) => {
 router.get('/raw-materials', async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
+    // Screens page through 200 at most; an Excel export (export=1) takes the whole date range.
+    const maxLimit = req.query.export === '1' ? 200000 : 200;
+    const limit = Math.min(maxLimit, Math.max(1, parseInt(req.query.limit, 10) || 50));
     const offset = (page - 1) * limit;
 
     const { whereSql, params } = buildListFilters(req.query);

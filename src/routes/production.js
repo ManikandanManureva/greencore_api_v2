@@ -181,6 +181,9 @@ function appendPetSubLineCountFilter(countSql, countParams, subLine) {
   return countSql;
 }
 
+/** Most rows one production export returns (PPIC Excel, CSV). */
+const LOGS_EXPORT_MAX_ROWS = 200000;
+
 /** Station buckets for dashboard / closed-shift reports (includes PET line). */
 function createEmptyByStation() {
   return {
@@ -1864,6 +1867,257 @@ router.put('/logs-update/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// ── Supervisor corrections (users.can_correct_production, e.g. Yoga) ────────────────────────────
+// Every change is written to production_corrections (who, when, old and new values).
+
+// Sub-lines that can be swapped for one another: same station, the operator just picked the wrong
+// line or output type (e.g. Extrusion 1 → Mixture, Flakes PE SUPER → Flakes PE 1).
+const CORRECTABLE_SUB_LINE_GROUPS = [
+  ['3E', 'Rapid', 'Betty'],
+  ['Washing 1', 'Washing 2', 'Washing 3'],
+  ['Extrusion 1', 'Extrusion 2', 'Extrusion 3', 'Mixture'],
+  ['Flakes PE SUPER', 'Flakes PE 1', 'Flakes EVA SUPER', 'Flakes EVA 1'],
+  ['Pellet PE SUPER', 'Pellet PE 1', 'Pellet EVA SUPER', 'Pellet EVA 1'],
+];
+function correctableSubLines(current) {
+  return CORRECTABLE_SUB_LINE_GROUPS.find((g) => g.includes(current)) || [];
+}
+
+function requireCorrector(req, res, next) {
+  if (req.user && req.user.canCorrectProduction) return next();
+  return res.status(403).json({ success: false, message: 'You are not allowed to correct production data' });
+}
+
+function correctorName(req) {
+  return (req.user && (req.user.name || req.user.employeeId)) || null;
+}
+
+async function logCorrection(client, { action, logId, shiftId, bagQr, oldValues, newValues, by }) {
+  await client.query(
+    `INSERT INTO production_corrections (action, log_id, shift_id, bag_qr, old_values, new_values, "correctedBy")
+     VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+    [
+      action,
+      logId ?? null,
+      shiftId ?? null,
+      bagQr ?? null,
+      oldValues ? JSON.stringify(oldValues) : null,
+      newValues ? JSON.stringify(newValues) : null,
+      by,
+    ],
+  );
+}
+
+// Correct a bag entered wrongly: line / output type (within its group), weight, remark, status.
+// The bag keeps its QR code (it is already printed on the label).
+router.put('/logs/:id/correct', authenticateToken, requireCorrector, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ success: false, message: 'Valid log id is required' });
+  const { sub_line, weight, remark, status } = req.body || {};
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const curRes = await client.query('SELECT * FROM production_logs WHERE id = $1 FOR UPDATE', [id]);
+    const cur = curRes.rows[0];
+    if (!cur) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Log not found' });
+    }
+    const sets = [];
+    const params = [];
+    const oldValues = {};
+    const newValues = {};
+    const change = (column, value) => {
+      params.push(value);
+      sets.push(`${column} = $${params.length}`);
+      oldValues[column] = cur[column];
+      newValues[column] = value;
+    };
+    if (sub_line !== undefined && sub_line !== cur.sub_line) {
+      const allowed = correctableSubLines(cur.sub_line);
+      if (!allowed.includes(sub_line)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          success: false,
+          message: allowed.length
+            ? `${cur.sub_line} can only be changed to ${allowed.filter((x) => x !== cur.sub_line).join(', ')}`
+            : "This bag's line cannot be changed",
+        });
+      }
+      change('sub_line', sub_line);
+    }
+    if (weight !== undefined) {
+      const w = Number(weight);
+      if (!Number.isFinite(w) || w <= 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'Valid positive weight (kg) is required' });
+      }
+      if (w !== Number(cur.weight)) change('weight', w);
+    }
+    if (remark !== undefined) {
+      const r = String(remark ?? '').trim() || null;
+      if (r !== cur.remark) change('remark', r);
+    }
+    if (status !== undefined) {
+      const st = String(status).trim().toLowerCase() === 'completed' ? 'Completed' : String(status).trim().toLowerCase();
+      if (!['pending', 'Completed'].includes(st)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'Status must be pending or Completed' });
+      }
+      if (st !== cur.status) change('status', st);
+    }
+    if (sets.length === 0) {
+      await client.query('ROLLBACK');
+      cur.photo_url = await resolvePhotoUrl(cur.photo_url);
+      return res.json({ success: true, message: 'Nothing changed', data: cur });
+    }
+    params.push(id);
+    const upd = await client.query(
+      `UPDATE production_logs SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING *`,
+      params,
+    );
+    await logCorrection(client, {
+      action: 'update',
+      logId: id,
+      shiftId: cur.shift_id,
+      bagQr: cur.output_bag_qr,
+      oldValues,
+      newValues,
+      by: correctorName(req),
+    });
+    await client.query('COMMIT');
+    const row = upd.rows[0];
+    row.photo_url = await resolvePhotoUrl(row.photo_url);
+    res.json({ success: true, message: 'Bag corrected', data: row });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[logs-correct] ERROR:', error.message);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Delete a bag entered by mistake. Refused when another bag already used it as input.
+router.delete('/logs/:id', authenticateToken, requireCorrector, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ success: false, message: 'Valid log id is required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const curRes = await client.query('SELECT * FROM production_logs WHERE id = $1 FOR UPDATE', [id]);
+    const cur = curRes.rows[0];
+    if (!cur) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Log not found' });
+    }
+    if (cur.output_bag_qr) {
+      const used = await client.query(
+        `SELECT output_bag_qr FROM production_logs WHERE input_bag_qr = $1 AND id <> $2 LIMIT 3`,
+        [cur.output_bag_qr, id],
+      );
+      if (used.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          success: false,
+          message: `This bag was already used as input for ${used.rows.map((r) => r.output_bag_qr || 'another bag').join(', ')}. Delete that bag first.`,
+        });
+      }
+    }
+    await client.query('DELETE FROM production_logs WHERE id = $1', [id]);
+    await logCorrection(client, {
+      action: 'delete',
+      logId: id,
+      shiftId: cur.shift_id,
+      bagQr: cur.output_bag_qr,
+      oldValues: cur,
+      newValues: null,
+      by: correctorName(req),
+    });
+    await client.query('COMMIT');
+    res.json({ success: true, message: 'Bag deleted', data: { id } });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[logs-delete] ERROR:', error.message);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Reopen a shift the shift leader closed by mistake. Only a shift closed in the last 8 hours whose
+// shift leader hasn't started another shift since (times compared on the database clock, the same
+// one that stamped start_time / end_time). The app still auto-closes it after its scheduled end.
+router.post('/shifts/:id/reopen', authenticateToken, requireCorrector, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ success: false, message: 'Valid shift id is required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const sRes = await client.query(
+      `SELECT os.*, (os.end_time >= LOCALTIMESTAMP - INTERVAL '8 hours') AS recently_closed
+       FROM operator_shifts os WHERE os.id = $1 FOR UPDATE`,
+      [id],
+    );
+    const s = sRes.rows[0];
+    if (!s) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Shift not found' });
+    }
+    if (s.is_active) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ success: false, message: 'This shift is already open' });
+    }
+    if (!s.end_time || !s.recently_closed) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ success: false, message: 'Only a shift closed in the last 8 hours can be reopened' });
+    }
+    const other = await client.query(
+      `SELECT 1 FROM operator_shifts
+       WHERE user_id = $1 AND id <> $2 AND (is_active = true OR start_time > $3)
+       LIMIT 1`,
+      [s.user_id, id, s.start_time],
+    );
+    if (other.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ success: false, message: 'The shift leader has already started another shift' });
+    }
+    const upd = await client.query(
+      `UPDATE operator_shifts SET is_active = true, end_time = NULL WHERE id = $1 RETURNING *`,
+      [id],
+    );
+    await logCorrection(client, {
+      action: 'reopen',
+      shiftId: id,
+      oldValues: { is_active: false, end_time: s.end_time },
+      newValues: { is_active: true, end_time: null },
+      by: correctorName(req),
+    });
+    await client.query('COMMIT');
+    res.json({ success: true, message: 'Shift reopened', data: upd.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[shift-reopen] ERROR:', error.message);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// First day with data — PPIC exports default their "From" date to it so they start from the beginning.
+router.get('/data-start', authenticateToken, async (req, res) => {
+  try {
+    const [prod, incoming] = await Promise.all([
+      pool.query(`SELECT to_char(MIN(created_at), 'YYYY-MM-DD') AS d FROM production_logs`),
+      pool.query(`SELECT to_char(MIN(entrydate), 'YYYY-MM-DD') AS d FROM raw_material`),
+    ]);
+    res.json({ success: true, data: { production: prod.rows[0].d, incoming: incoming.rows[0].d } });
+  } catch (error) {
+    console.error('[data-start] ERROR:', error.message);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
 // 11. Get crusher line logs with date filter, search, and pagination
 router.get('/crusher-logs', authenticateToken, async (req, res) => {
   const { subLine, date, search, status, shift_id, page = 1, limit = 10 } = req.query;
@@ -2519,7 +2773,8 @@ async function fetchLogsAllFlatRows(query) {
   }
 
   const where = conds.length ? 'AND ' + conds.join(' AND ') : '';
-  params.push(Math.min(parseInt(String(limit), 10) || 500, 25000));
+  // Exports start from the first day of data, so allow a large cap (was 25,000).
+  params.push(Math.min(parseInt(String(limit), 10) || 500, LOGS_EXPORT_MAX_ROWS));
   const limitParam = `$${params.length}`;
 
   const sql = `
@@ -2610,7 +2865,7 @@ router.get('/logs-all-export', authenticateToken, async (req, res) => {
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('X-Export-Row-Count', String(rows.length));
-    if (rows.length >= 25000) res.setHeader('X-Export-Truncated', '1');
+    if (rows.length >= LOGS_EXPORT_MAX_ROWS) res.setHeader('X-Export-Truncated', '1');
     res.send(csv);
   } catch (error) {
     console.error('[logs-all-export] ERROR:', error.message);
