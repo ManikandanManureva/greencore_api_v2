@@ -87,20 +87,31 @@ const CATEGORY_STATIONS = {
   flakes: { PC: ['WSH'], PE: ['WSH'], PET: ['WSH'] },
 };
 
-function stationsSql(stationMap, paramsOffset) {
+// Each material clause optionally gets "AND pl.created_at >= cutoff" when an opening stock
+// balance has been set for that material — so produced is counted only from the point the
+// opening balance was taken, instead of double-counting production already folded into it.
+// A material with no opening stock yet keeps the old all-time behaviour (no cutoff).
+function stationsSql(stationMap, cutoffMap, paramsOffset) {
   const clauses = [];
   const params = [];
   let i = paramsOffset;
   for (const [material, codes] of Object.entries(stationMap)) {
     params.push(material, codes);
-    clauses.push(`(mt.name = $${i + 1} AND s.code = ANY($${i + 2}))`);
+    let clause = `(mt.name = $${i + 1} AND s.code = ANY($${i + 2})`;
     i += 2;
+    const cutoff = cutoffMap[material];
+    if (cutoff) {
+      params.push(cutoff);
+      i += 1;
+      clause += ` AND pl.created_at >= $${i}`;
+    }
+    clauses.push(`${clause})`);
   }
   return { sql: clauses.join(' OR '), params };
 }
 
-async function producedByStation(client, stationMap) {
-  const { sql, params } = stationsSql(stationMap, 0);
+async function producedByStation(client, stationMap, cutoffMap) {
+  const { sql, params } = stationsSql(stationMap, cutoffMap, 0);
   const r = await client.query(
     `SELECT mt.name AS material, COALESCE(SUM(pl.weight), 0)::numeric AS produced_weight, COUNT(*)::int AS bag_count
      FROM production_logs pl
@@ -118,31 +129,57 @@ async function producedByStation(client, stationMap) {
   return r.rows;
 }
 
-async function producedByProduct(client) {
+function byProductSql(cutoffMap, paramsOffset) {
+  const clauses = [];
+  const params = [];
+  let i = paramsOffset;
+  for (const material of MATERIALS) {
+    params.push(material);
+    let clause = `(mt.name = $${i + 1}`;
+    i += 1;
+    const cutoff = cutoffMap[material];
+    if (cutoff) {
+      params.push(cutoff);
+      i += 1;
+      clause += ` AND b.created_at >= $${i}`;
+    }
+    clauses.push(`${clause})`);
+  }
+  return { sql: clauses.join(' OR '), params };
+}
+
+async function producedByProduct(client, cutoffMap) {
+  const { sql, params } = byProductSql(cutoffMap, 0);
   const r = await client.query(
     `SELECT mt.name AS material, COALESCE(SUM(b.weight), 0)::numeric AS produced_weight, COUNT(*)::int AS bag_count
      FROM by_product_logs b
      JOIN operator_shifts os ON os.id = b.shift_id
      JOIN material_types mt ON mt.id = os.material_type_id
+     WHERE (${sql})
      GROUP BY mt.name`,
+    params,
   );
   return r.rows;
 }
 
-async function producedByMaterial(client, category) {
-  if (category === 'by_products') return producedByProduct(client);
-  return producedByStation(client, CATEGORY_STATIONS[category]);
+async function producedByMaterial(client, category, cutoffMap = {}) {
+  if (category === 'by_products') return producedByProduct(client, cutoffMap);
+  return producedByStation(client, CATEGORY_STATIONS[category], cutoffMap);
 }
 
 async function openingStockByMaterial(client, category) {
   const r = await client.query(
-    `SELECT mt.name AS material, o.weight_kg::numeric AS weight_kg
+    `SELECT mt.name AS material, o.weight_kg::numeric AS weight_kg, o."createdAt" AS created_at
      FROM finished_goods_opening_stock o
      JOIN material_types mt ON mt.id = o.material_type_id
      WHERE o.category = $1`,
     [category],
   );
-  return Object.fromEntries(r.rows.map((row) => [row.material, Number(row.weight_kg)]));
+  return Object.fromEntries(r.rows.map((row) => [row.material, { weight: Number(row.weight_kg), createdAt: row.created_at }]));
+}
+
+function cutoffMapFrom(opening) {
+  return Object.fromEntries(Object.entries(opening).map(([material, o]) => [material, o.createdAt]));
 }
 
 // ─── Opening Stock — one-time go-live balance per category + material ─────────
@@ -207,8 +244,8 @@ router.put('/opening-stock', async (req, res) => {
 router.get('/summary', async (req, res) => {
   try {
     const category = parseCategory(req.query.category);
-    const produced = await producedByMaterial(pool, category);
     const opening = await openingStockByMaterial(pool, category);
+    const produced = await producedByMaterial(pool, category, cutoffMapFrom(opening));
     const shipped = await pool.query(
       `SELECT mt.name AS material, COALESCE(SUM(s.weight_kg), 0)::numeric AS shipped_weight
        FROM finished_goods_shipments s
@@ -222,7 +259,7 @@ router.get('/summary', async (req, res) => {
 
     const data = MATERIALS.map((material) => {
       const producedWeight = Number(producedMap[material]?.produced_weight || 0);
-      const openingWeight = Number(opening[material] || 0);
+      const openingWeight = Number(opening[material]?.weight || 0);
       const shippedWeight = shippedMap[material] || 0;
       return {
         material,
@@ -394,10 +431,10 @@ router.post('/shipments', async (req, res) => {
     }
     const materialTypeId = mtRes.rows[0].id;
 
-    const produced = await producedByMaterial(client, category);
-    const producedWeight = Number(produced.find((r) => r.material === material)?.produced_weight || 0);
     const opening = await openingStockByMaterial(client, category);
-    const openingWeight = Number(opening[material] || 0);
+    const produced = await producedByMaterial(client, category, cutoffMapFrom(opening));
+    const producedWeight = Number(produced.find((r) => r.material === material)?.produced_weight || 0);
+    const openingWeight = Number(opening[material]?.weight || 0);
     const shippedRes = await client.query(
       'SELECT COALESCE(SUM(weight_kg), 0)::numeric AS n FROM finished_goods_shipments WHERE material_type_id = $1 AND category = $2',
       [materialTypeId, category],
