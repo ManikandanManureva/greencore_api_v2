@@ -134,11 +134,81 @@ async function producedByMaterial(client, category) {
   return producedByStation(client, CATEGORY_STATIONS[category]);
 }
 
+async function openingStockByMaterial(client, category) {
+  const r = await client.query(
+    `SELECT mt.name AS material, o.weight_kg::numeric AS weight_kg
+     FROM finished_goods_opening_stock o
+     JOIN material_types mt ON mt.id = o.material_type_id
+     WHERE o.category = $1`,
+    [category],
+  );
+  return Object.fromEntries(r.rows.map((row) => [row.material, Number(row.weight_kg)]));
+}
+
+// ─── Opening Stock — one-time go-live balance per category + material ─────────
+router.get('/opening-stock', async (req, res) => {
+  try {
+    const category = parseCategory(req.query.category);
+    const r = await pool.query(
+      `SELECT o.*, mt.name AS material
+       FROM finished_goods_opening_stock o
+       JOIN material_types mt ON mt.id = o.material_type_id
+       WHERE o.category = $1`,
+      [category],
+    );
+    const byMaterial = Object.fromEntries(r.rows.map((row) => [row.material, row]));
+    const data = MATERIALS.map((material) => ({
+      material,
+      weight_kg: Number(byMaterial[material]?.weight_kg || 0),
+      notes: byMaterial[material]?.notes || null,
+      updatedAt: byMaterial[material]?.updatedAt || null,
+      updatedBy: byMaterial[material]?.updatedBy || null,
+    }));
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error('Opening stock list error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to load opening stock' });
+  }
+});
+
+router.put('/opening-stock', async (req, res) => {
+  try {
+    const category = parseCategory(req.body.category);
+    const { material, notes } = req.body || {};
+    if (!material || !MATERIALS.includes(material)) {
+      return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
+    }
+    const weightNum = Number(req.body.weight_kg);
+    if (!Number.isFinite(weightNum) || weightNum < 0) {
+      return res.status(400).json({ success: false, message: 'weight_kg must be a non-negative number' });
+    }
+    const mtRes = await pool.query('SELECT id FROM material_types WHERE name = $1', [material]);
+    if (mtRes.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Unknown material type' });
+    }
+    const materialTypeId = mtRes.rows[0].id;
+    const actor = actorName(req);
+    const r = await pool.query(
+      `INSERT INTO finished_goods_opening_stock (category, material_type_id, weight_kg, notes, "createdBy", "updatedBy")
+       VALUES ($1, $2, $3, $4, $5, $5)
+       ON CONFLICT (category, material_type_id)
+       DO UPDATE SET weight_kg = $3, notes = $4, "updatedBy" = $5, "updatedAt" = NOW()
+       RETURNING *`,
+      [category, materialTypeId, weightNum, notes || null, actor],
+    );
+    res.json({ success: true, data: { ...r.rows[0], material } });
+  } catch (err) {
+    console.error('Opening stock save error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to save opening stock' });
+  }
+});
+
 // ─── Summary — Produced / Shipped / Available per material, for one category ──
 router.get('/summary', async (req, res) => {
   try {
     const category = parseCategory(req.query.category);
     const produced = await producedByMaterial(pool, category);
+    const opening = await openingStockByMaterial(pool, category);
     const shipped = await pool.query(
       `SELECT mt.name AS material, COALESCE(SUM(s.weight_kg), 0)::numeric AS shipped_weight
        FROM finished_goods_shipments s
@@ -152,13 +222,15 @@ router.get('/summary', async (req, res) => {
 
     const data = MATERIALS.map((material) => {
       const producedWeight = Number(producedMap[material]?.produced_weight || 0);
+      const openingWeight = Number(opening[material] || 0);
       const shippedWeight = shippedMap[material] || 0;
       return {
         material,
         produced_weight: producedWeight,
+        opening_weight: openingWeight,
         bag_count: Number(producedMap[material]?.bag_count || 0),
         shipped_weight: shippedWeight,
-        available_weight: Math.max(producedWeight - shippedWeight, 0),
+        available_weight: Math.max(producedWeight + openingWeight - shippedWeight, 0),
       };
     });
     res.json({ success: true, data });
@@ -324,11 +396,13 @@ router.post('/shipments', async (req, res) => {
 
     const produced = await producedByMaterial(client, category);
     const producedWeight = Number(produced.find((r) => r.material === material)?.produced_weight || 0);
+    const opening = await openingStockByMaterial(client, category);
+    const openingWeight = Number(opening[material] || 0);
     const shippedRes = await client.query(
       'SELECT COALESCE(SUM(weight_kg), 0)::numeric AS n FROM finished_goods_shipments WHERE material_type_id = $1 AND category = $2',
       [materialTypeId, category],
     );
-    const availableWeight = producedWeight - Number(shippedRes.rows[0].n);
+    const availableWeight = producedWeight + openingWeight - Number(shippedRes.rows[0].n);
     if (weightNum > availableWeight) {
       await client.query('ROLLBACK');
       return res.status(400).json({ success: false, message: `Insufficient stock. Available: ${availableWeight.toFixed(2)} kg, Requested: ${weightNum} kg` });
