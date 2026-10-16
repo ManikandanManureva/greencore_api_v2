@@ -15,6 +15,7 @@ const partsRoutes = require('./routes/parts');
 const partsInventoryRoutes = require('./routes/parts-inventory');
 const sparePartsRoutes = require('./routes/spareparts');
 const finishedGoodsRoutes = require('./routes/finished-goods');
+const qcLabRoutes = require('./routes/qc-lab');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -75,6 +76,8 @@ app.use('/api/spareparts', sparePartsRoutes);
 app.use('/spareparts', sparePartsRoutes);
 app.use('/api/finished-goods', finishedGoodsRoutes);
 app.use('/finished-goods', finishedGoodsRoutes);
+app.use('/api/qc-lab', qcLabRoutes);
+app.use('/qc-lab', qcLabRoutes);
 
 // 404 handler
 app.use((req, res) => {
