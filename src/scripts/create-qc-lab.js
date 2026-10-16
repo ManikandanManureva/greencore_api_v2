@@ -65,6 +65,7 @@ async function run() {
         blue                   NUMERIC(8,3),
 
         notes                  TEXT,
+        iv_photo_url           TEXT,
         "createdBy"            VARCHAR(120),
         "updatedBy"            VARCHAR(120),
         "createdAt"            TIMESTAMPTZ DEFAULT NOW(),

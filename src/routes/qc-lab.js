@@ -1,8 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { isS3Configured, uploadBuffer, getSignedUrlForKey, keyFromS3Url } = require('../config/s3');
 
 /**
  * QC Lab — Pellet Finish Good sampling. Mirrors "QC LAB - PELLETS REPORT.xlsx" column-for-column
@@ -11,6 +15,53 @@ const { authenticateToken } = require('../middleware/auth');
  * use it for oversight/correction.
  */
 const ALLOWED_ROLES = ['qc_lab', 'ppic', 'super_admin', 'admin'];
+
+const PHOTO_UPLOAD_DIR = path.join(__dirname, '..', '..', 'uploads', 'qc-lab');
+fs.mkdirSync(PHOTO_UPLOAD_DIR, { recursive: true });
+
+function makePhotoFilename(originalname) {
+  const ext = path.extname(originalname || '').toLowerCase() || '.jpg';
+  return `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`;
+}
+
+// The IV photo is stored as a bare S3 object key (URLs expire, keys don't) — same convention
+// as production_logs.photo_url. A value is only treated as a key when it isn't itself a usable
+// URL (the local-disk fallback stores a full http(s) URL instead).
+function normalizePhotoForStorage(value) {
+  if (!value) return value;
+  const key = keyFromS3Url(value);
+  return key || value;
+}
+
+// Turn whatever is stored back into something a client can load right now: local-disk URLs
+// pass through unchanged; bare S3 keys get a freshly-signed GET URL.
+async function resolvePhotoUrl(value) {
+  if (!value) return value;
+  if (/^https?:\/\//i.test(value)) return value;
+  if (isS3Configured()) {
+    try {
+      return await getSignedUrlForKey(value);
+    } catch (err) {
+      console.error('Failed to sign QC Lab photo URL for key', value, err);
+      return value;
+    }
+  }
+  return value;
+}
+
+// Uploads an IV-reading photo buffer to S3 (preferred) or local disk, returning the value to
+// store (S3: bare key; local disk: full URL) and a URL usable immediately.
+async function persistIvPhoto(req, buffer, mimetype, originalname) {
+  const filename = makePhotoFilename(originalname);
+  if (isS3Configured()) {
+    const key = `qc-lab/${filename}`;
+    const url = await uploadBuffer(buffer, key, mimetype);
+    return { stored: key, url };
+  }
+  fs.writeFileSync(path.join(PHOTO_UPLOAD_DIR, filename), buffer);
+  const url = `${req.protocol}://${req.get('host')}/uploads/qc-lab/${filename}`;
+  return { stored: url, url };
+}
 
 function requireRole(req, res, next) {
   const role = String(req.user && req.user.role ? req.user.role : '').toLowerCase();
@@ -43,7 +94,7 @@ const INPUT_FIELDS = [
   'foreign_material', 'filaments_angel_hair', 'fines', 'black_specs',
   'black_spot_gt_1mm', 'black_spot_0_5_1mm', 'black_spot_0_1_0_5mm',
   'miscut', 'duplet', 'triplet', 'undersize', 'oversize', 'tail', 'aglomerat', 'white',
-  'notes',
+  'notes', 'iv_photo_url',
 ];
 const NUMERIC_FIELDS = [
   'qty_kg', 'iv', 'pellet_size', 'bulk_density', 'moisture', 'melting_point',
@@ -58,6 +109,7 @@ function cleanValue(field, value) {
     const n = Number(value);
     return Number.isFinite(n) ? n : null;
   }
+  if (field === 'iv_photo_url') return normalizePhotoForStorage(value);
   return value;
 }
 
@@ -90,8 +142,11 @@ router.get('/samples', async (req, res) => {
       listParams,
     );
     const total = countRes.rows[0].total;
+    const data = await Promise.all(rowsRes.rows.map(async (row) => ({
+      ...row, iv_photo_url: await resolvePhotoUrl(row.iv_photo_url),
+    })));
     res.json({
-      success: true, data: rowsRes.rows, page: parseInt(page), limit: parseInt(limit),
+      success: true, data, page: parseInt(page), limit: parseInt(limit),
       total, totalPages: Math.max(1, Math.ceil(total / parseInt(limit))),
     });
   } catch (err) {
@@ -141,7 +196,9 @@ router.get('/samples/:id', async (req, res) => {
   try {
     const r = await pool.query('SELECT * FROM qc_lab_samples WHERE id = $1', [req.params.id]);
     if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Sample not found' });
-    res.json({ success: true, data: r.rows[0] });
+    const row = r.rows[0];
+    row.iv_photo_url = await resolvePhotoUrl(row.iv_photo_url);
+    res.json({ success: true, data: row });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Failed to load sample' });
   }
@@ -177,7 +234,9 @@ router.post('/samples', async (req, res) => {
       `INSERT INTO qc_lab_samples (${cols.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`,
       vals,
     );
-    res.status(201).json({ success: true, data: r.rows[0] });
+    const row = r.rows[0];
+    row.iv_photo_url = await resolvePhotoUrl(row.iv_photo_url);
+    res.status(201).json({ success: true, data: row });
   } catch (err) {
     console.error('QC Lab create error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to create sample' });
@@ -219,7 +278,9 @@ router.put('/samples/:id', async (req, res) => {
       `UPDATE qc_lab_samples SET ${sets.join(', ')} WHERE id = $${vals.length} RETURNING *`,
       vals,
     );
-    res.json({ success: true, data: r.rows[0] });
+    const row = r.rows[0];
+    row.iv_photo_url = await resolvePhotoUrl(row.iv_photo_url);
+    res.json({ success: true, data: row });
   } catch (err) {
     console.error('QC Lab update error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to update sample' });
@@ -239,8 +300,10 @@ router.delete('/samples/:id', async (req, res) => {
 
 // ─── IV OCR ─────────────────────────────────────────────────────────────────────
 // Reads the Intrinsic Viscosity value off a lab instrument's display/printout photo via
-// OpenAI vision, mirroring production.js's /ocr-weight route exactly (same model, same
-// in-memory-only handling — the image is never written to disk or S3).
+// OpenAI vision (same model/prompt style as production.js's /ocr-weight), and — unlike that
+// route — also persists the photo (S3 when configured, else local disk) so it can be reviewed
+// later from the sample record. Returns `stored` (what the client should submit back as
+// iv_photo_url when saving the sample) and `photo_url` (a URL usable immediately for preview).
 const photoUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
@@ -303,7 +366,20 @@ router.post('/ocr-iv', (req, res) => {
       const raw = (aiJson?.choices?.[0]?.message?.content || '').trim();
       const match = raw.match(/-?\d+(\.\d+)?/);
       const iv = match ? parseFloat(match[0]) : null;
-      res.json({ success: true, iv, raw });
+
+      let stored = null;
+      let photoUrl = null;
+      try {
+        const persisted = await persistIvPhoto(req, req.file.buffer, mime, req.file.originalname);
+        stored = persisted.stored;
+        photoUrl = persisted.url;
+      } catch (storeErr) {
+        // Don't fail the whole OCR read just because the photo couldn't be saved —
+        // the IV value is still usable without it.
+        console.error('Failed to store IV photo:', storeErr);
+      }
+
+      res.json({ success: true, iv, raw, stored, photo_url: photoUrl });
     } catch (ocrErr) {
       console.error('IV OCR failed:', ocrErr);
       res.status(500).json({ success: false, message: 'Failed to read IV from photo' });
