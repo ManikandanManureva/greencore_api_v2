@@ -2045,20 +2045,78 @@ router.delete('/logs/:id', authenticateToken, requireCorrector, async (req, res)
   }
 });
 
-// Reopen a shift the shift leader closed by mistake. Only a shift closed in the last 8 hours whose
-// shift leader hasn't started another shift since (times compared on the database clock, the same
-// one that stamped start_time / end_time). The app still auto-closes it after its scheduled end.
+// ── Supervisor shift controls: view, close, reopen and edit any shift (open or closed) ─────────
+// Times arrive as ISO instants and are stored the way the column already is: operator_shifts uses
+// `timestamp without time zone` filled by CURRENT_TIMESTAMP, i.e. the instant converted to the
+// database session's time zone — so `AT TIME ZONE current_setting('TimeZone')` matches it exactly.
+const SHIFT_DETAIL_SELECT = `
+  SELECT os.id, os.user_id, u.name AS operator_name, os.shift_type_id, st.name AS shift_name,
+         os.start_time, os.end_time, os.is_active, os.end_remark, mt.name AS material_type_name
+  FROM operator_shifts os
+  LEFT JOIN users u ON u.id = os.user_id
+  LEFT JOIN shift_types st ON st.id = os.shift_type_id
+  LEFT JOIN material_types mt ON mt.id = os.material_type_id
+  WHERE os.id = $1`;
+
+router.get('/shifts/:id/detail', authenticateToken, requireCorrector, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ success: false, message: 'Valid shift id is required' });
+  try {
+    const r = await pool.query(SHIFT_DETAIL_SELECT, [id]);
+    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Shift not found' });
+    res.json({ success: true, data: r.rows[0] });
+  } catch (error) {
+    console.error('[shift-detail] ERROR:', error.message);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// Close a running shift (e.g. the shift leader forgot to close it).
+router.post('/shifts/:id/close', authenticateToken, requireCorrector, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ success: false, message: 'Valid shift id is required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const sRes = await client.query('SELECT * FROM operator_shifts WHERE id = $1 FOR UPDATE', [id]);
+    const s = sRes.rows[0];
+    if (!s) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Shift not found' });
+    }
+    if (!s.is_active) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ success: false, message: 'This shift is already closed' });
+    }
+    await client.query(`UPDATE operator_shifts SET is_active = false, end_time = CURRENT_TIMESTAMP WHERE id = $1`, [id]);
+    await logCorrection(client, {
+      action: 'close',
+      shiftId: id,
+      oldValues: { is_active: true, end_time: null },
+      newValues: { is_active: false },
+      by: correctorName(req),
+    });
+    await client.query('COMMIT');
+    const out = await pool.query(SHIFT_DETAIL_SELECT, [id]);
+    res.json({ success: true, message: 'Shift closed', data: out.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[shift-close] ERROR:', error.message);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Reopen any closed shift. The only rule: the shift leader can't already have another open shift
+// (the app allows one at a time). The app still auto-closes it after its scheduled end.
 router.post('/shifts/:id/reopen', authenticateToken, requireCorrector, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ success: false, message: 'Valid shift id is required' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const sRes = await client.query(
-      `SELECT os.*, (os.end_time >= LOCALTIMESTAMP - INTERVAL '8 hours') AS recently_closed
-       FROM operator_shifts os WHERE os.id = $1 FOR UPDATE`,
-      [id],
-    );
+    const sRes = await client.query('SELECT * FROM operator_shifts WHERE id = $1 FOR UPDATE', [id]);
     const s = sRes.rows[0];
     if (!s) {
       await client.query('ROLLBACK');
@@ -2068,24 +2126,18 @@ router.post('/shifts/:id/reopen', authenticateToken, requireCorrector, async (re
       await client.query('ROLLBACK');
       return res.status(409).json({ success: false, message: 'This shift is already open' });
     }
-    if (!s.end_time || !s.recently_closed) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ success: false, message: 'Only a shift closed in the last 8 hours can be reopened' });
-    }
     const other = await client.query(
-      `SELECT 1 FROM operator_shifts
-       WHERE user_id = $1 AND id <> $2 AND (is_active = true OR start_time > $3)
-       LIMIT 1`,
-      [s.user_id, id, s.start_time],
+      `SELECT id FROM operator_shifts WHERE user_id = $1 AND id <> $2 AND is_active = true LIMIT 1`,
+      [s.user_id, id],
     );
     if (other.rows.length > 0) {
       await client.query('ROLLBACK');
-      return res.status(409).json({ success: false, message: 'The shift leader has already started another shift' });
+      return res.status(409).json({
+        success: false,
+        message: 'The shift leader has another shift open. Close that one first.',
+      });
     }
-    const upd = await client.query(
-      `UPDATE operator_shifts SET is_active = true, end_time = NULL WHERE id = $1 RETURNING *`,
-      [id],
-    );
+    await client.query(`UPDATE operator_shifts SET is_active = true, end_time = NULL WHERE id = $1`, [id]);
     await logCorrection(client, {
       action: 'reopen',
       shiftId: id,
@@ -2094,10 +2146,91 @@ router.post('/shifts/:id/reopen', authenticateToken, requireCorrector, async (re
       by: correctorName(req),
     });
     await client.query('COMMIT');
-    res.json({ success: true, message: 'Shift reopened', data: upd.rows[0] });
+    const out = await pool.query(SHIFT_DETAIL_SELECT, [id]);
+    res.json({ success: true, message: 'Shift reopened', data: out.rows[0] });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('[shift-reopen] ERROR:', error.message);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Edit a shift: shift type (Shift 1/2/3), start time, end time (end time only on a closed shift).
+router.put('/shifts/:id', authenticateToken, requireCorrector, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ success: false, message: 'Valid shift id is required' });
+  const { shift_type_id, start_time, end_time } = req.body || {};
+  const isInstant = (v) => typeof v === 'string' && !Number.isNaN(Date.parse(v));
+  if (start_time !== undefined && !isInstant(start_time)) {
+    return res.status(400).json({ success: false, message: 'Start time is not a valid date/time' });
+  }
+  if (end_time !== undefined && end_time !== null && !isInstant(end_time)) {
+    return res.status(400).json({ success: false, message: 'End time is not a valid date/time' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const sRes = await client.query('SELECT * FROM operator_shifts WHERE id = $1 FOR UPDATE', [id]);
+    const s = sRes.rows[0];
+    if (!s) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Shift not found' });
+    }
+    const sets = [];
+    const params = [];
+    const oldValues = {};
+    const newValues = {};
+    if (shift_type_id !== undefined && Number(shift_type_id) !== Number(s.shift_type_id)) {
+      const st = await client.query('SELECT id FROM shift_types WHERE id = $1', [Number(shift_type_id)]);
+      if (st.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'Unknown shift type' });
+      }
+      params.push(Number(shift_type_id));
+      sets.push(`shift_type_id = $${params.length}`);
+      oldValues.shift_type_id = s.shift_type_id;
+      newValues.shift_type_id = Number(shift_type_id);
+    }
+    if (start_time !== undefined) {
+      params.push(start_time);
+      sets.push(`start_time = ($${params.length}::timestamptz AT TIME ZONE current_setting('TimeZone'))`);
+      oldValues.start_time = s.start_time;
+      newValues.start_time = start_time;
+    }
+    if (end_time !== undefined) {
+      if (s.is_active && end_time !== null) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'Close the shift before setting its end time' });
+      }
+      params.push(end_time);
+      sets.push(`end_time = ($${params.length}::timestamptz AT TIME ZONE current_setting('TimeZone'))`);
+      oldValues.end_time = s.end_time;
+      newValues.end_time = end_time;
+    }
+    if (sets.length === 0) {
+      await client.query('ROLLBACK');
+      const same = await pool.query(SHIFT_DETAIL_SELECT, [id]);
+      return res.json({ success: true, message: 'Nothing changed', data: same.rows[0] });
+    }
+    params.push(id);
+    const upd = await client.query(
+      `UPDATE operator_shifts SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING start_time, end_time`,
+      params,
+    );
+    const { start_time: st, end_time: et } = upd.rows[0];
+    if (st && et && new Date(et) <= new Date(st)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'End time must be after the start time' });
+    }
+    await logCorrection(client, { action: 'edit_shift', shiftId: id, oldValues, newValues, by: correctorName(req) });
+    await client.query('COMMIT');
+    const out = await pool.query(SHIFT_DETAIL_SELECT, [id]);
+    res.json({ success: true, message: 'Shift updated', data: out.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[shift-edit] ERROR:', error.message);
     res.status(500).json({ success: false, message: 'Internal server error' });
   } finally {
     client.release();
