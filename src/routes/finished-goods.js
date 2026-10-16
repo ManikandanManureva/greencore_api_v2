@@ -182,6 +182,26 @@ function cutoffMapFrom(opening) {
   return Object.fromEntries(Object.entries(opening).map(([material, o]) => [material, o.createdAt]));
 }
 
+function fmtKg(n) {
+  return `${Number(n).toLocaleString()} kg`;
+}
+
+async function logShipmentHistory(client, { shipmentId, category, materialTypeId, action, details, actor }) {
+  await client.query(
+    `INSERT INTO finished_goods_shipment_history (shipment_id, category, material_type_id, action, details, "createdBy")
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [shipmentId, category, materialTypeId, action, details, actor],
+  );
+}
+
+async function logOpeningStockHistory(client, { category, materialTypeId, weightKg, action, details, actor }) {
+  await client.query(
+    `INSERT INTO finished_goods_opening_stock_history (category, material_type_id, weight_kg, action, details, "createdBy")
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [category, materialTypeId, weightKg, action, details, actor],
+  );
+}
+
 // ─── Opening Stock — one-time go-live balance per category + material ─────────
 router.get('/opening-stock', async (req, res) => {
   try {
@@ -209,6 +229,7 @@ router.get('/opening-stock', async (req, res) => {
 });
 
 router.put('/opening-stock', async (req, res) => {
+  const client = await pool.connect();
   try {
     const category = parseCategory(req.body.category);
     const { material, notes } = req.body || {};
@@ -219,13 +240,19 @@ router.put('/opening-stock', async (req, res) => {
     if (!Number.isFinite(weightNum) || weightNum < 0) {
       return res.status(400).json({ success: false, message: 'weight_kg must be a non-negative number' });
     }
-    const mtRes = await pool.query('SELECT id FROM material_types WHERE name = $1', [material]);
+    const mtRes = await client.query('SELECT id FROM material_types WHERE name = $1', [material]);
     if (mtRes.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Unknown material type' });
     }
     const materialTypeId = mtRes.rows[0].id;
     const actor = actorName(req);
-    const r = await pool.query(
+
+    await client.query('BEGIN');
+    const existing = await client.query(
+      'SELECT weight_kg FROM finished_goods_opening_stock WHERE category = $1 AND material_type_id = $2',
+      [category, materialTypeId],
+    );
+    const r = await client.query(
       `INSERT INTO finished_goods_opening_stock (category, material_type_id, weight_kg, notes, "createdBy", "updatedBy")
        VALUES ($1, $2, $3, $4, $5, $5)
        ON CONFLICT (category, material_type_id)
@@ -233,10 +260,47 @@ router.put('/opening-stock', async (req, res) => {
        RETURNING *`,
       [category, materialTypeId, weightNum, notes || null, actor],
     );
+    const isNew = existing.rows.length === 0;
+    const details = isNew
+      ? `Opening stock set to ${fmtKg(weightNum)} for ${material}.`
+      : `Opening stock corrected from ${fmtKg(existing.rows[0].weight_kg)} to ${fmtKg(weightNum)} for ${material}.`;
+    await logOpeningStockHistory(client, {
+      category, materialTypeId, weightKg: weightNum, action: isNew ? 'created' : 'amended', details, actor,
+    });
+    await client.query('COMMIT');
+
     res.json({ success: true, data: { ...r.rows[0], material } });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('Opening stock save error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to save opening stock' });
+  } finally {
+    client.release();
+  }
+});
+
+router.get('/opening-stock/history', async (req, res) => {
+  try {
+    const category = parseCategory(req.query.category);
+    const { material } = req.query;
+    const where = ['h.category = $1'];
+    const params = [category];
+    if (material && MATERIALS.includes(material)) {
+      params.push(material);
+      where.push(`mt.name = $${params.length}`);
+    }
+    const r = await pool.query(
+      `SELECT h.*, mt.name AS material
+       FROM finished_goods_opening_stock_history h
+       JOIN material_types mt ON mt.id = h.material_type_id
+       WHERE ${where.join(' AND ')}
+       ORDER BY h."createdAt" DESC`,
+      params,
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    console.error('Opening stock history error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to load opening stock history' });
   }
 });
 
@@ -445,16 +509,22 @@ router.post('/shipments', async (req, res) => {
       return res.status(400).json({ success: false, message: `Insufficient stock. Available: ${availableWeight.toFixed(2)} kg, Requested: ${weightNum} kg` });
     }
 
+    const actor = actorName(req);
     const r = await client.query(
       `INSERT INTO finished_goods_shipments
          (shipment_date, material_type_id, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, category, "createdBy")
        VALUES (COALESCE($1::date, CURRENT_DATE), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
-      [shipment_date, materialTypeId, weightNum, customer || null, destination || null, vehicle_no || null, dn_no || null, notes || null, normalizePackingListForStorage(packing_list_url) || null, category, actorName(req)],
+      [shipment_date, materialTypeId, weightNum, customer || null, destination || null, vehicle_no || null, dn_no || null, notes || null, normalizePackingListForStorage(packing_list_url) || null, category, actor],
     );
+    const row = r.rows[0];
+    await logShipmentHistory(client, {
+      shipmentId: row.id, category, materialTypeId, action: 'created', actor,
+      details: `${fmtKg(weightNum)} ${material} recorded${customer ? ` for ${customer}` : ''}${dn_no ? ` (DN ${dn_no})` : ''}.`,
+    });
     await client.query('COMMIT');
-    const resolvedUrl = await resolvePackingListUrl(r.rows[0].packing_list_url);
-    res.status(201).json({ success: true, data: { ...r.rows[0], material, packing_list_url: resolvedUrl } });
+    const resolvedUrl = await resolvePackingListUrl(row.packing_list_url);
+    res.status(201).json({ success: true, data: { ...row, material, packing_list_url: resolvedUrl } });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('Outgoing/Sales shipment create error:', err.message);
@@ -464,14 +534,152 @@ router.post('/shipments', async (req, res) => {
   }
 });
 
-router.delete('/shipments/:id', async (req, res) => {
+router.put('/shipments/:id', async (req, res) => {
+  const client = await pool.connect();
   try {
-    const r = await pool.query('DELETE FROM finished_goods_shipments WHERE id = $1 RETURNING id', [req.params.id]);
-    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Shipment not found' });
+    const existingRes = await client.query(
+      `SELECT s.*, mt.name AS material FROM finished_goods_shipments s
+       JOIN material_types mt ON mt.id = s.material_type_id WHERE s.id = $1`,
+      [req.params.id],
+    );
+    if (existingRes.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Shipment not found' });
+    }
+    const existing = existingRes.rows[0];
+    const category = existing.category;
+
+    const { material, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url } = req.body || {};
+    const shipment_date = req.body.shipment_date || existing.shipment_date;
+    if (!material || !MATERIALS.includes(material)) {
+      return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
+    }
+    const weightNum = Number(weight_kg);
+    if (!Number.isFinite(weightNum) || weightNum <= 0) {
+      return res.status(400).json({ success: false, message: 'weight_kg must be a positive number' });
+    }
+
+    await client.query('BEGIN');
+
+    const mtRes = await client.query('SELECT id FROM material_types WHERE name = $1', [material]);
+    if (mtRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Unknown material type' });
+    }
+    const materialTypeId = mtRes.rows[0].id;
+
+    // Available stock as if this shipment hadn't been shipped yet, so amending it (even to a
+    // larger weight for the same material) is checked against the true remaining balance.
+    const opening = await openingStockByMaterial(client, category);
+    const produced = await producedByMaterial(client, category, cutoffMapFrom(opening));
+    const producedWeight = Number(produced.find((r) => r.material === material)?.produced_weight || 0);
+    const openingWeight = Number(opening[material]?.weight || 0);
+    const shippedRes = await client.query(
+      'SELECT COALESCE(SUM(weight_kg), 0)::numeric AS n FROM finished_goods_shipments WHERE material_type_id = $1 AND category = $2 AND id <> $3',
+      [materialTypeId, category, existing.id],
+    );
+    const availableWeight = producedWeight + openingWeight - Number(shippedRes.rows[0].n);
+    if (weightNum > availableWeight) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: `Insufficient stock. Available: ${availableWeight.toFixed(2)} kg, Requested: ${weightNum} kg` });
+    }
+
+    const actor = actorName(req);
+    const r = await client.query(
+      `UPDATE finished_goods_shipments SET
+         shipment_date = COALESCE($1::date, shipment_date), material_type_id = $2, weight_kg = $3,
+         customer = $4, destination = $5, vehicle_no = $6, dn_no = $7, notes = $8, packing_list_url = $9
+       WHERE id = $10
+       RETURNING *`,
+      [shipment_date, materialTypeId, weightNum, customer || null, destination || null, vehicle_no || null, dn_no || null, notes || null,
+        normalizePackingListForStorage(packing_list_url) || existing.packing_list_url, existing.id],
+    );
+    const row = r.rows[0];
+
+    const changes = [];
+    if (Number(existing.weight_kg) !== weightNum) changes.push(`weight ${fmtKg(existing.weight_kg)} → ${fmtKg(weightNum)}`);
+    if (existing.material !== material) changes.push(`material ${existing.material} → ${material}`);
+    if ((existing.customer || '') !== (customer || '')) changes.push(`customer "${existing.customer || '—'}" → "${customer || '—'}"`);
+    if ((existing.destination || '') !== (destination || '')) changes.push(`destination "${existing.destination || '—'}" → "${destination || '—'}"`);
+    if ((existing.dn_no || '') !== (dn_no || '')) changes.push(`DN no. "${existing.dn_no || '—'}" → "${dn_no || '—'}"`);
+    if ((existing.vehicle_no || '') !== (vehicle_no || '')) changes.push(`vehicle "${existing.vehicle_no || '—'}" → "${vehicle_no || '—'}"`);
+    const details = changes.length ? `Amended: ${changes.join('; ')}.` : 'Amended (no field changes detected).';
+    await logShipmentHistory(client, { shipmentId: existing.id, category, materialTypeId, action: 'amended', details, actor });
+
+    await client.query('COMMIT');
+    const resolvedUrl = await resolvePackingListUrl(row.packing_list_url);
+    res.json({ success: true, data: { ...row, material, packing_list_url: resolvedUrl } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('Outgoing/Sales shipment amend error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to amend shipment' });
+  } finally {
+    client.release();
+  }
+});
+
+router.get('/shipments/:id/history', async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT h.* FROM finished_goods_shipment_history h WHERE h.shipment_id = $1 ORDER BY h."createdAt" DESC`,
+      [req.params.id],
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    console.error('Shipment history error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to load shipment history' });
+  }
+});
+
+router.post('/shipments/:id/notes', async (req, res) => {
+  try {
+    const { note } = req.body || {};
+    if (!note || !String(note).trim()) {
+      return res.status(400).json({ success: false, message: 'Note text is required' });
+    }
+    const existing = await pool.query('SELECT category, material_type_id FROM finished_goods_shipments WHERE id = $1', [req.params.id]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Shipment not found' });
+    }
+    const actor = actorName(req);
+    await logShipmentHistory(pool, {
+      shipmentId: req.params.id, category: existing.rows[0].category, materialTypeId: existing.rows[0].material_type_id,
+      action: 'note', details: String(note).trim(), actor,
+    });
+    res.status(201).json({ success: true, message: 'Note added' });
+  } catch (err) {
+    console.error('Shipment note error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to add note' });
+  }
+});
+
+router.delete('/shipments/:id', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const existingRes = await client.query(
+      `SELECT s.*, mt.name AS material FROM finished_goods_shipments s
+       JOIN material_types mt ON mt.id = s.material_type_id WHERE s.id = $1`,
+      [req.params.id],
+    );
+    if (existingRes.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Shipment not found' });
+    }
+    const existing = existingRes.rows[0];
+    const actor = actorName(req);
+
+    await client.query('BEGIN');
+    await logShipmentHistory(client, {
+      shipmentId: existing.id, category: existing.category, materialTypeId: existing.material_type_id, action: 'deleted', actor,
+      details: `${fmtKg(existing.weight_kg)} ${existing.material} shipment${existing.customer ? ` to ${existing.customer}` : ''} deleted — stock restored.`,
+    });
+    await client.query('DELETE FROM finished_goods_shipments WHERE id = $1', [existing.id]);
+    await client.query('COMMIT');
     res.json({ success: true, message: 'Shipment deleted' });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('Outgoing/Sales shipment delete error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to delete shipment' });
+  } finally {
+    client.release();
   }
 });
 
