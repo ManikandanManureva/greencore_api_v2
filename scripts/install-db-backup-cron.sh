@@ -17,16 +17,19 @@ PG_DUMP_BIN="$(command -v pg_dump || true)"
 if [ -z "$NODE_BIN" ]; then echo "node not found on PATH — run this as the user that runs the API (root)"; exit 1; fi
 if [ -z "$PG_DUMP_BIN" ]; then echo "pg_dump not found — install the PostgreSQL client tools first"; exit 1; fi
 
-# cron is not installed by default on Amazon Linux 2023.
-if ! command -v crond >/dev/null 2>&1 && ! command -v cron >/dev/null 2>&1; then
-  echo "==> Installing cron..."
-  (dnf install -y cronie || yum install -y cronie || apt-get install -y cron)
-fi
-if systemctl list-unit-files | grep -q '^crond\.service'; then
-  systemctl enable --now crond
+# The scheduler service is "crond" on Amazon Linux / RHEL and "cron" on Ubuntu; Amazon Linux 2023
+# doesn't ship it, so install cronie when neither exists. (Checked with `systemctl cat`, not a
+# `list-unit-files | grep -q` pipe, which fails under pipefail.)
+if systemctl cat crond.service >/dev/null 2>&1; then
+  CRON_SERVICE=crond
+elif systemctl cat cron.service >/dev/null 2>&1; then
+  CRON_SERVICE=cron
 else
-  systemctl enable --now cron
+  echo "==> Installing cron..."
+  dnf install -y cronie || yum install -y cronie
+  CRON_SERVICE=crond
 fi
+systemctl enable --now "$CRON_SERVICE"
 
 cat > "$CRON_FILE" <<EOF
 # Greencore: nightly database backup to S3 (keeps 7 days). Installed by scripts/install-db-backup-cron.sh
