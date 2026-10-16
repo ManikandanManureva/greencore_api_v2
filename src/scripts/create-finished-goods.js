@@ -34,12 +34,15 @@ async function run() {
         dn_no              VARCHAR(60),
         notes              TEXT,
         packing_list_url   TEXT,
+        category           VARCHAR(20) NOT NULL DEFAULT 'finished_goods'
+                             CHECK (category IN ('finished_goods', 'flakes', 'by_products')),
         "createdBy"        VARCHAR(120),
         "createdAt"        TIMESTAMPTZ DEFAULT NOW()
       )
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_fg_shipments_material ON finished_goods_shipments (material_type_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_fg_shipments_date ON finished_goods_shipments (shipment_date)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_fg_shipments_category ON finished_goods_shipments (category)`);
 
     await client.query('COMMIT');
     console.log('✅ Finished Goods tables ensured.');

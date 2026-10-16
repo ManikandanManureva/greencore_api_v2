@@ -49,45 +49,49 @@ async function persistPackingList(req, buffer, mimetype, originalname) {
 }
 
 /**
- * Finished Goods — Outgoing / Sales. Quantities only, no pricing.
- *
- * Available stock is computed live from production_logs, not stored:
- *   produced  = Completed bags at the material's finishing station(s) (see FINISHING_STATIONS),
- *               excluding any bag later consumed as input to a further production step so a
- *               re-processed bag (e.g. Extrusion -> Packing) is only counted once.
- *   shipped   = SUM(weight_kg) from finished_goods_shipments for that material.
- *   available = produced - shipped.
+ * Outgoing / Sales — three categories sharing one shipments table (finished_goods_shipments.category):
+ *   finished_goods — finished pellets. Produced = Completed, unconsumed output at the material's
+ *                     finishing station(s) (Extrusion and/or Packing — see CATEGORY_STATIONS).
+ *   flakes         — Produced = Completed, unconsumed output at the Washing station.
+ *   by_products    — Produced = SUM(weight) already logged per shift in by_product_logs (the
+ *                     per-station by-products collection that already exists) — no lineage
+ *                     exclusion, since by-products aren't re-processed as input to another step.
+ * Quantities only — no pricing.
  */
 const ALLOWED_ROLES = ['ppic', 'super_admin', 'admin'];
+const CATEGORIES = ['finished_goods', 'flakes', 'by_products'];
+const MATERIALS = ['PC', 'PE', 'PET'];
 
 function requireRole(req, res, next) {
   const role = String(req.user && req.user.role ? req.user.role : '').toLowerCase();
   if (!ALLOWED_ROLES.includes(role)) {
-    return res.status(403).json({ success: false, message: 'Not authorized to access Finished Goods' });
+    return res.status(403).json({ success: false, message: 'Not authorized to access Outgoing / Sales' });
   }
   next();
 }
 
 router.use(authenticateToken, requireRole);
 
-// Material -> station codes whose Completed, unconsumed output counts as finished goods.
-const FINISHING_STATIONS = {
-  PC: ['EXT', 'PKG'],
-  PE: ['EXT'],
-  PET: ['EXT', 'PKG'],
-};
+function parseCategory(value) {
+  return CATEGORIES.includes(value) ? value : 'finished_goods';
+}
 
 function actorName(req) {
   return (req.user && (req.user.name || req.user.employeeId)) || null;
 }
 
-function finishingStationsSql(paramsOffset) {
-  // Builds "(mt.name = $n AND s.code = ANY($n+1)) OR ..." across every material in FINISHING_STATIONS,
-  // so the whole rule lives in one place (the map above) instead of being duplicated per query.
+// Material -> station codes whose Completed, unconsumed output counts as produced stock,
+// per category. by_products has no entry here — it's computed from by_product_logs instead.
+const CATEGORY_STATIONS = {
+  finished_goods: { PC: ['EXT', 'PKG'], PE: ['EXT'], PET: ['EXT', 'PKG'] },
+  flakes: { PC: ['WSH'], PE: ['WSH'], PET: ['WSH'] },
+};
+
+function stationsSql(stationMap, paramsOffset) {
   const clauses = [];
   const params = [];
   let i = paramsOffset;
-  for (const [material, codes] of Object.entries(FINISHING_STATIONS)) {
+  for (const [material, codes] of Object.entries(stationMap)) {
     params.push(material, codes);
     clauses.push(`(mt.name = $${i + 1} AND s.code = ANY($${i + 2}))`);
     i += 2;
@@ -95,8 +99,8 @@ function finishingStationsSql(paramsOffset) {
   return { sql: clauses.join(' OR '), params };
 }
 
-async function producedByMaterial(client) {
-  const { sql, params } = finishingStationsSql(0);
+async function producedByStation(client, stationMap) {
+  const { sql, params } = stationsSql(stationMap, 0);
   const r = await client.query(
     `SELECT mt.name AS material, COALESCE(SUM(pl.weight), 0)::numeric AS produced_weight, COUNT(*)::int AS bag_count
      FROM production_logs pl
@@ -114,20 +118,39 @@ async function producedByMaterial(client) {
   return r.rows;
 }
 
-// ─── Summary — Produced / Shipped / Available per material ────────────────────
+async function producedByProduct(client) {
+  const r = await client.query(
+    `SELECT mt.name AS material, COALESCE(SUM(b.weight), 0)::numeric AS produced_weight, COUNT(*)::int AS bag_count
+     FROM by_product_logs b
+     JOIN operator_shifts os ON os.id = b.shift_id
+     JOIN material_types mt ON mt.id = os.material_type_id
+     GROUP BY mt.name`,
+  );
+  return r.rows;
+}
+
+async function producedByMaterial(client, category) {
+  if (category === 'by_products') return producedByProduct(client);
+  return producedByStation(client, CATEGORY_STATIONS[category]);
+}
+
+// ─── Summary — Produced / Shipped / Available per material, for one category ──
 router.get('/summary', async (req, res) => {
   try {
-    const produced = await producedByMaterial(pool);
+    const category = parseCategory(req.query.category);
+    const produced = await producedByMaterial(pool, category);
     const shipped = await pool.query(
       `SELECT mt.name AS material, COALESCE(SUM(s.weight_kg), 0)::numeric AS shipped_weight
        FROM finished_goods_shipments s
        JOIN material_types mt ON mt.id = s.material_type_id
+       WHERE s.category = $1
        GROUP BY mt.name`,
+      [category],
     );
     const producedMap = Object.fromEntries(produced.map((r) => [r.material, r]));
     const shippedMap = Object.fromEntries(shipped.rows.map((r) => [r.material, Number(r.shipped_weight)]));
 
-    const data = Object.keys(FINISHING_STATIONS).map((material) => {
+    const data = MATERIALS.map((material) => {
       const producedWeight = Number(producedMap[material]?.produced_weight || 0);
       const shippedWeight = shippedMap[material] || 0;
       return {
@@ -140,8 +163,8 @@ router.get('/summary', async (req, res) => {
     });
     res.json({ success: true, data });
   } catch (err) {
-    console.error('Finished goods summary error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to load finished goods summary' });
+    console.error('Outgoing/Sales summary error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to load summary' });
   }
 });
 
@@ -216,7 +239,7 @@ ${text.slice(0, 12000)}
     } catch {
       extracted = {};
     }
-    if (extracted.material && !['PC', 'PE', 'PET'].includes(extracted.material)) extracted.material = null;
+    if (extracted.material && !MATERIALS.includes(extracted.material)) extracted.material = null;
 
     const { stored, url } = await persistPackingList(req, req.file.buffer, req.file.mimetype, req.file.originalname);
 
@@ -230,10 +253,11 @@ ${text.slice(0, 12000)}
 // ─── Shipments (Outgoing / Sales) ──────────────────────────────────────────────
 router.get('/shipments', async (req, res) => {
   try {
+    const category = parseCategory(req.query.category);
     const { search, material, date_from, date_to } = req.query;
     const { page = 1, limit = 20 } = req.query;
-    const where = [];
-    const params = [];
+    const where = [`s.category = $1`];
+    const params = [category];
 
     if (material && material !== 'all') {
       params.push(material);
@@ -245,7 +269,7 @@ router.get('/shipments', async (req, res) => {
     }
     if (date_from) { params.push(date_from); where.push(`s.shipment_date >= $${params.length}`); }
     if (date_to) { params.push(date_to); where.push(`s.shipment_date <= $${params.length}`); }
-    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const whereSql = `WHERE ${where.join(' AND ')}`;
 
     const countRes = await pool.query(
       `SELECT COUNT(*)::int AS total FROM finished_goods_shipments s JOIN material_types mt ON mt.id = s.material_type_id ${whereSql}`,
@@ -270,7 +294,7 @@ router.get('/shipments', async (req, res) => {
       total, totalPages: Math.max(1, Math.ceil(total / parseInt(limit))),
     });
   } catch (err) {
-    console.error('Finished goods shipments list error:', err.message);
+    console.error('Outgoing/Sales shipments list error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to load shipments' });
   }
 });
@@ -279,8 +303,9 @@ router.post('/shipments', async (req, res) => {
   const client = await pool.connect();
   try {
     const { material, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url } = req.body || {};
+    const category = parseCategory(req.body.category);
     const shipment_date = req.body.shipment_date || null;
-    if (!material || !FINISHING_STATIONS[material]) {
+    if (!material || !MATERIALS.includes(material)) {
       return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
     }
     const weightNum = Number(weight_kg);
@@ -297,31 +322,31 @@ router.post('/shipments', async (req, res) => {
     }
     const materialTypeId = mtRes.rows[0].id;
 
-    const produced = await producedByMaterial(client);
+    const produced = await producedByMaterial(client, category);
     const producedWeight = Number(produced.find((r) => r.material === material)?.produced_weight || 0);
     const shippedRes = await client.query(
-      'SELECT COALESCE(SUM(weight_kg), 0)::numeric AS n FROM finished_goods_shipments WHERE material_type_id = $1',
-      [materialTypeId],
+      'SELECT COALESCE(SUM(weight_kg), 0)::numeric AS n FROM finished_goods_shipments WHERE material_type_id = $1 AND category = $2',
+      [materialTypeId, category],
     );
     const availableWeight = producedWeight - Number(shippedRes.rows[0].n);
     if (weightNum > availableWeight) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ success: false, message: `Insufficient finished stock. Available: ${availableWeight.toFixed(2)} kg, Requested: ${weightNum} kg` });
+      return res.status(400).json({ success: false, message: `Insufficient stock. Available: ${availableWeight.toFixed(2)} kg, Requested: ${weightNum} kg` });
     }
 
     const r = await client.query(
       `INSERT INTO finished_goods_shipments
-         (shipment_date, material_type_id, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, "createdBy")
-       VALUES (COALESCE($1::date, CURRENT_DATE), $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         (shipment_date, material_type_id, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, category, "createdBy")
+       VALUES (COALESCE($1::date, CURRENT_DATE), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
-      [shipment_date, materialTypeId, weightNum, customer || null, destination || null, vehicle_no || null, dn_no || null, notes || null, normalizePackingListForStorage(packing_list_url) || null, actorName(req)],
+      [shipment_date, materialTypeId, weightNum, customer || null, destination || null, vehicle_no || null, dn_no || null, notes || null, normalizePackingListForStorage(packing_list_url) || null, category, actorName(req)],
     );
     await client.query('COMMIT');
     const resolvedUrl = await resolvePackingListUrl(r.rows[0].packing_list_url);
     res.status(201).json({ success: true, data: { ...r.rows[0], material, packing_list_url: resolvedUrl } });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
-    console.error('Finished goods shipment create error:', err.message);
+    console.error('Outgoing/Sales shipment create error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to record shipment' });
   } finally {
     client.release();
@@ -334,7 +359,7 @@ router.delete('/shipments/:id', async (req, res) => {
     if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'Shipment not found' });
     res.json({ success: true, message: 'Shipment deleted' });
   } catch (err) {
-    console.error('Finished goods shipment delete error:', err.message);
+    console.error('Outgoing/Sales shipment delete error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to delete shipment' });
   }
 });
