@@ -12,8 +12,8 @@ const { authenticateToken } = require('../middleware/auth');
  * view role; only PPIC (and admin/super_admin) can edit master fields (min/max, location,
  * category, etc.).
  */
-const MASTER_EDIT_ROLES = ['ppic', 'super_admin', 'admin'];
-const VIEW_ROLES = ['ppic', 'super_admin', 'admin', 'pet'];
+const MASTER_EDIT_ROLES = ['ppic', 'super_admin', 'admin', 'spare_parts_admin'];
+const VIEW_ROLES = ['ppic', 'super_admin', 'admin', 'pet', 'spare_parts_admin'];
 
 function requireView(req, res, next) {
   const role = String(req.user?.role || '').toLowerCase();
