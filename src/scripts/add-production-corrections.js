@@ -3,8 +3,10 @@
  *  - users.can_correct_production: lets a PPIC user delete a wrong bag, correct its line/output
  *    type or weight, and reopen a shift that was closed early by mistake.
  *  - production_corrections: audit trail of every such change (who, when, old and new values).
- *  - Ensures the YOGA login (role PPIC + the flag). The password is only set when the user is
+ *  - Ensures the YOGA_PROD login (role PPIC + the flag). The password is only set when the user is
  *    first created, so re-running never resets a changed password.
+ *  - An earlier version used the id YOGA; that id may belong to an existing account, so the flag
+ *    it may have granted there is taken back.
  * Additive and idempotent — safe to re-run; no existing rows are changed apart from the flag.
  *
  * Usage:
@@ -14,7 +16,8 @@ require('dotenv').config();
 const bcrypt = require('bcrypt');
 const pool = require('../config/database');
 
-const YOGA_EMPLOYEE_ID = 'YOGA';
+const YOGA_EMPLOYEE_ID = 'YOGA_PROD';
+const EARLIER_EMPLOYEE_ID = 'YOGA';
 const YOGA_NAME = 'Yoga';
 const YOGA_INITIAL_PASSWORD = 'password123';
 
@@ -49,8 +52,14 @@ async function run() {
        RETURNING (xmax = 0) AS created`,
       [YOGA_EMPLOYEE_ID, hashed, YOGA_NAME],
     );
+    const revoked = await client.query(
+      `UPDATE users SET can_correct_production = false
+       WHERE employee_id = $1 AND can_correct_production = true`,
+      [EARLIER_EMPLOYEE_ID],
+    );
     await client.query('COMMIT');
     console.log('✅ users.can_correct_production + production_corrections ensured.');
+    if (revoked.rowCount > 0) console.log(`✅ Correction access removed from ${EARLIER_EMPLOYEE_ID} (now ${YOGA_EMPLOYEE_ID}).`);
     console.log(
       r.rows[0].created
         ? `✅ Login created — Employee ID: ${YOGA_EMPLOYEE_ID}, password: ${YOGA_INITIAL_PASSWORD}`
