@@ -454,13 +454,13 @@ router.get('/:catalogKey/outgoing/summary', async (req, res) => {
 
     const r = await pool.query(
       `SELECT date_trunc('${trunc}', l.log_date)::date AS period,
+              p.part_no, p.description,
               COALESCE(SUM(ABS(l.qty)), 0)::numeric AS total_qty,
-              COUNT(*)::int AS transaction_count,
-              COUNT(DISTINCT l.item_id)::int AS part_count
+              COUNT(*)::int AS transaction_count
        FROM spare_parts_log l JOIN spare_parts_items p ON p.id = l.item_id
        ${whereSql}
-       GROUP BY period
-       ORDER BY period DESC`,
+       GROUP BY period, p.part_no, p.description
+       ORDER BY period DESC, p.part_no ASC`,
       params,
     );
     res.json({ success: true, data: r.rows, group: trunc });
