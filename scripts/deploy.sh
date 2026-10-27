@@ -29,6 +29,32 @@ node src/scripts/add-raw-material-region.js
 node src/scripts/add-raw-material-pe-grade-weights.js
 node src/scripts/add-production-corrections.js
 
+# Spare Parts
+node src/scripts/create-spareparts-v2.js
+node src/scripts/create-spareparts-admin-user.js
+
+# Finished Goods / Outgoing-Sales (Finished Goods, Flakes, By Products)
+node src/scripts/create-finished-goods.js
+node src/scripts/add-finished-goods-category-column.js
+node src/scripts/add-finished-goods-packing-list-column.js
+node src/scripts/create-finished-goods-opening-stock.js
+node src/scripts/create-finished-goods-history.js
+
+# QC Lab
+node src/scripts/create-qc-lab.js
+node src/scripts/create-qc-lab-user.js
+node src/scripts/add-qc-lab-photo-column.js
+
+# One-time data loads below are NOT run here — they're safe to re-run (they skip if data
+# already exists) but are listed separately since they're one-off imports, not schema setup:
+#   node src/scripts/seed-spareparts.js                     (initial spare parts catalog)
+#   node src/scripts/migrate-spareparts-v2.js                (v1 -> v2 schema data migration)
+#   node src/scripts/merge-pcpe-spareparts.js                (merged PC+PE catalogs)
+#   node src/scripts/refresh-starlinger-and-boretech.js      (refreshed PET spare parts data)
+#   node src/scripts/remove-duplicate-sp-mec-items.js        (one-time duplicate cleanup)
+#   node src/scripts/import-qc-lab-history.js                (668 historical QC Lab samples)
+# Run any of these by hand only if this server has never had that data loaded.
+
 echo "==> Restarting app under PM2..."
 # The running PM2 process on this box is named "server" (not "greencore-api" as its
 # ecosystem.config.cjs name would suggest — it was started directly, not via that file).
