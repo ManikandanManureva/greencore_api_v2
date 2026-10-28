@@ -362,6 +362,66 @@ router.get('/bags/scan', async (req, res) => {
   }
 });
 
+// One REF/DN often covers 20-30 bags — pasting a whole list (copied straight from a packing
+// sheet) is validated in one round trip instead of the user adding each bag one at a time.
+router.post('/bags/bulk-check', async (req, res) => {
+  try {
+    const { material, codes } = req.body || {};
+    if (!material || !MATERIALS.includes(material)) {
+      return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
+    }
+    if (!Array.isArray(codes) || codes.length === 0) {
+      return res.status(400).json({ success: false, message: 'codes must be a non-empty array' });
+    }
+    const trimmed = [...new Set(codes.map((c) => String(c).trim()).filter(Boolean))];
+    const results = [];
+    for (const code of trimmed.slice(0, 200)) {
+      const bag = await findAvailableBag(pool, material, code);
+      results.push(bag
+        ? { code, ok: true, bag_qr: bag.bag_qr, weight_kg: Number(bag.weight_kg) }
+        : { code, ok: false, reason: 'Not available — check it exists, is Completed, matches the material, and isn\'t already shipped.' });
+    }
+    res.json({ success: true, data: results });
+  } catch (err) {
+    console.error('Bag bulk-check error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to check jumbo bags' });
+  }
+});
+
+// Walks the production chain backward from a Finished Goods bag through every re-process step
+// (e.g. Packing <- Extrusion <- Washing <- Crusher) via the single-parent input_bag_qr link each
+// production_logs row carries, surfacing the batch/process trail that bag came from.
+router.get('/bags/:bagQr/lineage', async (req, res) => {
+  try {
+    const bagQr = String(req.params.bagQr).trim();
+    const r = await pool.query(
+      `WITH RECURSIVE chain AS (
+         SELECT pl.id, pl.output_bag_qr, pl.input_bag_qr, pl.station_id, pl.weight::numeric AS weight,
+                pl.status, pl.created_at, pl.pet_batch_no, pl.sub_line, pl.remark, pl.dn_no, 1 AS depth
+         FROM production_logs pl
+         WHERE pl.output_bag_qr = $1
+         UNION ALL
+         SELECT pl2.id, pl2.output_bag_qr, pl2.input_bag_qr, pl2.station_id, pl2.weight::numeric AS weight,
+                pl2.status, pl2.created_at, pl2.pet_batch_no, pl2.sub_line, pl2.remark, pl2.dn_no, chain.depth + 1
+         FROM production_logs pl2
+         JOIN chain ON pl2.output_bag_qr = chain.input_bag_qr
+         WHERE chain.input_bag_qr IS NOT NULL AND chain.input_bag_qr <> '' AND chain.depth < 25
+       )
+       SELECT chain.*, s.name AS station_name, s.code AS station_code
+       FROM chain JOIN stations s ON s.id = chain.station_id
+       ORDER BY chain.depth ASC`,
+      [bagQr],
+    );
+    if (r.rows.length === 0) {
+      return res.status(404).json({ success: false, message: `No production record found for bag "${bagQr}"` });
+    }
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    console.error('Bag lineage error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to load this bag\'s process history' });
+  }
+});
+
 router.get('/shipments/:id/bags', async (req, res) => {
   try {
     const r = await pool.query(
