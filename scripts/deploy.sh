@@ -40,6 +40,7 @@ node src/scripts/add-finished-goods-packing-list-column.js
 node src/scripts/create-finished-goods-opening-stock.js
 node src/scripts/create-finished-goods-history.js
 node src/scripts/add-finished-goods-pet-type.js
+node src/scripts/create-finished-goods-shipment-bags.js
 
 # QC Lab
 node src/scripts/create-qc-lab.js

@@ -232,6 +232,149 @@ async function logOpeningStockHistory(client, { category, materialTypeId, petTyp
   );
 }
 
+// ─── Jumbo bags (Finished Goods only) ──────────────────────────────────────────
+// A Finished Goods shipment is made up of many individual jumbo bags, each one a row already
+// recorded in production_logs (Completed, unconsumed output at a finishing station). Rather than
+// typing a total weight, the user picks/scans the exact bags shipped; the shipment's weight is
+// the sum of its bags' own recorded weight. A bag is "available" once: it's Completed at the
+// material's finishing station, wasn't later consumed as input to a further step, and isn't
+// already linked to another shipment.
+async function findAvailableBag(client, material, bagQr) {
+  const codes = CATEGORY_STATIONS.finished_goods[material];
+  if (!codes) return null;
+  const r = await client.query(
+    `SELECT pl.id AS production_log_id, pl.output_bag_qr AS bag_qr, pl.weight::numeric AS weight_kg
+     FROM production_logs pl
+     JOIN stations s ON s.id = pl.station_id
+     JOIN material_types mt ON mt.id = pl.material_type_id
+     WHERE pl.status = 'Completed'
+       AND mt.name = $1
+       AND s.code = ANY($2)
+       AND pl.output_bag_qr = $3
+       AND NOT EXISTS (
+         SELECT 1 FROM production_logs px
+         WHERE px.input_bag_qr = pl.output_bag_qr AND px.input_bag_qr IS NOT NULL AND px.input_bag_qr <> ''
+       )
+       AND NOT EXISTS (SELECT 1 FROM finished_goods_shipment_bags b WHERE b.bag_qr = pl.output_bag_qr)
+     LIMIT 1`,
+    [material, codes, bagQr],
+  );
+  return r.rows[0] || null;
+}
+
+async function searchAvailableBags(client, material, query) {
+  const codes = CATEGORY_STATIONS.finished_goods[material];
+  if (!codes) return [];
+  const params = [material, codes];
+  let extra = '';
+  if (query) { params.push(`%${query}%`); extra = `AND pl.output_bag_qr ILIKE $${params.length}`; }
+  const r = await client.query(
+    `SELECT pl.output_bag_qr AS bag_qr, pl.weight::numeric AS weight_kg
+     FROM production_logs pl
+     JOIN stations s ON s.id = pl.station_id
+     JOIN material_types mt ON mt.id = pl.material_type_id
+     WHERE pl.status = 'Completed'
+       AND mt.name = $1 AND s.code = ANY($2)
+       AND pl.output_bag_qr IS NOT NULL AND pl.output_bag_qr <> ''
+       ${extra}
+       AND NOT EXISTS (
+         SELECT 1 FROM production_logs px
+         WHERE px.input_bag_qr = pl.output_bag_qr AND px.input_bag_qr IS NOT NULL AND px.input_bag_qr <> ''
+       )
+       AND NOT EXISTS (SELECT 1 FROM finished_goods_shipment_bags b WHERE b.bag_qr = pl.output_bag_qr)
+     ORDER BY pl.created_at DESC
+     LIMIT 20`,
+    params,
+  );
+  return r.rows;
+}
+
+// Validates every bag in the list is available right now, rejects duplicates, and sums their
+// weight — this sum becomes the shipment's weight_kg (never a manually typed figure).
+async function validateAndSumBags(client, material, bagQrList) {
+  if (!Array.isArray(bagQrList) || bagQrList.length === 0) {
+    const err = new Error('Add at least one jumbo bag for a Finished Goods shipment.');
+    err.status = 400;
+    throw err;
+  }
+  const trimmed = bagQrList.map((b) => String(b).trim()).filter(Boolean);
+  const unique = [...new Set(trimmed)];
+  if (unique.length !== trimmed.length) {
+    const err = new Error('The same jumbo bag was entered twice — each bag can only be added once.');
+    err.status = 400;
+    throw err;
+  }
+  const bags = [];
+  for (const bagQr of unique) {
+    const found = await findAvailableBag(client, material, bagQr);
+    if (!found) {
+      const err = new Error(`Jumbo bag "${bagQr}" isn't available — check it exists, is marked Completed, matches ${material}, and isn't already in another shipment.`);
+      err.status = 400;
+      throw err;
+    }
+    bags.push(found);
+  }
+  const totalWeight = bags.reduce((sum, b) => sum + Number(b.weight_kg), 0);
+  return { bags, totalWeight };
+}
+
+async function linkShipmentBags(client, shipmentId, bags) {
+  for (const bag of bags) {
+    await client.query(
+      `INSERT INTO finished_goods_shipment_bags (shipment_id, bag_qr, weight_kg, production_log_id)
+       VALUES ($1, $2, $3, $4)`,
+      [shipmentId, bag.bag_qr, bag.weight_kg, bag.production_log_id],
+    );
+  }
+}
+
+router.get('/bags/search', async (req, res) => {
+  try {
+    const { material, q } = req.query;
+    if (!material || !MATERIALS.includes(material)) {
+      return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
+    }
+    const rows = await searchAvailableBags(pool, material, q ? String(q).trim() : '');
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error('Bag search error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to search jumbo bags' });
+  }
+});
+
+router.get('/bags/scan', async (req, res) => {
+  try {
+    const { material, code } = req.query;
+    if (!material || !MATERIALS.includes(material)) {
+      return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
+    }
+    if (!code || !String(code).trim()) {
+      return res.status(400).json({ success: false, message: 'No code scanned' });
+    }
+    const bag = await findAvailableBag(pool, material, String(code).trim());
+    if (!bag) {
+      return res.status(404).json({ success: false, message: `Bag "${code}" isn't available for ${material} — check it's Completed and not already shipped.` });
+    }
+    res.json({ success: true, data: bag });
+  } catch (err) {
+    console.error('Bag scan error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to look up scanned bag' });
+  }
+});
+
+router.get('/shipments/:id/bags', async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT bag_qr, weight_kg::numeric AS weight_kg FROM finished_goods_shipment_bags WHERE shipment_id = $1 ORDER BY bag_qr`,
+      [req.params.id],
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    console.error('Shipment bags error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to load jumbo bags for this shipment' });
+  }
+});
+
 // ─── Opening Stock — one-time go-live balance per category + material ─────────
 router.get('/opening-stock', async (req, res) => {
   try {
@@ -505,7 +648,8 @@ router.get('/shipments', async (req, res) => {
     const offset = (parseInt(page) - 1) * parseInt(limit);
     const listParams = [...params, parseInt(limit), offset];
     const rowsRes = await pool.query(
-      `SELECT s.*, mt.name AS material
+      `SELECT s.*, mt.name AS material,
+              (SELECT COUNT(*)::int FROM finished_goods_shipment_bags b WHERE b.shipment_id = s.id) AS bag_count
        FROM finished_goods_shipments s JOIN material_types mt ON mt.id = s.material_type_id
        ${whereSql}
        ORDER BY s.shipment_date DESC, s.id DESC
@@ -529,7 +673,7 @@ router.get('/shipments', async (req, res) => {
 router.post('/shipments', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { material, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url } = req.body || {};
+    const { material, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, bags } = req.body || {};
     const category = parseCategory(req.body.category);
     const shipment_date = req.body.shipment_date || null;
     if (!material || !MATERIALS.includes(material)) {
@@ -539,12 +683,24 @@ router.post('/shipments', async (req, res) => {
     if (petType === null) {
       return res.status(400).json({ success: false, message: 'pet_type must be "Bottle" or "Gallon" for PET' });
     }
-    const weightNum = Number(weight_kg);
-    if (!Number.isFinite(weightNum) || weightNum <= 0) {
-      return res.status(400).json({ success: false, message: 'weight_kg must be a positive number' });
-    }
 
     await client.query('BEGIN');
+
+    // Finished Goods is tracked bag-by-bag: the user picks/scans the physical jumbo bags
+    // shipped, and the shipment's weight is the sum of those bags — never a typed-in figure.
+    let weightNum;
+    let bagsToLink = null;
+    if (category === 'finished_goods') {
+      const { bags: validatedBags, totalWeight } = await validateAndSumBags(client, material, bags);
+      weightNum = totalWeight;
+      bagsToLink = validatedBags;
+    } else {
+      weightNum = Number(weight_kg);
+      if (!Number.isFinite(weightNum) || weightNum <= 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'weight_kg must be a positive number' });
+      }
+    }
 
     const mtRes = await client.query('SELECT id FROM material_types WHERE name = $1', [material]);
     if (mtRes.rows.length === 0) {
@@ -577,15 +733,20 @@ router.post('/shipments', async (req, res) => {
       [shipment_date, materialTypeId, petType, weightNum, customer || null, destination || null, vehicle_no || null, dn_no || null, notes || null, normalizePackingListForStorage(packing_list_url) || null, category, actor],
     );
     const row = r.rows[0];
+    if (bagsToLink) await linkShipmentBags(client, row.id, bagsToLink);
+    const bagDetail = bagsToLink ? ` across ${bagsToLink.length} jumbo bag${bagsToLink.length === 1 ? '' : 's'}` : '';
     await logShipmentHistory(client, {
       shipmentId: row.id, category, materialTypeId, petType, action: 'created', actor,
-      details: `${fmtKg(weightNum)} ${label} recorded${customer ? ` for ${customer}` : ''}${dn_no ? ` (DN ${dn_no})` : ''}.`,
+      details: `${fmtKg(weightNum)} ${label} recorded${bagDetail}${customer ? ` for ${customer}` : ''}${dn_no ? ` (DN ${dn_no})` : ''}.`,
     });
     await client.query('COMMIT');
     const resolvedUrl = await resolvePackingListUrl(row.packing_list_url);
     res.status(201).json({ success: true, data: { ...row, material, packing_list_url: resolvedUrl } });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
+    if (err.status === 400) {
+      return res.status(400).json({ success: false, message: err.message });
+    }
     console.error('Outgoing/Sales shipment create error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to record shipment' });
   } finally {
@@ -607,7 +768,7 @@ router.put('/shipments/:id', async (req, res) => {
     const existing = existingRes.rows[0];
     const category = existing.category;
 
-    const { material, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url } = req.body || {};
+    const { material, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, bags } = req.body || {};
     const shipment_date = req.body.shipment_date || existing.shipment_date;
     if (!material || !MATERIALS.includes(material)) {
       return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
@@ -616,12 +777,30 @@ router.put('/shipments/:id', async (req, res) => {
     if (petType === null) {
       return res.status(400).json({ success: false, message: 'pet_type must be "Bottle" or "Gallon" for PET' });
     }
-    const weightNum = Number(weight_kg);
-    if (!Number.isFinite(weightNum) || weightNum <= 0) {
-      return res.status(400).json({ success: false, message: 'weight_kg must be a positive number' });
-    }
 
     await client.query('BEGIN');
+
+    // Free this shipment's currently-linked bags first, so re-saving the same bags (or a mix of
+    // kept + new ones) validates against availability correctly instead of seeing them as taken.
+    let weightNum;
+    let bagsToLink = null;
+    let bagCountChanged = false;
+    if (category === 'finished_goods') {
+      const prevBags = await client.query('SELECT bag_qr FROM finished_goods_shipment_bags WHERE shipment_id = $1', [existing.id]);
+      await client.query('DELETE FROM finished_goods_shipment_bags WHERE shipment_id = $1', [existing.id]);
+      const { bags: validatedBags, totalWeight } = await validateAndSumBags(client, material, bags);
+      weightNum = totalWeight;
+      bagsToLink = validatedBags;
+      const prevSet = new Set(prevBags.rows.map((r) => r.bag_qr));
+      const nextSet = new Set(validatedBags.map((b) => b.bag_qr));
+      bagCountChanged = prevSet.size !== nextSet.size || [...prevSet].some((q) => !nextSet.has(q));
+    } else {
+      weightNum = Number(weight_kg);
+      if (!Number.isFinite(weightNum) || weightNum <= 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'weight_kg must be a positive number' });
+      }
+    }
 
     const mtRes = await client.query('SELECT id FROM material_types WHERE name = $1', [material]);
     if (mtRes.rows.length === 0) {
@@ -657,12 +836,14 @@ router.put('/shipments/:id', async (req, res) => {
         normalizePackingListForStorage(packing_list_url) || existing.packing_list_url, existing.id],
     );
     const row = r.rows[0];
+    if (bagsToLink) await linkShipmentBags(client, existing.id, bagsToLink);
 
     const existingLabel = existing.material === 'PET' ? `PET (${existing.pet_type})` : existing.material;
     const newLabel = material === 'PET' ? `PET (${petType})` : material;
     const changes = [];
     if (Number(existing.weight_kg) !== weightNum) changes.push(`weight ${fmtKg(existing.weight_kg)} → ${fmtKg(weightNum)}`);
     if (existingLabel !== newLabel) changes.push(`material ${existingLabel} → ${newLabel}`);
+    if (bagCountChanged) changes.push(`jumbo bags updated (${bagsToLink.length} bag${bagsToLink.length === 1 ? '' : 's'})`);
     if ((existing.customer || '') !== (customer || '')) changes.push(`customer "${existing.customer || '—'}" → "${customer || '—'}"`);
     if ((existing.destination || '') !== (destination || '')) changes.push(`destination "${existing.destination || '—'}" → "${destination || '—'}"`);
     if ((existing.dn_no || '') !== (dn_no || '')) changes.push(`DN no. "${existing.dn_no || '—'}" → "${dn_no || '—'}"`);
@@ -675,6 +856,9 @@ router.put('/shipments/:id', async (req, res) => {
     res.json({ success: true, data: { ...row, material, packing_list_url: resolvedUrl } });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
+    if (err.status === 400) {
+      return res.status(400).json({ success: false, message: err.message });
+    }
     console.error('Outgoing/Sales shipment amend error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to amend shipment' });
   } finally {
