@@ -462,6 +462,49 @@ router.get('/bag-refs/search', async (req, res) => {
   }
 });
 
+// Full list for the standalone "Bag REF Lists" management page (vs. /search, used by the
+// shipment picker's quick autocomplete).
+router.get('/bag-refs', async (req, res) => {
+  try {
+    const { material, q } = req.query;
+    const where = [];
+    const params = [];
+    if (material && MATERIALS.includes(material)) {
+      params.push(material);
+      where.push(`mt.name = $${params.length}`);
+    }
+    if (q && String(q).trim()) {
+      params.push(`%${String(q).trim()}%`);
+      where.push(`r.ref_no ILIKE $${params.length}`);
+    }
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const r = await pool.query(
+      `SELECT r.id, r.ref_no, r.bag_count, r.weight_kg::numeric AS weight_kg, r."createdAt", r."createdBy", mt.name AS material
+       FROM finished_goods_bag_refs r
+       JOIN material_types mt ON mt.id = r.material_type_id
+       ${whereSql}
+       ORDER BY r."createdAt" DESC
+       LIMIT 200`,
+      params,
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    console.error('Bag ref list error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to load REF bag lists' });
+  }
+});
+
+router.delete('/bag-refs/:id', async (req, res) => {
+  try {
+    const r = await pool.query('DELETE FROM finished_goods_bag_refs WHERE id = $1 RETURNING id', [req.params.id]);
+    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'REF not found' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Bag ref delete error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to delete this REF' });
+  }
+});
+
 router.get('/bag-refs/:id/bags', async (req, res) => {
   try {
     const refRes = await pool.query(
