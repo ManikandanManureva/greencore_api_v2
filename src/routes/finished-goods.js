@@ -388,6 +388,105 @@ router.post('/bags/bulk-check', async (req, res) => {
   }
 });
 
+// ─── Bag Refs (Finished Goods only) ────────────────────────────────────────────
+// One REF/DN number (e.g. "2026255") often covers 10-30 jumbo bags. Rather than re-pasting that
+// same bag list every time a shipment references it, the user builds the list once under the
+// REF number here, then Record/Amend Shipment just picks the REF and the bags come along.
+router.post('/bag-refs', async (req, res) => {
+  try {
+    const { material, ref_no, codes } = req.body || {};
+    if (!material || !MATERIALS.includes(material)) {
+      return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
+    }
+    const refNo = String(ref_no || '').trim();
+    if (!refNo) return res.status(400).json({ success: false, message: 'REF / DN number is required' });
+    if (!Array.isArray(codes) || codes.length === 0) {
+      return res.status(400).json({ success: false, message: 'codes must be a non-empty array' });
+    }
+    const trimmed = [...new Set(codes.map((c) => String(c).trim()).filter(Boolean))];
+    const ok = [];
+    const bad = [];
+    for (const code of trimmed.slice(0, 200)) {
+      const bag = await findAvailableBag(pool, material, code);
+      if (bag) ok.push({ bag_qr: bag.bag_qr, weight_kg: Number(bag.weight_kg) });
+      else bad.push({ code, reason: 'Not available — check it exists, is Completed, matches the material, and isn\'t already shipped.' });
+    }
+    if (ok.length === 0) {
+      return res.status(400).json({ success: false, message: 'None of those bag codes are available right now.', data: { ok, bad } });
+    }
+    const mtRes = await pool.query('SELECT id FROM material_types WHERE name = $1', [material]);
+    if (mtRes.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Unknown material type' });
+    }
+    const materialTypeId = mtRes.rows[0].id;
+    const weightKg = ok.reduce((sum, b) => sum + b.weight_kg, 0);
+    const actor = actorName(req);
+    const r = await pool.query(
+      `INSERT INTO finished_goods_bag_refs (material_type_id, ref_no, bags, bag_count, weight_kg, "createdBy")
+       VALUES ($1, $2, $3::jsonb, $4, $5, $6)
+       ON CONFLICT (material_type_id, ref_no)
+       DO UPDATE SET bags = $3::jsonb, bag_count = $4, weight_kg = $5, "updatedAt" = NOW()
+       RETURNING id, ref_no, bag_count, weight_kg`,
+      [materialTypeId, refNo, JSON.stringify(ok), ok.length, weightKg, actor],
+    );
+    res.json({ success: true, data: { ...r.rows[0], bags: ok, bad } });
+  } catch (err) {
+    console.error('Bag ref save error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to save REF bag list' });
+  }
+});
+
+router.get('/bag-refs/search', async (req, res) => {
+  try {
+    const { material, q } = req.query;
+    if (!material || !MATERIALS.includes(material)) {
+      return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
+    }
+    const mtRes = await pool.query('SELECT id FROM material_types WHERE name = $1', [material]);
+    if (mtRes.rows.length === 0) return res.json({ success: true, data: [] });
+    const params = [mtRes.rows[0].id];
+    let extra = '';
+    if (q && String(q).trim()) { params.push(`%${String(q).trim()}%`); extra = `AND ref_no ILIKE $${params.length}`; }
+    const r = await pool.query(
+      `SELECT id, ref_no, bag_count, weight_kg::numeric AS weight_kg, "createdAt"
+       FROM finished_goods_bag_refs
+       WHERE material_type_id = $1 ${extra}
+       ORDER BY "createdAt" DESC
+       LIMIT 20`,
+      params,
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    console.error('Bag ref search error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to search REF numbers' });
+  }
+});
+
+router.get('/bag-refs/:id/bags', async (req, res) => {
+  try {
+    const refRes = await pool.query(
+      `SELECT r.*, mt.name AS material FROM finished_goods_bag_refs r
+       JOIN material_types mt ON mt.id = r.material_type_id WHERE r.id = $1`,
+      [req.params.id],
+    );
+    if (refRes.rows.length === 0) return res.status(404).json({ success: false, message: 'REF not found' });
+    const ref = refRes.rows[0];
+    // Re-check each bag is still available — some may have shipped under a different REF since
+    // this list was saved, so we only hand back the ones still usable right now.
+    const available = [];
+    const dropped = [];
+    for (const b of ref.bags || []) {
+      const found = await findAvailableBag(pool, ref.material, b.bag_qr);
+      if (found) available.push({ bag_qr: found.bag_qr, weight_kg: Number(found.weight_kg) });
+      else dropped.push(b.bag_qr);
+    }
+    res.json({ success: true, data: { ref_no: ref.ref_no, material: ref.material, bags: available, dropped } });
+  } catch (err) {
+    console.error('Bag ref bags error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to load bags for this REF' });
+  }
+});
+
 // Walks the production chain backward from a Finished Goods bag through every re-process step
 // (e.g. Packing <- Extrusion <- Washing <- Crusher) via the single-parent input_bag_qr link each
 // production_logs row carries, surfacing the batch/process trail that bag came from.
