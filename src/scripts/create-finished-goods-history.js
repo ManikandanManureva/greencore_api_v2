@@ -21,6 +21,7 @@ async function run() {
         shipment_id        INTEGER,
         category           VARCHAR(20) NOT NULL,
         material_type_id   INTEGER REFERENCES material_types(id),
+        pet_type           VARCHAR(10) DEFAULT 'NA',
         action             VARCHAR(20) NOT NULL, -- created | amended | deleted | note
         details            TEXT NOT NULL,
         "createdBy"        VARCHAR(120),
@@ -34,6 +35,7 @@ async function run() {
         id                 SERIAL PRIMARY KEY,
         category           VARCHAR(20) NOT NULL,
         material_type_id   INTEGER NOT NULL REFERENCES material_types(id),
+        pet_type           VARCHAR(10) DEFAULT 'NA',
         weight_kg          NUMERIC(14,2) NOT NULL,
         action             VARCHAR(20) NOT NULL, -- created | amended
         details            TEXT NOT NULL,

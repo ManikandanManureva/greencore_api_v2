@@ -24,13 +24,14 @@ async function run() {
         category           VARCHAR(20) NOT NULL
                              CHECK (category IN ('finished_goods', 'flakes', 'by_products')),
         material_type_id   INTEGER NOT NULL REFERENCES material_types(id),
+        pet_type           VARCHAR(10) NOT NULL DEFAULT 'NA' CHECK (pet_type IN ('NA', 'Bottle', 'Gallon')),
         weight_kg          NUMERIC(14,2) NOT NULL DEFAULT 0,
         notes              TEXT,
         "createdBy"        VARCHAR(120),
         "updatedBy"        VARCHAR(120),
         "createdAt"        TIMESTAMPTZ DEFAULT NOW(),
         "updatedAt"        TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE (category, material_type_id)
+        UNIQUE (category, material_type_id, pet_type)
       )
     `);
     await client.query('COMMIT');

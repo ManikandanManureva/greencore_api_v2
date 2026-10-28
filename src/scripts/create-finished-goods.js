@@ -27,6 +27,7 @@ async function run() {
         id                 SERIAL PRIMARY KEY,
         shipment_date      DATE NOT NULL DEFAULT CURRENT_DATE,
         material_type_id   INTEGER NOT NULL REFERENCES material_types(id),
+        pet_type           VARCHAR(10) NOT NULL DEFAULT 'NA' CHECK (pet_type IN ('NA', 'Bottle', 'Gallon')),
         weight_kg          NUMERIC(14,2) NOT NULL,
         customer           VARCHAR(150),
         destination        VARCHAR(200),
