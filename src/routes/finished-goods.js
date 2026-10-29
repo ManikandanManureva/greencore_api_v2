@@ -538,16 +538,24 @@ router.get('/bag-refs/:id/bags', async (req, res) => {
 // shift leader) so PIC no longer has to look this up and type it into a separate spreadsheet.
 async function bagLineage(client, bagQr) {
   const r = await client.query(
-    `WITH RECURSIVE chain AS (
-       SELECT pl.id, pl.output_bag_qr, pl.input_bag_qr, pl.station_id, pl.weight::numeric AS weight,
-              pl.status, pl.created_at, pl.pet_batch_no, pl.sub_line, pl.remark, pl.dn_no, pl.shift_id, 1 AS depth
+    `WITH RECURSIVE dedup AS (
+       -- A QR code can end up logged more than once in real data (e.g. re-scanned, corrected).
+       -- Without this, the recursive join below fans out once per duplicate at every depth —
+       -- harmless with clean data, but it can blow up (or error on a deep/messy real chain) once
+       -- duplicates exist, so each output_bag_qr is collapsed to its single most recent row first.
+       SELECT DISTINCT ON (pl.output_bag_qr)
+              pl.id, pl.output_bag_qr, pl.input_bag_qr, pl.station_id, pl.weight::numeric AS weight,
+              pl.status, pl.created_at, pl.pet_batch_no, pl.sub_line, pl.remark, pl.dn_no, pl.shift_id
        FROM production_logs pl
-       WHERE pl.output_bag_qr = $1
+       WHERE pl.output_bag_qr IS NOT NULL AND pl.output_bag_qr <> ''
+       ORDER BY pl.output_bag_qr, pl.created_at DESC
+     ),
+     chain AS (
+       SELECT d.*, 1 AS depth FROM dedup d WHERE d.output_bag_qr = $1
        UNION ALL
-       SELECT pl2.id, pl2.output_bag_qr, pl2.input_bag_qr, pl2.station_id, pl2.weight::numeric AS weight,
-              pl2.status, pl2.created_at, pl2.pet_batch_no, pl2.sub_line, pl2.remark, pl2.dn_no, pl2.shift_id, chain.depth + 1
-       FROM production_logs pl2
-       JOIN chain ON pl2.output_bag_qr = chain.input_bag_qr
+       SELECT d2.*, chain.depth + 1
+       FROM dedup d2
+       JOIN chain ON d2.output_bag_qr = chain.input_bag_qr
        WHERE chain.input_bag_qr IS NOT NULL AND chain.input_bag_qr <> '' AND chain.depth < 25
      )
      SELECT chain.*, s.name AS station_name, s.code AS station_code,
