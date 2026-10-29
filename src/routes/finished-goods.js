@@ -581,7 +581,9 @@ router.get('/bags/:bagQr/lineage', async (req, res) => {
     res.json({ success: true, data: rows });
   } catch (err) {
     console.error('Bag lineage error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to load this bag\'s process history' });
+    // Surfaced directly in the popup (temporary) so this can be diagnosed from a screenshot
+    // without needing server log access — revert to a generic message once root-caused.
+    res.status(500).json({ success: false, message: `Failed to load this bag's process history: ${err.message}` });
   }
 });
 
