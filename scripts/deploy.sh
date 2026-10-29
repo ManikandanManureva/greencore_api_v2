@@ -42,6 +42,7 @@ node src/scripts/create-finished-goods-history.js
 node src/scripts/add-finished-goods-pet-type.js
 node src/scripts/create-finished-goods-shipment-bags.js
 node src/scripts/create-finished-goods-bag-refs.js
+node src/scripts/add-finished-goods-bag-ref-used.js
 
 # QC Lab
 node src/scripts/create-qc-lab.js

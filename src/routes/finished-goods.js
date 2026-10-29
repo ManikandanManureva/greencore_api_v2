@@ -448,7 +448,7 @@ router.get('/bag-refs/search', async (req, res) => {
     let extra = '';
     if (q && String(q).trim()) { params.push(`%${String(q).trim()}%`); extra = `AND ref_no ILIKE $${params.length}`; }
     const r = await pool.query(
-      `SELECT id, ref_no, bag_count, weight_kg::numeric AS weight_kg, "createdAt"
+      `SELECT id, ref_no, bag_count, weight_kg::numeric AS weight_kg, "createdAt", used_at
        FROM finished_goods_bag_refs
        WHERE material_type_id = $1 ${extra}
        ORDER BY "createdAt" DESC
@@ -479,7 +479,7 @@ router.get('/bag-refs', async (req, res) => {
     }
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const r = await pool.query(
-      `SELECT r.id, r.ref_no, r.bag_count, r.weight_kg::numeric AS weight_kg, r."createdAt", r."createdBy", mt.name AS material
+      `SELECT r.id, r.ref_no, r.bag_count, r.weight_kg::numeric AS weight_kg, r."createdAt", r."createdBy", r.used_at, r.shipment_id, mt.name AS material
        FROM finished_goods_bag_refs r
        JOIN material_types mt ON mt.id = r.material_type_id
        ${whereSql}
@@ -533,31 +533,44 @@ router.get('/bag-refs/:id/bags', async (req, res) => {
 // Walks the production chain backward from a Finished Goods bag through every re-process step
 // (e.g. Packing <- Extrusion <- Washing <- Crusher) via the single-parent input_bag_qr link each
 // production_logs row carries, surfacing the batch/process trail that bag came from.
+// Shared by both the lineage popup and the traceability export — walks the production chain
+// backward via input_bag_qr and brings in each stage's shift (MFG date, shift name, line/unit,
+// shift leader) so PIC no longer has to look this up and type it into a separate spreadsheet.
+async function bagLineage(client, bagQr) {
+  const r = await client.query(
+    `WITH RECURSIVE chain AS (
+       SELECT pl.id, pl.output_bag_qr, pl.input_bag_qr, pl.station_id, pl.weight::numeric AS weight,
+              pl.status, pl.created_at, pl.pet_batch_no, pl.sub_line, pl.remark, pl.dn_no, pl.shift_id, 1 AS depth
+       FROM production_logs pl
+       WHERE pl.output_bag_qr = $1
+       UNION ALL
+       SELECT pl2.id, pl2.output_bag_qr, pl2.input_bag_qr, pl2.station_id, pl2.weight::numeric AS weight,
+              pl2.status, pl2.created_at, pl2.pet_batch_no, pl2.sub_line, pl2.remark, pl2.dn_no, pl2.shift_id, chain.depth + 1
+       FROM production_logs pl2
+       JOIN chain ON pl2.output_bag_qr = chain.input_bag_qr
+       WHERE chain.input_bag_qr IS NOT NULL AND chain.input_bag_qr <> '' AND chain.depth < 25
+     )
+     SELECT chain.*, s.name AS station_name, s.code AS station_code,
+            st.name AS shift_name, os.line_id AS unit, u.name AS shift_leader
+     FROM chain
+     JOIN stations s ON s.id = chain.station_id
+     LEFT JOIN operator_shifts os ON os.id = chain.shift_id
+     LEFT JOIN shift_types st ON st.id = os.shift_type_id
+     LEFT JOIN users u ON u.id = os.user_id
+     ORDER BY chain.depth ASC`,
+    [bagQr],
+  );
+  return r.rows;
+}
+
 router.get('/bags/:bagQr/lineage', async (req, res) => {
   try {
     const bagQr = String(req.params.bagQr).trim();
-    const r = await pool.query(
-      `WITH RECURSIVE chain AS (
-         SELECT pl.id, pl.output_bag_qr, pl.input_bag_qr, pl.station_id, pl.weight::numeric AS weight,
-                pl.status, pl.created_at, pl.pet_batch_no, pl.sub_line, pl.remark, pl.dn_no, 1 AS depth
-         FROM production_logs pl
-         WHERE pl.output_bag_qr = $1
-         UNION ALL
-         SELECT pl2.id, pl2.output_bag_qr, pl2.input_bag_qr, pl2.station_id, pl2.weight::numeric AS weight,
-                pl2.status, pl2.created_at, pl2.pet_batch_no, pl2.sub_line, pl2.remark, pl2.dn_no, chain.depth + 1
-         FROM production_logs pl2
-         JOIN chain ON pl2.output_bag_qr = chain.input_bag_qr
-         WHERE chain.input_bag_qr IS NOT NULL AND chain.input_bag_qr <> '' AND chain.depth < 25
-       )
-       SELECT chain.*, s.name AS station_name, s.code AS station_code
-       FROM chain JOIN stations s ON s.id = chain.station_id
-       ORDER BY chain.depth ASC`,
-      [bagQr],
-    );
-    if (r.rows.length === 0) {
+    const rows = await bagLineage(pool, bagQr);
+    if (rows.length === 0) {
       return res.status(404).json({ success: false, message: `No production record found for bag "${bagQr}"` });
     }
-    res.json({ success: true, data: r.rows });
+    res.json({ success: true, data: rows });
   } catch (err) {
     console.error('Bag lineage error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to load this bag\'s process history' });
@@ -574,6 +587,77 @@ router.get('/shipments/:id/bags', async (req, res) => {
   } catch (err) {
     console.error('Shipment bags error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to load jumbo bags for this shipment' });
+  }
+});
+
+// The per-stage (Crusher/Washing/Extruder) MFG date, shift, line and shift leader that PIC was
+// manually looking up and retyping into a separate traceability spreadsheet per shipment — this
+// is already recorded against each bag via its production lineage, so it's generated instead.
+const TRACE_STAGES = [
+  { code: 'CRS', label: 'CRUSHER' },
+  { code: 'WSH', label: 'WASHING' },
+  { code: 'EXT', label: 'EXTRUDER' },
+];
+
+router.get('/shipments/:id/traceability-export', async (req, res) => {
+  try {
+    const ExcelJS = require('exceljs');
+    const shipRes = await pool.query(
+      `SELECT s.*, mt.name AS material FROM finished_goods_shipments s
+       JOIN material_types mt ON mt.id = s.material_type_id WHERE s.id = $1`,
+      [req.params.id],
+    );
+    if (shipRes.rows.length === 0) return res.status(404).json({ success: false, message: 'Shipment not found' });
+    const shipment = shipRes.rows[0];
+
+    const bagsRes = await pool.query(
+      `SELECT bag_qr, weight_kg::numeric AS weight_kg FROM finished_goods_shipment_bags WHERE shipment_id = $1 ORDER BY bag_qr`,
+      [req.params.id],
+    );
+    if (bagsRes.rows.length === 0) {
+      return res.status(400).json({ success: false, message: 'This shipment has no jumbo bags to trace.' });
+    }
+
+    const wb = new ExcelJS.Workbook();
+    wb.creator = 'Greencore API';
+    const ws = wb.addWorksheet('Traceability');
+
+    const baseHeaders = ['No. Invoice', 'Shipment Date', 'Customer', 'No. Bag', 'Qty/Net Weight (kg)'];
+    const stageHeaders = ['MFG DATE', 'SHIFT', 'UNIT', 'SHIFT LEADER', 'STAMP QC'];
+    ws.addRow([]);
+    const groupRow = ws.addRow([...baseHeaders.map(() => null), ...TRACE_STAGES.flatMap((s) => stageHeaders.map(() => s.label))]);
+    const headerRow = ws.addRow([...baseHeaders, ...TRACE_STAGES.flatMap(() => stageHeaders)]);
+    [groupRow, headerRow].forEach((row) => row.eachCell((cell) => { cell.font = { bold: true }; }));
+    let col = baseHeaders.length + 1;
+    for (const stage of TRACE_STAGES) {
+      ws.mergeCells(2, col, 2, col + stageHeaders.length - 1);
+      col += stageHeaders.length;
+    }
+
+    for (const bag of bagsRes.rows) {
+      const lineage = await bagLineage(pool, bag.bag_qr);
+      const byCode = {};
+      for (const entry of lineage) { if (!byCode[entry.station_code]) byCode[entry.station_code] = entry; }
+      const row = [shipment.dn_no || '', shipment.shipment_date, shipment.customer || '', bag.bag_qr, Number(bag.weight_kg)];
+      for (const stage of TRACE_STAGES) {
+        const e = byCode[stage.code];
+        row.push(e ? e.created_at : '', e?.shift_name || '', e?.unit ?? '', e?.shift_leader || '', '');
+      }
+      ws.addRow(row);
+    }
+
+    ws.columns.forEach((c) => { c.width = 16; });
+    ws.getColumn(4).width = 24;
+    ws.getColumn(3).width = 20;
+
+    const filename = `traceability-${shipment.dn_no || shipment.id}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    console.error('Traceability export error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to generate traceability export' });
   }
 });
 
@@ -875,7 +959,7 @@ router.get('/shipments', async (req, res) => {
 router.post('/shipments', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { material, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, bags } = req.body || {};
+    const { material, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, bags, ref_id } = req.body || {};
     const category = parseCategory(req.body.category);
     const shipment_date = req.body.shipment_date || null;
     if (!material || !MATERIALS.includes(material)) {
@@ -936,6 +1020,12 @@ router.post('/shipments', async (req, res) => {
     );
     const row = r.rows[0];
     if (bagsToLink) await linkShipmentBags(client, row.id, bagsToLink);
+    if (ref_id) {
+      await client.query(
+        `UPDATE finished_goods_bag_refs SET used_at = NOW(), shipment_id = $1 WHERE id = $2 AND used_at IS NULL`,
+        [row.id, ref_id],
+      );
+    }
     const bagDetail = bagsToLink ? ` across ${bagsToLink.length} jumbo bag${bagsToLink.length === 1 ? '' : 's'}` : '';
     await logShipmentHistory(client, {
       shipmentId: row.id, category, materialTypeId, petType, action: 'created', actor,
@@ -970,7 +1060,7 @@ router.put('/shipments/:id', async (req, res) => {
     const existing = existingRes.rows[0];
     const category = existing.category;
 
-    const { material, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, bags } = req.body || {};
+    const { material, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, bags, ref_id } = req.body || {};
     const shipment_date = req.body.shipment_date || existing.shipment_date;
     if (!material || !MATERIALS.includes(material)) {
       return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
@@ -1039,6 +1129,12 @@ router.put('/shipments/:id', async (req, res) => {
     );
     const row = r.rows[0];
     if (bagsToLink) await linkShipmentBags(client, existing.id, bagsToLink);
+    if (ref_id) {
+      await client.query(
+        `UPDATE finished_goods_bag_refs SET used_at = NOW(), shipment_id = $1 WHERE id = $2 AND used_at IS NULL`,
+        [existing.id, ref_id],
+      );
+    }
 
     const existingLabel = existing.material === 'PET' ? `PET (${existing.pet_type})` : existing.material;
     const newLabel = material === 'PET' ? `PET (${petType})` : material;
