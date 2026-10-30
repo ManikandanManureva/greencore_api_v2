@@ -3292,4 +3292,325 @@ router.get('/dashboard-summary', authenticateToken, async (req, res) => {
   }
 });
 
+// ─── Overview KPIs + Trends (read-only aggregates for the Overview page) ───────
+const OV_MATERIALS = ['PC', 'PE', 'PET'];
+const OV_STATION_CODES = ['LBL', 'CRS', 'WSH', 'EXT', 'PKG', 'PLT'];
+const OV_SHIFT_NAMES = ['Shift 1', 'Shift 2', 'Shift 3'];
+
+// Material -> stations whose Completed output counts as finished product (mirrors finished-goods.js).
+const OV_FINISHING_STATIONS = { PC: ['EXT', 'PKG'], PE: ['EXT'], PET: ['EXT', 'PKG'] };
+
+// SQL fragment: true when a log row is a finished-product bag (Completed at a finishing station).
+const OV_FINISHED_SQL = `(pl.status = 'Completed' AND (
+  (mt.name = 'PC'  AND s.code IN ('EXT','PKG')) OR
+  (mt.name = 'PE'  AND s.code = 'EXT') OR
+  (mt.name = 'PET' AND s.code IN ('EXT','PKG'))))`;
+
+// Shared FROM/JOIN block: material falls back to the shift's material when the log has none.
+const OV_FROM_SQL = `
+  FROM production_logs pl
+  JOIN stations s ON s.id = pl.station_id
+  LEFT JOIN operator_shifts os ON os.id = pl.shift_id
+  LEFT JOIN shift_types sht ON sht.id = os.shift_type_id
+  LEFT JOIN material_types mt ON mt.id = COALESCE(pl.material_type_id, os.material_type_id)`;
+
+function ovMaterialFilter(materialType, params) {
+  if (materialType && OV_MATERIALS.includes(materialType)) {
+    params.push(materialType);
+    return `AND mt.name = $${params.length}`;
+  }
+  return '';
+}
+
+function ovNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0;
+}
+
+function ovEmptyPeriod() {
+  return { finished_kg: 0, finished_bags: 0, throughput_kg: 0, bags: 0, shifts: 0 };
+}
+
+// dateFrom/dateTo may be null → the trailing N-day window ending today (server-local CURRENT_DATE,
+// so it lines up with the period windows above instead of a UTC-based JS date).
+async function ovStationsBreakdown(dateFrom, dateTo, materialType, trailingDays = 30) {
+  const params = dateFrom && dateTo ? [dateFrom, dateTo] : [trailingDays - 1];
+  const dateSql = dateFrom && dateTo
+    ? 'AND pl.created_at::date >= $1::date AND pl.created_at::date <= $2::date'
+    : 'AND pl.created_at::date >= CURRENT_DATE - $1::int AND pl.created_at::date <= CURRENT_DATE';
+  const matSql = ovMaterialFilter(materialType, params);
+  const r = await pool.query(`
+    SELECT st.code, st.name, st.order_index,
+           COALESCE(SUM(x.weight), 0)::numeric AS throughput_kg,
+           COUNT(x.id)::int AS bags,
+           COUNT(x.id) FILTER (WHERE x.status = 'Completed')::int AS completed_bags,
+           COUNT(x.id) FILTER (WHERE x.status IN ('pending','Processing'))::int AS pending_bags
+    FROM stations st
+    LEFT JOIN (
+      SELECT pl.id, pl.station_id, pl.weight, pl.status
+      ${OV_FROM_SQL}
+      WHERE pl.status <> 'Cancelled'
+        ${dateSql}
+        ${matSql}
+    ) x ON x.station_id = st.id
+    WHERE st.code = ANY($${params.length + 1})
+    GROUP BY st.id, st.code, st.name, st.order_index
+    ORDER BY st.order_index ASC, st.id ASC`, [...params, OV_STATION_CODES]);
+  return r.rows.map((row) => ({
+    code: row.code, name: row.name, order_index: row.order_index,
+    throughput_kg: ovNum(row.throughput_kg), bags: row.bags,
+    completed_bags: row.completed_bags, pending_bags: row.pending_bags,
+  }));
+}
+
+router.get('/overview-kpis', authenticateToken, async (req, res) => {
+  try {
+    const materialType = req.query.material_type && req.query.material_type !== 'all' ? req.query.material_type : null;
+    if (materialType && !OV_MATERIALS.includes(materialType)) {
+      return res.status(400).json({ success: false, message: 'material_type must be all, PC, PE or PET' });
+    }
+
+    // One scan of the last 60 days, bucketed into the six comparison windows with CASE WHEN.
+    const periodParams = [];
+    const matSql = ovMaterialFilter(materialType, periodParams);
+    const periodRes = await pool.query(`
+      WITH base AS (
+        SELECT pl.id, pl.weight, pl.shift_id, pl.created_at::date AS d,
+               ${OV_FINISHED_SQL} AS is_finished
+        ${OV_FROM_SQL}
+        WHERE pl.status <> 'Cancelled'
+          AND pl.created_at::date >= CURRENT_DATE - 59
+          ${matSql}
+      ),
+      tagged AS (
+        SELECT b.*, p.period
+        FROM base b
+        CROSS JOIN LATERAL (VALUES
+          ('today',     b.d = CURRENT_DATE),
+          ('yesterday', b.d = CURRENT_DATE - 1),
+          ('last7d',    b.d >  CURRENT_DATE - 7  AND b.d <= CURRENT_DATE),
+          ('prev7d',    b.d >  CURRENT_DATE - 14 AND b.d <= CURRENT_DATE - 7),
+          ('last30d',   b.d >  CURRENT_DATE - 30 AND b.d <= CURRENT_DATE),
+          ('prev30d',   b.d >  CURRENT_DATE - 60 AND b.d <= CURRENT_DATE - 30)
+        ) AS p(period, hit)
+        WHERE p.hit
+      )
+      SELECT period,
+             COALESCE(SUM(weight) FILTER (WHERE is_finished), 0)::numeric AS finished_kg,
+             COUNT(id) FILTER (WHERE is_finished)::int AS finished_bags,
+             COALESCE(SUM(weight), 0)::numeric AS throughput_kg,
+             COUNT(id)::int AS bags,
+             COUNT(DISTINCT shift_id)::int AS shifts
+      FROM tagged
+      GROUP BY period`, periodParams);
+    const periods = {
+      today: ovEmptyPeriod(), yesterday: ovEmptyPeriod(), last7d: ovEmptyPeriod(),
+      prev7d: ovEmptyPeriod(), last30d: ovEmptyPeriod(), prev30d: ovEmptyPeriod(),
+    };
+    for (const row of periodRes.rows) {
+      periods[row.period] = {
+        finished_kg: ovNum(row.finished_kg), finished_bags: row.finished_bags,
+        throughput_kg: ovNum(row.throughput_kg), bags: row.bags, shifts: row.shifts,
+      };
+    }
+
+    const liveParams = [];
+    const liveMatSql = ovMaterialFilter(materialType, liveParams);
+    const liveRes = await pool.query(`
+      SELECT
+        (SELECT COUNT(*)::int FROM operator_shifts os2
+           LEFT JOIN material_types mt2 ON mt2.id = os2.material_type_id
+           WHERE os2.is_active = true ${materialType ? `AND mt2.name = $1` : ''}) AS active_shifts,
+        COUNT(pl.id) FILTER (WHERE pl.status IN ('pending','Processing')
+          AND NOT EXISTS (SELECT 1 FROM production_logs px
+                          WHERE px.input_bag_qr = pl.output_bag_qr
+                            AND px.input_bag_qr IS NOT NULL AND px.input_bag_qr <> ''))::int AS wip_bags,
+        COALESCE(SUM(pl.weight) FILTER (WHERE pl.status IN ('pending','Processing')
+          AND NOT EXISTS (SELECT 1 FROM production_logs px
+                          WHERE px.input_bag_qr = pl.output_bag_qr
+                            AND px.input_bag_qr IS NOT NULL AND px.input_bag_qr <> '')), 0)::numeric AS wip_kg,
+        COUNT(pl.id) FILTER (WHERE pl.status = 'Completed' AND pl.created_at::date = CURRENT_DATE)::int AS completed_today_bags
+      ${OV_FROM_SQL}
+      WHERE pl.status <> 'Cancelled' ${liveMatSql}`, liveParams);
+    const live = liveRes.rows[0];
+
+    const bpParams = [];
+    const bpMatSql = materialType ? (bpParams.push(materialType), `AND mt.name = $1`) : '';
+    const bpRes = await pool.query(`
+      SELECT COALESCE(SUM(b.weight), 0)::numeric AS kg
+      FROM by_product_logs b
+      LEFT JOIN operator_shifts os ON os.id = b.shift_id
+      LEFT JOIN material_types mt ON mt.id = os.material_type_id
+      WHERE b.created_at::date > CURRENT_DATE - 30 ${bpMatSql}`, bpParams);
+
+    const matParams = [];
+    const matMatSql = ovMaterialFilter(materialType, matParams);
+    const matRes = await pool.query(`
+      SELECT mt.name AS material,
+             COALESCE(SUM(pl.weight) FILTER (WHERE ${OV_FINISHED_SQL}), 0)::numeric AS finished_kg,
+             COUNT(pl.id) FILTER (WHERE ${OV_FINISHED_SQL})::int AS finished_bags,
+             COALESCE(SUM(pl.weight), 0)::numeric AS throughput_kg
+      ${OV_FROM_SQL}
+      WHERE pl.status <> 'Cancelled'
+        AND pl.created_at::date > CURRENT_DATE - 30
+        AND mt.name = ANY($${matParams.length + 1})
+        ${matMatSql}
+      GROUP BY mt.name`, [...matParams, OV_MATERIALS]);
+    const matByName = Object.fromEntries(matRes.rows.map((r) => [r.material, r]));
+    const materials_last30d = OV_MATERIALS.map((m) => ({
+      material: m,
+      finished_kg: ovNum(matByName[m]?.finished_kg), finished_bags: matByName[m]?.finished_bags || 0,
+      throughput_kg: ovNum(matByName[m]?.throughput_kg),
+    }));
+
+    const stations_last30d = await ovStationsBreakdown(null, null, materialType, 30);
+
+    res.json({
+      success: true,
+      data: {
+        generated_at: new Date().toISOString(),
+        periods,
+        live: {
+          active_shifts: live.active_shifts,
+          wip_pending: { bags: live.wip_bags, weight_kg: ovNum(live.wip_kg) },
+          completed_today_bags: live.completed_today_bags,
+        },
+        by_products: { last30d_kg: ovNum(bpRes.rows[0].kg), output_last30d_kg: periods.last30d.throughput_kg },
+        materials_last30d,
+        stations_last30d,
+      },
+    });
+  } catch (error) {
+    console.error('[overview-kpis] ERROR:', error.message);
+    res.status(500).json({ success: false, message: 'Failed to load overview KPIs' });
+  }
+});
+
+router.get('/trends', authenticateToken, async (req, res) => {
+  try {
+    const { date_start, date_end } = req.query;
+    const bucket = req.query.bucket || 'day';
+    const materialType = req.query.material_type && req.query.material_type !== 'all' ? req.query.material_type : null;
+    const isoDate = /^\d{4}-\d{2}-\d{2}$/;
+    if (!date_start || !date_end || !isoDate.test(date_start) || !isoDate.test(date_end)
+        || Number.isNaN(Date.parse(date_start)) || Number.isNaN(Date.parse(date_end))) {
+      return res.status(400).json({ success: false, message: 'date_start and date_end (YYYY-MM-DD) are required' });
+    }
+    if (date_end < date_start) {
+      return res.status(400).json({ success: false, message: 'date_end must be on or after date_start' });
+    }
+    if ((Date.parse(date_end) - Date.parse(date_start)) / 86400000 > 400) {
+      return res.status(400).json({ success: false, message: 'Range cannot exceed 400 days' });
+    }
+    if (!['day', 'week', 'month'].includes(bucket)) {
+      return res.status(400).json({ success: false, message: 'bucket must be day, week or month' });
+    }
+    if (materialType && !OV_MATERIALS.includes(materialType)) {
+      return res.status(400).json({ success: false, message: 'material_type must be all, PC, PE or PET' });
+    }
+
+    const params = [date_start, date_end, bucket];
+    const matSql = ovMaterialFilter(materialType, params);
+    const pointsRes = await pool.query(`
+      WITH buckets AS (
+        SELECT gs::date AS b
+        FROM generate_series(date_trunc($3, $1::date)::date, date_trunc($3, $2::date)::date, ('1 ' || $3)::interval) gs
+      ),
+      logs AS (
+        SELECT date_trunc($3, pl.created_at)::date AS b, pl.weight, s.code AS station, mt.name AS material,
+               sht.name AS shift, ${OV_FINISHED_SQL} AS is_finished
+        ${OV_FROM_SQL}
+        WHERE pl.status <> 'Cancelled'
+          AND pl.created_at::date >= $1::date AND pl.created_at::date <= $2::date
+          ${matSql}
+      ),
+      agg AS (
+        SELECT b,
+               COALESCE(SUM(weight) FILTER (WHERE is_finished), 0)::numeric AS finished_kg,
+               COUNT(*) FILTER (WHERE is_finished)::int AS finished_bags,
+               COALESCE(SUM(weight), 0)::numeric AS throughput_kg,
+               COALESCE(jsonb_object_agg(material, mkg) FILTER (WHERE material IS NOT NULL), '{}') AS materials_kg,
+               COALESCE(jsonb_object_agg(material, mfin) FILTER (WHERE material IS NOT NULL), '{}') AS materials_fin
+        FROM (
+          SELECT b, weight, is_finished, material,
+                 SUM(weight) OVER (PARTITION BY b, material) AS mkg,
+                 SUM(weight) FILTER (WHERE is_finished) OVER (PARTITION BY b, material) AS mfin
+          FROM logs
+        ) q
+        GROUP BY b
+      ),
+      stations AS (
+        SELECT b, jsonb_object_agg(station, kg) AS stations_kg
+        FROM (SELECT b, station, SUM(weight)::numeric AS kg FROM logs GROUP BY b, station) q GROUP BY b
+      ),
+      shifts AS (
+        SELECT b, jsonb_object_agg(shift, kg) AS shifts_kg
+        FROM (SELECT b, shift, SUM(weight)::numeric AS kg FROM logs WHERE shift IS NOT NULL GROUP BY b, shift) q GROUP BY b
+      ),
+      bp AS (
+        SELECT date_trunc($3, bl.created_at)::date AS b, SUM(bl.weight)::numeric AS kg
+        FROM by_product_logs bl
+        LEFT JOIN operator_shifts os ON os.id = bl.shift_id
+        LEFT JOIN material_types mt ON mt.id = os.material_type_id
+        WHERE bl.created_at::date >= $1::date AND bl.created_at::date <= $2::date ${matSql}
+        GROUP BY 1
+      )
+      SELECT buckets.b AS date,
+             COALESCE(agg.finished_kg, 0) AS finished_kg, COALESCE(agg.finished_bags, 0) AS finished_bags,
+             COALESCE(agg.throughput_kg, 0) AS throughput_kg,
+             COALESCE(agg.materials_kg, '{}') AS materials_kg, COALESCE(agg.materials_fin, '{}') AS materials_fin,
+             COALESCE(stations.stations_kg, '{}') AS stations_kg, COALESCE(shifts.shifts_kg, '{}') AS shifts_kg,
+             COALESCE(bp.kg, 0) AS by_products_kg
+      FROM buckets
+      LEFT JOIN agg ON agg.b = buckets.b
+      LEFT JOIN stations ON stations.b = buckets.b
+      LEFT JOIN shifts ON shifts.b = buckets.b
+      LEFT JOIN bp ON bp.b = buckets.b
+      ORDER BY buckets.b ASC`, params);
+
+    const toDate = (d) => (d instanceof Date ? new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10) : String(d).slice(0, 10));
+    const points = pointsRes.rows.map((row) => ({
+      date: toDate(row.date),
+      finished_kg: ovNum(row.finished_kg),
+      finished_bags: row.finished_bags,
+      throughput_kg: ovNum(row.throughput_kg),
+      materials: Object.fromEntries(OV_MATERIALS.map((m) => [m, {
+        finished_kg: ovNum(row.materials_fin[m]), throughput_kg: ovNum(row.materials_kg[m]),
+      }])),
+      stations: Object.fromEntries(OV_STATION_CODES.map((c) => [c, ovNum(row.stations_kg[c])])),
+      shifts: Object.fromEntries(OV_SHIFT_NAMES.map((n) => [n, ovNum(row.shifts_kg[n])])),
+      by_products_kg: ovNum(row.by_products_kg),
+    }));
+
+    const totals = {
+      finished_kg: 0, finished_bags: 0, throughput_kg: 0, by_products_kg: 0,
+      materials: Object.fromEntries(OV_MATERIALS.map((m) => [m, { finished_kg: 0, throughput_kg: 0 }])),
+      stations: await ovStationsBreakdown(date_start, date_end, materialType),
+      shifts: Object.fromEntries(OV_SHIFT_NAMES.map((n) => [n, 0])),
+    };
+    for (const p of points) {
+      totals.finished_kg += p.finished_kg;
+      totals.finished_bags += p.finished_bags;
+      totals.throughput_kg += p.throughput_kg;
+      totals.by_products_kg += p.by_products_kg;
+      for (const m of OV_MATERIALS) {
+        totals.materials[m].finished_kg += p.materials[m].finished_kg;
+        totals.materials[m].throughput_kg += p.materials[m].throughput_kg;
+      }
+      for (const n of OV_SHIFT_NAMES) totals.shifts[n] += p.shifts[n];
+    }
+    for (const k of ['finished_kg', 'throughput_kg', 'by_products_kg']) totals[k] = ovNum(totals[k]);
+    for (const m of OV_MATERIALS) {
+      totals.materials[m].finished_kg = ovNum(totals.materials[m].finished_kg);
+      totals.materials[m].throughput_kg = ovNum(totals.materials[m].throughput_kg);
+    }
+    for (const n of OV_SHIFT_NAMES) totals.shifts[n] = ovNum(totals.shifts[n]);
+
+    res.json({ success: true, data: { bucket, date_start, date_end, points, totals } });
+  } catch (error) {
+    console.error('[trends] ERROR:', error.message);
+    res.status(500).json({ success: false, message: 'Failed to load production trends' });
+  }
+});
+
 module.exports = router;
