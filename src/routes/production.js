@@ -3363,6 +3363,79 @@ async function ovStationsBreakdown(dateFrom, dateTo, materialType, trailingDays 
   }));
 }
 
+// Fallback line definitions when material_flow_stations is missing (mirrors init-production-schema).
+const OV_DEFAULT_LINES = {
+  PC: ['LBL', 'CRS', 'WSH', 'EXT', 'PKG', 'PLT'],
+  PE: ['CRS', 'WSH', 'EXT', 'PKG', 'PLT'],
+  PET: ['LBL', 'CRS', 'WSH', 'EXT', 'PKG', 'PLT'],
+};
+
+/**
+ * One production line per material (PC / PE / PET): the stations configured for that material's
+ * flow, in process order, each with what it handled in the range. Stations that saw activity for
+ * a material but are not in its configured flow are appended so no data is hidden. Read-only.
+ */
+async function ovLinesBreakdown(dateFrom, dateTo, materialType) {
+  const materials = materialType ? [materialType] : OV_MATERIALS;
+
+  // Station master (name + order) for the six overview stations.
+  const stRes = await pool.query(
+    `SELECT code, name, order_index FROM stations WHERE code = ANY($1) ORDER BY order_index ASC, id ASC`,
+    [OV_STATION_CODES],
+  );
+  const stationMeta = Object.fromEntries(stRes.rows.map((r) => [r.code, r]));
+
+  // Configured flow per material; fall back to the seed lists when the mapping table is absent.
+  const flow = Object.fromEntries(materials.map((m) => [m, new Set()]));
+  try {
+    const flowRes = await pool.query(`
+      SELECT mt.name AS material, st.code
+      FROM material_flow_stations mfs
+      JOIN material_types mt ON mt.id = mfs.material_type_id
+      JOIN stations st ON st.id = mfs.station_id
+      WHERE mt.name = ANY($1) AND st.code = ANY($2)`, [materials, OV_STATION_CODES]);
+    for (const r of flowRes.rows) flow[r.material]?.add(r.code);
+  } catch (err) {
+    console.warn('[overview] material_flow_stations unavailable, using default lines:', err.message);
+  }
+  for (const m of materials) {
+    if (flow[m].size === 0) OV_DEFAULT_LINES[m].forEach((c) => flow[m].add(c));
+    if (m === 'PE') flow[m].add('EXT'); // legacy DBs seeded PE without Extrusion
+  }
+
+  const dataRes = await pool.query(`
+    SELECT mt.name AS material, s.code,
+           COALESCE(SUM(pl.weight), 0)::numeric AS throughput_kg,
+           COUNT(pl.id)::int AS bags,
+           COUNT(pl.id) FILTER (WHERE pl.status = 'Completed')::int AS completed_bags,
+           COUNT(pl.id) FILTER (WHERE pl.status IN ('pending','Processing'))::int AS pending_bags
+    ${OV_FROM_SQL}
+    WHERE pl.status <> 'Cancelled'
+      AND pl.created_at::date >= $1::date AND pl.created_at::date <= $2::date
+      AND mt.name = ANY($3) AND s.code = ANY($4)
+    GROUP BY mt.name, s.code`, [dateFrom, dateTo, materials, OV_STATION_CODES]);
+  const byKey = {};
+  for (const r of dataRes.rows) {
+    byKey[`${r.material}:${r.code}`] = r;
+    flow[r.material]?.add(r.code);
+  }
+
+  return materials.map((m) => ({
+    material: m,
+    stations: OV_STATION_CODES
+      .filter((c) => flow[m].has(c) && stationMeta[c])
+      .sort((a, b) => (stationMeta[a].order_index - stationMeta[b].order_index))
+      .map((c) => {
+        const d = byKey[`${m}:${c}`];
+        return {
+          code: c, name: stationMeta[c].name, order_index: stationMeta[c].order_index,
+          throughput_kg: ovNum(d?.throughput_kg), bags: d?.bags || 0,
+          completed_bags: d?.completed_bags || 0, pending_bags: d?.pending_bags || 0,
+        };
+      }),
+  }));
+}
+
 router.get('/overview-kpis', authenticateToken, async (req, res) => {
   try {
     const materialType = req.query.material_type && req.query.material_type !== 'all' ? req.query.material_type : null;
@@ -3586,6 +3659,7 @@ router.get('/trends', authenticateToken, async (req, res) => {
       finished_kg: 0, finished_bags: 0, throughput_kg: 0, by_products_kg: 0,
       materials: Object.fromEntries(OV_MATERIALS.map((m) => [m, { finished_kg: 0, throughput_kg: 0 }])),
       stations: await ovStationsBreakdown(date_start, date_end, materialType),
+      lines: await ovLinesBreakdown(date_start, date_end, materialType),
       shifts: Object.fromEntries(OV_SHIFT_NAMES.map((n) => [n, 0])),
     };
     for (const p of points) {
