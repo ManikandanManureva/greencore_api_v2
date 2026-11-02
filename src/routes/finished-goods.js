@@ -559,7 +559,10 @@ async function bagLineage(client, bagQr) {
        WHERE chain.input_bag_qr IS NOT NULL AND chain.input_bag_qr <> '' AND chain.depth < 25
      )
      SELECT chain.*, s.name AS station_name, s.code AS station_code,
-            st.name AS shift_name, os.line_id AS unit, u.name AS shift_leader
+            st.name AS shift_name,
+            -- UNIT = the sub-line the operator picked when scanning (e.g. crusher 3E, washing line 2).
+            -- operator_shifts has no line column in production, so this comes from the log row itself.
+            NULLIF(chain.sub_line, '') AS unit, u.name AS shift_leader
      FROM chain
      JOIN stations s ON s.id = chain.station_id
      LEFT JOIN operator_shifts os ON os.id = chain.shift_id
@@ -581,9 +584,7 @@ router.get('/bags/:bagQr/lineage', async (req, res) => {
     res.json({ success: true, data: rows });
   } catch (err) {
     console.error('Bag lineage error:', err.message);
-    // Surfaced directly in the popup (temporary) so this can be diagnosed from a screenshot
-    // without needing server log access — revert to a generic message once root-caused.
-    res.status(500).json({ success: false, message: `Failed to load this bag's process history: ${err.message}` });
+    res.status(500).json({ success: false, message: "Failed to load this bag's process history" });
   }
 });
 
