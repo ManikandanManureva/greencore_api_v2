@@ -610,9 +610,111 @@ const TRACE_STAGES = [
   { code: 'EXT', label: 'EXTRUDER' },
 ];
 
+// Column layout mirrors the traceability sheet PIC fills per shipment (2026346-SHEKOU.xlsx):
+// invoice/REF, DN, shipment date, customer, pallet, bag, net weight, then per stage the MFG date,
+// shift, unit (sub-line), shift leader and a QC stamp column left for QC to fill.
+async function buildTraceabilityWorkbook(shipments) {
+  const ExcelJS = require('exceljs');
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Greencore API';
+  const ws = wb.addWorksheet('Traceability', { views: [{ state: 'frozen', ySplit: 2 }] });
+
+  const baseHeaders = ['No. Invoice', 'No. DN', 'Tgl Shipment', 'Customer', 'No. Palet', 'No. Bag (Ext)', 'Qty/Net Weight (kg)'];
+  const stageHeaders = ['MFG DATE', 'SHIFT', 'UNIT', 'SHIFT LEADER', 'STAMP QC'];
+  // Base headers live in row 1 (the merged cell keeps its top-left value); stage headers in row 2.
+  const groupRow = ws.addRow([...baseHeaders, ...TRACE_STAGES.flatMap((st) => stageHeaders.map(() => `BATCH NUMBER ${st.label}`))]);
+  const headerRow = ws.addRow([...baseHeaders.map(() => null), ...TRACE_STAGES.flatMap(() => stageHeaders)]);
+  for (let i = 0; i < baseHeaders.length; i += 1) ws.mergeCells(1, i + 1, 2, i + 1);
+  let col = baseHeaders.length + 1;
+  for (const stage of TRACE_STAGES) {
+    ws.mergeCells(1, col, 1, col + stageHeaders.length - 1);
+    col += stageHeaders.length;
+  }
+  const border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+  [groupRow, headerRow].forEach((row) => row.eachCell({ includeEmpty: true }, (cell, n) => {
+    const base = n <= baseHeaders.length;
+    cell.font = { bold: true, color: { argb: base ? 'FFFFFFFF' : 'FF000000' } };
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+    cell.border = border;
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: base ? 'FF1F3864' : 'FFFFFF00' } };
+  }));
+
+  // Excel stores dates as UTC serials; a DATE / timestamp read in server-local time would shift a
+  // day near midnight, so write the calendar day as UTC midnight.
+  const asDay = (v) => {
+    if (!v) return '';
+    const d = v instanceof Date ? v : new Date(v);
+    return Number.isNaN(d.getTime()) ? '' : new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  };
+
+  let rows = 0;
+  for (const shipment of shipments) {
+    const bagsRes = await pool.query(
+      `SELECT bag_qr, weight_kg::numeric AS weight_kg FROM finished_goods_shipment_bags WHERE shipment_id = $1 ORDER BY bag_qr`,
+      [shipment.id],
+    );
+    for (const bag of bagsRes.rows) {
+      const lineage = await bagLineage(pool, bag.bag_qr);
+      const byCode = {};
+      for (const entry of lineage) { if (!byCode[entry.station_code]) byCode[entry.station_code] = entry; }
+      const row = [shipment.ref_no || '', shipment.dn_no || '', asDay(shipment.shipment_date), shipment.customer || '', '', bag.bag_qr, Number(bag.weight_kg)];
+      for (const stage of TRACE_STAGES) {
+        const e = byCode[stage.code];
+        row.push(asDay(e?.created_at), e?.shift_name || '', e?.unit ?? '', e?.shift_leader || '', '');
+      }
+      const added = ws.addRow(row);
+      added.getCell(3).numFmt = 'dd/mm/yyyy';
+      TRACE_STAGES.forEach((_, i) => { added.getCell(baseHeaders.length + 1 + i * stageHeaders.length).numFmt = 'dd/mm/yyyy'; });
+      added.eachCell({ includeEmpty: true }, (cell) => { cell.border = border; cell.alignment = { horizontal: 'center' }; });
+      rows += 1;
+    }
+  }
+
+  ws.columns.forEach((c) => { c.width = 14; });
+  ws.getColumn(4).width = 20;
+  ws.getColumn(6).width = 30;
+  return { wb, rows };
+}
+
+async function sendWorkbook(res, wb, filename) {
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  await wb.xlsx.write(res);
+  res.end();
+}
+
+// Every finished-goods shipment in the current list filter, one row per jumbo bag — the main
+// "Export" of the Finished Goods page.
+router.get('/shipments/traceability-export', async (req, res) => {
+  try {
+    const { search, material, date_from, date_to } = req.query;
+    const where = [`s.category = 'finished_goods'`];
+    const params = [];
+    if (material && material !== 'all') { params.push(material); where.push(`mt.name = $${params.length}`); }
+    if (search && String(search).trim()) {
+      params.push(`%${String(search).trim()}%`);
+      where.push(`(s.customer ILIKE $${params.length} OR s.destination ILIKE $${params.length} OR s.dn_no ILIKE $${params.length} OR s.ref_no ILIKE $${params.length} OR s.vehicle_no ILIKE $${params.length})`);
+    }
+    if (date_from) { params.push(date_from); where.push(`s.shipment_date >= $${params.length}`); }
+    if (date_to) { params.push(date_to); where.push(`s.shipment_date <= $${params.length}`); }
+    const shipRes = await pool.query(
+      `SELECT s.*, mt.name AS material FROM finished_goods_shipments s
+       JOIN material_types mt ON mt.id = s.material_type_id
+       WHERE ${where.join(' AND ')}
+       ORDER BY s.shipment_date DESC, s.id DESC`,
+      params,
+    );
+    const { wb, rows } = await buildTraceabilityWorkbook(shipRes.rows);
+    if (rows === 0) return res.status(400).json({ success: false, message: 'No shipments with jumbo bags to trace in this view.' });
+    await sendWorkbook(res, wb, `traceability-${new Date().toISOString().slice(0, 10)}.xlsx`);
+  } catch (err) {
+    console.error('Traceability export (all) error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to generate traceability export' });
+  }
+});
+
 router.get('/shipments/:id/traceability-export', async (req, res) => {
   try {
-    const ExcelJS = require('exceljs');
     const shipRes = await pool.query(
       `SELECT s.*, mt.name AS material FROM finished_goods_shipments s
        JOIN material_types mt ON mt.id = s.material_type_id WHERE s.id = $1`,
@@ -620,52 +722,9 @@ router.get('/shipments/:id/traceability-export', async (req, res) => {
     );
     if (shipRes.rows.length === 0) return res.status(404).json({ success: false, message: 'Shipment not found' });
     const shipment = shipRes.rows[0];
-
-    const bagsRes = await pool.query(
-      `SELECT bag_qr, weight_kg::numeric AS weight_kg FROM finished_goods_shipment_bags WHERE shipment_id = $1 ORDER BY bag_qr`,
-      [req.params.id],
-    );
-    if (bagsRes.rows.length === 0) {
-      return res.status(400).json({ success: false, message: 'This shipment has no jumbo bags to trace.' });
-    }
-
-    const wb = new ExcelJS.Workbook();
-    wb.creator = 'Greencore API';
-    const ws = wb.addWorksheet('Traceability');
-
-    const baseHeaders = ['No. Invoice', 'Shipment Date', 'Customer', 'No. Bag', 'Qty/Net Weight (kg)'];
-    const stageHeaders = ['MFG DATE', 'SHIFT', 'UNIT', 'SHIFT LEADER', 'STAMP QC'];
-    ws.addRow([]);
-    const groupRow = ws.addRow([...baseHeaders.map(() => null), ...TRACE_STAGES.flatMap((s) => stageHeaders.map(() => s.label))]);
-    const headerRow = ws.addRow([...baseHeaders, ...TRACE_STAGES.flatMap(() => stageHeaders)]);
-    [groupRow, headerRow].forEach((row) => row.eachCell((cell) => { cell.font = { bold: true }; }));
-    let col = baseHeaders.length + 1;
-    for (const stage of TRACE_STAGES) {
-      ws.mergeCells(2, col, 2, col + stageHeaders.length - 1);
-      col += stageHeaders.length;
-    }
-
-    for (const bag of bagsRes.rows) {
-      const lineage = await bagLineage(pool, bag.bag_qr);
-      const byCode = {};
-      for (const entry of lineage) { if (!byCode[entry.station_code]) byCode[entry.station_code] = entry; }
-      const row = [shipment.dn_no || '', shipment.shipment_date, shipment.customer || '', bag.bag_qr, Number(bag.weight_kg)];
-      for (const stage of TRACE_STAGES) {
-        const e = byCode[stage.code];
-        row.push(e ? e.created_at : '', e?.shift_name || '', e?.unit ?? '', e?.shift_leader || '', '');
-      }
-      ws.addRow(row);
-    }
-
-    ws.columns.forEach((c) => { c.width = 16; });
-    ws.getColumn(4).width = 24;
-    ws.getColumn(3).width = 20;
-
-    const filename = `traceability-${shipment.dn_no || shipment.id}.xlsx`;
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    await wb.xlsx.write(res);
-    res.end();
+    const { wb, rows } = await buildTraceabilityWorkbook([shipment]);
+    if (rows === 0) return res.status(400).json({ success: false, message: 'This shipment has no jumbo bags to trace.' });
+    await sendWorkbook(res, wb, `traceability-${shipment.ref_no || shipment.dn_no || shipment.id}.xlsx`);
   } catch (err) {
     console.error('Traceability export error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to generate traceability export' });
@@ -932,7 +991,7 @@ router.get('/shipments', async (req, res) => {
     }
     if (search && String(search).trim()) {
       params.push(`%${String(search).trim()}%`);
-      where.push(`(s.customer ILIKE $${params.length} OR s.destination ILIKE $${params.length} OR s.dn_no ILIKE $${params.length} OR s.vehicle_no ILIKE $${params.length})`);
+      where.push(`(s.customer ILIKE $${params.length} OR s.destination ILIKE $${params.length} OR s.dn_no ILIKE $${params.length} OR s.ref_no ILIKE $${params.length} OR s.vehicle_no ILIKE $${params.length})`);
     }
     if (date_from) { params.push(date_from); where.push(`s.shipment_date >= $${params.length}`); }
     if (date_to) { params.push(date_to); where.push(`s.shipment_date <= $${params.length}`); }
@@ -967,10 +1026,21 @@ router.get('/shipments', async (req, res) => {
   }
 });
 
+// The shipment's parent REF / invoice number. Typed by the user, or taken from the REF bag list
+// the bags were loaded from when the field was left blank.
+async function resolveRefNo(client, typed, refId) {
+  const t = String(typed || '').trim();
+  if (t) return t.slice(0, 80);
+  if (!refId) return null;
+  const r = await client.query('SELECT ref_no FROM finished_goods_bag_refs WHERE id = $1', [refId]);
+  return r.rows[0]?.ref_no || null;
+}
+
 router.post('/shipments', async (req, res) => {
   const client = await pool.connect();
   try {
     const { material, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, bags, ref_id } = req.body || {};
+    const refNo = await resolveRefNo(client, req.body.ref_no, ref_id);
     const category = parseCategory(req.body.category);
     const shipment_date = req.body.shipment_date || null;
     if (!material || !MATERIALS.includes(material)) {
@@ -1024,10 +1094,10 @@ router.post('/shipments', async (req, res) => {
     const label = material === 'PET' ? `PET (${petType})` : material;
     const r = await client.query(
       `INSERT INTO finished_goods_shipments
-         (shipment_date, material_type_id, pet_type, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, category, "createdBy")
-       VALUES (COALESCE($1::date, CURRENT_DATE), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         (shipment_date, material_type_id, pet_type, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, category, "createdBy", ref_no)
+       VALUES (COALESCE($1::date, CURRENT_DATE), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        RETURNING *`,
-      [shipment_date, materialTypeId, petType, weightNum, customer || null, destination || null, vehicle_no || null, dn_no || null, notes || null, normalizePackingListForStorage(packing_list_url) || null, category, actor],
+      [shipment_date, materialTypeId, petType, weightNum, customer || null, destination || null, vehicle_no || null, dn_no || null, notes || null, normalizePackingListForStorage(packing_list_url) || null, category, actor, refNo],
     );
     const row = r.rows[0];
     if (bagsToLink) await linkShipmentBags(client, row.id, bagsToLink);
@@ -1040,7 +1110,7 @@ router.post('/shipments', async (req, res) => {
     const bagDetail = bagsToLink ? ` across ${bagsToLink.length} jumbo bag${bagsToLink.length === 1 ? '' : 's'}` : '';
     await logShipmentHistory(client, {
       shipmentId: row.id, category, materialTypeId, petType, action: 'created', actor,
-      details: `${fmtKg(weightNum)} ${label} recorded${bagDetail}${customer ? ` for ${customer}` : ''}${dn_no ? ` (DN ${dn_no})` : ''}.`,
+      details: `${fmtKg(weightNum)} ${label} recorded${bagDetail}${customer ? ` for ${customer}` : ''}${refNo ? ` (REF ${refNo})` : ''}${dn_no ? ` (DN ${dn_no})` : ''}.`,
     });
     await client.query('COMMIT');
     const resolvedUrl = await resolvePackingListUrl(row.packing_list_url);
@@ -1072,6 +1142,7 @@ router.put('/shipments/:id', async (req, res) => {
     const category = existing.category;
 
     const { material, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, bags, ref_id } = req.body || {};
+    const refNo = await resolveRefNo(client, req.body.ref_no, ref_id);
     const shipment_date = req.body.shipment_date || existing.shipment_date;
     if (!material || !MATERIALS.includes(material)) {
       return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
@@ -1132,11 +1203,11 @@ router.put('/shipments/:id', async (req, res) => {
     const r = await client.query(
       `UPDATE finished_goods_shipments SET
          shipment_date = COALESCE($1::date, shipment_date), material_type_id = $2, pet_type = $3, weight_kg = $4,
-         customer = $5, destination = $6, vehicle_no = $7, dn_no = $8, notes = $9, packing_list_url = $10
+         customer = $5, destination = $6, vehicle_no = $7, dn_no = $8, notes = $9, packing_list_url = $10, ref_no = $12
        WHERE id = $11
        RETURNING *`,
       [shipment_date, materialTypeId, petType, weightNum, customer || null, destination || null, vehicle_no || null, dn_no || null, notes || null,
-        normalizePackingListForStorage(packing_list_url) || existing.packing_list_url, existing.id],
+        normalizePackingListForStorage(packing_list_url) || existing.packing_list_url, existing.id, refNo],
     );
     const row = r.rows[0];
     if (bagsToLink) await linkShipmentBags(client, existing.id, bagsToLink);
@@ -1155,6 +1226,7 @@ router.put('/shipments/:id', async (req, res) => {
     if (bagCountChanged) changes.push(`jumbo bags updated (${bagsToLink.length} bag${bagsToLink.length === 1 ? '' : 's'})`);
     if ((existing.customer || '') !== (customer || '')) changes.push(`customer "${existing.customer || '—'}" → "${customer || '—'}"`);
     if ((existing.destination || '') !== (destination || '')) changes.push(`destination "${existing.destination || '—'}" → "${destination || '—'}"`);
+    if ((existing.ref_no || '') !== (refNo || '')) changes.push(`REF no. "${existing.ref_no || '—'}" → "${refNo || '—'}"`);
     if ((existing.dn_no || '') !== (dn_no || '')) changes.push(`DN no. "${existing.dn_no || '—'}" → "${dn_no || '—'}"`);
     if ((existing.vehicle_no || '') !== (vehicle_no || '')) changes.push(`vehicle "${existing.vehicle_no || '—'}" → "${vehicle_no || '—'}"`);
     const details = changes.length ? `Amended: ${changes.join('; ')}.` : 'Amended (no field changes detected).';
