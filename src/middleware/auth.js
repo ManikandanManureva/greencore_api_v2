@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const pool = require('../config/database');
+const { loadPermissions } = require('./permissions');
 
 const authenticateToken = async (req, res, next) => {
   try {
@@ -26,8 +27,13 @@ const authenticateToken = async (req, res, next) => {
       });
     }
 
+    const access = await loadPermissions(pool, result.rows[0]);
     req.user = {
       id: result.rows[0].id,
+      roleKey: access.roleKey,
+      roleName: access.roleName,
+      permissions: access.permissions,
+      phone: result.rows[0].phone || null,
       employeeId: result.rows[0].employee_id,
       name: result.rows[0].name,
       email: result.rows[0].email,

@@ -3,17 +3,9 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { requireModule } = require('../middleware/permissions');
 
-const ALLOWED_ROLES = ['ppic', 'super_admin', 'admin'];
-
-function requireRole(req, res, next) {
-  const role = String(req.user && req.user.role ? req.user.role : '').toLowerCase();
-  if (!ALLOWED_ROLES.includes(role))
-    return res.status(403).json({ success: false, message: 'Not authorized to access Parts Inventory' });
-  next();
-}
-
-router.use(authenticateToken, requireRole);
+router.use(authenticateToken, requireModule('parts', 'Parts Inventory'));
 
 function paginate(query) {
   const page = Math.max(1, parseInt(query.page) || 1);

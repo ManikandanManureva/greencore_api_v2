@@ -2,22 +2,13 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { requireModule } = require('../middleware/permissions');
 
 /**
  * Parts / Packaging-Material (PM) inventory — master catalog (pm_item).
  * Restricted to admin / super_admin / ppic (not qc).
  */
-const ALLOWED_ROLES = ['ppic', 'super_admin', 'admin'];
-
-function requirePartsRole(req, res, next) {
-  const role = String(req.user && req.user.role ? req.user.role : '').toLowerCase();
-  if (!ALLOWED_ROLES.includes(role)) {
-    return res.status(403).json({ success: false, message: 'You are not authorized to access the Parts module' });
-  }
-  next();
-}
-
-router.use(authenticateToken, requirePartsRole);
+router.use(authenticateToken, requireModule('parts', 'Parts Inventory'));
 
 // Editable fields → column names
 const FIELDS = {

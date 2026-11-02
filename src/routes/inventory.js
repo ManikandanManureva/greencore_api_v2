@@ -2,28 +2,27 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { requireModule, hasPermission } = require('../middleware/permissions');
 
 /**
  * Inventory module — gate-entry (raw_material) records.
  * Restricted to PPIC and Super Admin roles.
  */
-const ALLOWED_ROLES = ['ppic', 'super_admin', 'admin'];
-// QC is limited to the gate-entry (Receipts) endpoints only: the raw_material list,
-// a single record + update (status/notes), and the summary KPIs.
+// The built-in QC (Gate Entry) role is limited to the receipts endpoints only: the raw_material
+// list, a single record + update (status/notes), and the summary KPIs — on top of its
+// Material Inventory read/write permission.
 const QC_ALLOWED_PATHS = [/^\/raw-materials(\/|$)/, /^\/summary(\/|$)/];
 
-function requireInventoryRole(req, res, next) {
+function narrowQcRole(req, res, next) {
   const role = String(req.user && req.user.role ? req.user.role : '').toLowerCase();
-  if (ALLOWED_ROLES.includes(role)) return next();
-  if (role === 'qc' && QC_ALLOWED_PATHS.some((re) => re.test(req.path))) return next();
-  return res.status(403).json({
-    success: false,
-    message: 'You are not authorized to access the Inventory module',
-  });
+  if (role === 'qc' && !QC_ALLOWED_PATHS.some((re) => re.test(req.path))) {
+    return res.status(403).json({ success: false, message: 'QC can only work with gate-entry receipts' });
+  }
+  next();
 }
 
-// Every inventory route requires a valid token AND an allowed role.
-router.use(authenticateToken, requireInventoryRole);
+// Every inventory route requires a valid token AND the Material Inventory permission.
+router.use(authenticateToken, requireModule('inventory', 'Material Inventory'), narrowQcRole);
 
 // Editable API field -> DB column (quoted where the column is camelCase).
 const FIELDS = {
@@ -512,8 +511,7 @@ router.put('/raw-materials/:id', async (req, res) => {
  * QC can view/update gate entries but not delete them.
  */
 router.delete('/raw-materials/:id', async (req, res) => {
-  const role = String(req.user && req.user.role ? req.user.role : '').toLowerCase();
-  if (!ALLOWED_ROLES.includes(role)) {
+  if (!hasPermission(req.user, 'inventory', 'delete')) {
     return res.status(403).json({ success: false, message: 'Not authorized to delete gate-entry records' });
   }
   try {

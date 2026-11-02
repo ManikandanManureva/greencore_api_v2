@@ -6,6 +6,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { requireModule } = require('../middleware/permissions');
 const { isS3Configured, uploadBuffer, getSignedUrlForKey, keyFromS3Url } = require('../config/s3');
 
 /**
@@ -14,7 +15,6 @@ const { isS3Configured, uploadBuffer, getSignedUrlForKey, keyFromS3Url } = requi
  * density, blue). QC_LAB is a dedicated login scoped to only this module; PPIC/Admin can also
  * use it for oversight/correction.
  */
-const ALLOWED_ROLES = ['qc_lab', 'ppic', 'super_admin', 'admin'];
 
 const PHOTO_UPLOAD_DIR = path.join(__dirname, '..', '..', 'uploads', 'qc-lab');
 fs.mkdirSync(PHOTO_UPLOAD_DIR, { recursive: true });
@@ -63,15 +63,7 @@ async function persistIvPhoto(req, buffer, mimetype, originalname) {
   return { stored: url, url };
 }
 
-function requireRole(req, res, next) {
-  const role = String(req.user && req.user.role ? req.user.role : '').toLowerCase();
-  if (!ALLOWED_ROLES.includes(role)) {
-    return res.status(403).json({ success: false, message: 'Not authorized to access QC Lab' });
-  }
-  next();
-}
-
-router.use(authenticateToken, requireRole);
+router.use(authenticateToken, requireModule('qc_lab', 'QC Lab'));
 
 function actorName(req) {
   return (req.user && (req.user.name || req.user.employeeId)) || null;

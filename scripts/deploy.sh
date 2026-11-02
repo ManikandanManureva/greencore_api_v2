@@ -44,6 +44,7 @@ node src/scripts/create-finished-goods-shipment-bags.js
 node src/scripts/create-finished-goods-bag-refs.js
 node src/scripts/add-finished-goods-bag-ref-used.js
 node src/scripts/add-finished-goods-shipment-ref-no.js
+node src/scripts/create-roles-permissions.js
 
 # QC Lab
 node src/scripts/create-qc-lab.js

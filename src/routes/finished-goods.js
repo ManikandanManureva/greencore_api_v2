@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const pdfParse = require('pdf-parse');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { requireModule } = require('../middleware/permissions');
 const { isS3Configured, uploadBuffer, getSignedUrlForKey, keyFromS3Url } = require('../config/s3');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
@@ -58,7 +59,6 @@ async function persistPackingList(req, buffer, mimetype, originalname) {
  *                     exclusion, since by-products aren't re-processed as input to another step.
  * Quantities only — no pricing.
  */
-const ALLOWED_ROLES = ['ppic', 'super_admin', 'admin'];
 const CATEGORIES = ['finished_goods', 'flakes', 'by_products'];
 const MATERIALS = ['PC', 'PE', 'PET'];
 const PET_TYPES = ['Bottle', 'Gallon'];
@@ -85,15 +85,7 @@ function normalizePetType(material, value) {
   return PET_TYPES.includes(value) ? value : null;
 }
 
-function requireRole(req, res, next) {
-  const role = String(req.user && req.user.role ? req.user.role : '').toLowerCase();
-  if (!ALLOWED_ROLES.includes(role)) {
-    return res.status(403).json({ success: false, message: 'Not authorized to access Outgoing / Sales' });
-  }
-  next();
-}
-
-router.use(authenticateToken, requireRole);
+router.use(authenticateToken, requireModule('outgoing', 'Outgoing / Sales'));
 
 function parseCategory(value) {
   return CATEGORIES.includes(value) ? value : 'finished_goods';

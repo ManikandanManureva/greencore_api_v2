@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { requireModule, hasPermission } = require('../middleware/permissions');
 
 /**
  * Spare Parts module — unified schema (v2). One catalog registry (spare_parts_catalogs) plus
@@ -12,22 +13,14 @@ const { authenticateToken } = require('../middleware/auth');
  * view role; only PPIC (and admin/super_admin) can edit master fields (min/max, location,
  * category, etc.).
  */
-const MASTER_EDIT_ROLES = ['ppic', 'super_admin', 'admin', 'spare_parts_admin'];
-const VIEW_ROLES = ['ppic', 'super_admin', 'admin', 'pet', 'spare_parts_admin'];
-
-function requireView(req, res, next) {
-  const role = String(req.user?.role || '').toLowerCase();
-  if (VIEW_ROLES.includes(role)) return next();
-  return res.status(403).json({ success: false, message: 'Not authorized for Spare Parts' });
-}
-
+// Master data (adding / editing parts, min-max, location) needs the module's *delete* level —
+// the "full control" tier — so a role that may only log stock in / usage (write) can't change it.
 function requireMasterEdit(req, res, next) {
-  const role = String(req.user?.role || '').toLowerCase();
-  if (MASTER_EDIT_ROLES.includes(role)) return next();
-  return res.status(403).json({ success: false, message: 'Only PPIC can edit spare parts master data' });
+  if (hasPermission(req.user, 'spare_parts', 'delete')) return next();
+  return res.status(403).json({ success: false, message: 'Your role can log transactions but not edit spare parts master data' });
 }
 
-router.use(authenticateToken, requireView);
+router.use(authenticateToken, requireModule('spare_parts', 'Spare Parts'));
 
 function actorName(req) {
   return (req.user && (req.user.name || req.user.employeeId)) || null;

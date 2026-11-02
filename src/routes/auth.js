@@ -5,6 +5,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { loadPermissions } = require('../middleware/permissions');
 console.log("inside auth 8 ");
 
 // Login endpoint
@@ -80,6 +81,7 @@ router.post('/login', async (req, res) => {
       // Continue with login even if refresh token storage fails
     }
 
+    const access = await loadPermissions(pool, user);
     // Return success response
     res.json({
       success: true,
@@ -92,7 +94,10 @@ router.post('/login', async (req, res) => {
         employeeId: user.employee_id,
         name: user.name,
         email: user.email,
+        phone: user.phone || null,
         role: user.role,
+        roleName: access.roleName,
+        permissions: access.permissions,
         materialTypeId: user.material_type_id,
         canCorrectProduction: user.can_correct_production === true
       }
@@ -152,6 +157,7 @@ router.post('/refresh', async (req, res) => {
       { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
     );
 
+    const access = await loadPermissions(pool, flags.rows[0] || tokenData);
     res.json({
       success: true,
       token: accessToken,
@@ -161,7 +167,10 @@ router.post('/refresh', async (req, res) => {
         employeeId: tokenData.employee_id,
         name: tokenData.name,
         email: tokenData.email,
+        phone: flags.rows[0]?.phone || null,
         role: tokenData.role,
+        roleName: access.roleName,
+        permissions: access.permissions,
         materialTypeId: tokenData.material_type_id,
         canCorrectProduction: flags.rows[0]?.can_correct_production === true
       }
@@ -187,6 +196,9 @@ router.get('/verify', authenticateToken, async (req, res) => {
         name: req.user.name,
         email: req.user.email,
         role: req.user.role,
+        roleName: req.user.roleName,
+        permissions: req.user.permissions,
+        phone: req.user.phone,
         materialTypeId: result.rows[0]?.material_type_id,
         lastLoginAt: result.rows[0]?.last_login_at,
         canCorrectProduction: req.user.canCorrectProduction === true
