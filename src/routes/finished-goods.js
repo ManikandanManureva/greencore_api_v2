@@ -602,6 +602,50 @@ const TRACE_STAGES = [
   { code: 'EXT', label: 'EXTRUDER' },
 ];
 
+// Every jumbo bag on a shipment (one DN / container) with the first Crusher / Washing / Extruder
+// step found walking its production lineage — the same data the viewer and the Excel export show.
+async function traceShipmentBags(shipmentId) {
+  const bagsRes = await pool.query(
+    `SELECT bag_qr, weight_kg::numeric AS weight_kg FROM finished_goods_shipment_bags WHERE shipment_id = $1 ORDER BY bag_qr`,
+    [shipmentId],
+  );
+  const out = [];
+  for (const bag of bagsRes.rows) {
+    const lineage = await bagLineage(pool, bag.bag_qr);
+    const stages = {};
+    for (const entry of lineage) {
+      if (stages[entry.station_code]) continue;
+      stages[entry.station_code] = {
+        mfg_date: entry.created_at, shift: entry.shift_name || null, unit: entry.unit ?? null,
+        leader: entry.shift_leader || null, batch_no: entry.pet_batch_no || null, station: entry.station_name,
+      };
+    }
+    out.push({ bag_qr: bag.bag_qr, weight_kg: Number(bag.weight_kg), stages, traced: lineage.length > 0 });
+  }
+  return out;
+}
+
+// Shipment ids from a comma-separated query value, capped so one REF can't ask for the world.
+function parseIdList(value, max = 100) {
+  return String(value || '')
+    .split(',')
+    .map((s) => parseInt(String(s).trim(), 10))
+    .filter((n) => Number.isInteger(n) && n > 0)
+    .slice(0, max);
+}
+
+async function shipmentsByIds(ids) {
+  if (ids.length === 0) return [];
+  const r = await pool.query(
+    `SELECT s.*, mt.name AS material FROM finished_goods_shipments s
+     JOIN material_types mt ON mt.id = s.material_type_id
+     WHERE s.id = ANY($1::int[])
+     ORDER BY s.dn_no NULLS LAST, s.id`,
+    [ids],
+  );
+  return r.rows;
+}
+
 // Column layout mirrors the traceability sheet PIC fills per shipment (2026346-SHEKOU.xlsx):
 // invoice/REF, DN, shipment date, customer, pallet, bag, net weight, then per stage the MFG date,
 // shift, unit (sub-line), shift leader and a QC stamp column left for QC to fill.
@@ -641,18 +685,12 @@ async function buildTraceabilityWorkbook(shipments) {
 
   let rows = 0;
   for (const shipment of shipments) {
-    const bagsRes = await pool.query(
-      `SELECT bag_qr, weight_kg::numeric AS weight_kg FROM finished_goods_shipment_bags WHERE shipment_id = $1 ORDER BY bag_qr`,
-      [shipment.id],
-    );
-    for (const bag of bagsRes.rows) {
-      const lineage = await bagLineage(pool, bag.bag_qr);
-      const byCode = {};
-      for (const entry of lineage) { if (!byCode[entry.station_code]) byCode[entry.station_code] = entry; }
+    const bags = await traceShipmentBags(shipment.id);
+    for (const bag of bags) {
       const row = [shipment.ref_no || '', shipment.dn_no || '', asDay(shipment.shipment_date), shipment.customer || '', '', bag.bag_qr, Number(bag.weight_kg)];
       for (const stage of TRACE_STAGES) {
-        const e = byCode[stage.code];
-        row.push(asDay(e?.created_at), e?.shift_name || '', e?.unit ?? '', e?.shift_leader || '', '');
+        const e = bag.stages[stage.code];
+        row.push(asDay(e?.mfg_date), e?.shift || '', e?.unit ?? '', e?.leader || '', '');
       }
       const added = ws.addRow(row);
       added.getCell(3).numFmt = 'dd/mm/yyyy';
@@ -675,11 +713,51 @@ async function sendWorkbook(res, wb, filename) {
   res.end();
 }
 
+// JSON twin of the Excel export for the on-screen "Shipment Traceability" viewer: the REF's
+// containers (one shipment row = one DN) each with their bags and per-stage batch details.
+router.get('/shipments/traceability', async (req, res) => {
+  try {
+    const ids = parseIdList(req.query.ids);
+    if (ids.length === 0) return res.status(400).json({ success: false, message: 'ids is required' });
+    const shipments = await shipmentsByIds(ids);
+    if (shipments.length === 0) return res.status(404).json({ success: false, message: 'Shipment not found' });
+    const containers = [];
+    for (const s of shipments) {
+      const bags = await traceShipmentBags(s.id);
+      containers.push({
+        id: s.id, dn_no: s.dn_no, vehicle_no: s.vehicle_no, shipment_date: s.shipment_date, weight_kg: Number(s.weight_kg),
+        material: s.material, pet_type: s.pet_type, customer: s.customer, destination: s.destination, bags,
+      });
+    }
+    const first = shipments[0];
+    res.json({
+      success: true,
+      data: {
+        ref_no: first.ref_no, customer: first.customer, destination: first.destination, material: first.material, pet_type: first.pet_type,
+        stages: TRACE_STAGES, containers,
+        total_weight: containers.reduce((n, c) => n + c.weight_kg, 0),
+        total_bags: containers.reduce((n, c) => n + c.bags.length, 0),
+      },
+    });
+  } catch (err) {
+    console.error('Traceability view error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to load traceability' });
+  }
+});
+
 // Every finished-goods shipment in the current list filter, one row per jumbo bag — the main
-// "Export" of the Finished Goods page.
+// "Export" of the Finished Goods page. With ?ids=1,2,3 it exports just those containers (a REF).
 router.get('/shipments/traceability-export', async (req, res) => {
   try {
     const { search, material, date_from, date_to } = req.query;
+    if (req.query.ids) {
+      const shipments = await shipmentsByIds(parseIdList(req.query.ids));
+      if (shipments.length === 0) return res.status(404).json({ success: false, message: 'Shipment not found' });
+      const { wb, rows } = await buildTraceabilityWorkbook(shipments);
+      if (rows === 0) return res.status(400).json({ success: false, message: 'No jumbo bags to trace on this REF.' });
+      const tag = (shipments[0].ref_no || shipments[0].dn_no || shipments[0].id).toString().replace(/[^\w.-]+/g, '_');
+      return sendWorkbook(res, wb, `traceability-${tag}.xlsx`);
+    }
     const where = [`s.category = 'finished_goods'`];
     const params = [];
     if (material && material !== 'all') { params.push(material); where.push(`mt.name = $${params.length}`); }
@@ -1015,6 +1093,183 @@ router.get('/shipments', async (req, res) => {
   } catch (err) {
     console.error('Outgoing/Sales shipments list error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to load shipments' });
+  }
+});
+
+// Finished Goods, the way the customer paperwork is organised: the REF / invoice is the parent,
+// and each delivery note (DN) under it is one container with its own jumbo bags. A shipment row
+// is still one DN, so this groups the rows by ref_no; a row with no REF stands on its own.
+router.get('/shipments/grouped', async (req, res) => {
+  try {
+    const category = parseCategory(req.query.category);
+    const { search, material, date_from, date_to } = req.query;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 25));
+    const where = [`s.category = $1`];
+    const params = [category];
+    if (material && material !== 'all') { params.push(material); where.push(`mt.name = $${params.length}`); }
+    if (req.query.pet_type && PET_TYPES.includes(req.query.pet_type)) { params.push(req.query.pet_type); where.push(`s.pet_type = $${params.length}`); }
+    if (search && String(search).trim()) {
+      params.push(`%${String(search).trim()}%`);
+      where.push(`(s.customer ILIKE $${params.length} OR s.destination ILIKE $${params.length} OR s.dn_no ILIKE $${params.length} OR s.ref_no ILIKE $${params.length} OR s.vehicle_no ILIKE $${params.length})`);
+    }
+    if (date_from) { params.push(date_from); where.push(`s.shipment_date >= $${params.length}`); }
+    if (date_to) { params.push(date_to); where.push(`s.shipment_date <= $${params.length}`); }
+
+    // A matching DN pulls in its whole REF, so a search for one DN number still shows the parent
+    // with all of its containers.
+    const rowsRes = await pool.query(
+      `WITH hit AS (
+         SELECT DISTINCT COALESCE(NULLIF(s.ref_no, ''), '#' || s.id) AS gkey
+         FROM finished_goods_shipments s JOIN material_types mt ON mt.id = s.material_type_id
+         WHERE ${where.join(' AND ')}
+       )
+       SELECT s.*, mt.name AS material, COALESCE(NULLIF(s.ref_no, ''), '#' || s.id) AS gkey,
+              (SELECT COUNT(*)::int FROM finished_goods_shipment_bags b WHERE b.shipment_id = s.id) AS bag_count
+       FROM finished_goods_shipments s
+       JOIN material_types mt ON mt.id = s.material_type_id
+       WHERE s.category = $1 AND COALESCE(NULLIF(s.ref_no, ''), '#' || s.id) IN (SELECT gkey FROM hit)
+       ORDER BY s.shipment_date DESC, s.id DESC`,
+      params,
+    );
+
+    const groups = new Map();
+    for (const row of rowsRes.rows) {
+      let g = groups.get(row.gkey);
+      if (!g) {
+        g = {
+          key: row.gkey, ref_no: row.ref_no || null, shipment_date: row.shipment_date, material: row.material, pet_type: row.pet_type,
+          customer: row.customer, destination: row.destination, notes: row.notes, packing_list_url: row.packing_list_url,
+          weight_kg: 0, bag_count: 0, container_count: 0, containers: [], createdBy: row.createdBy,
+        };
+        groups.set(row.gkey, g);
+      }
+      g.weight_kg += Number(row.weight_kg);
+      g.bag_count += row.bag_count;
+      g.container_count += 1;
+      if (!g.customer && row.customer) g.customer = row.customer;
+      if (!g.destination && row.destination) g.destination = row.destination;
+      if (!g.packing_list_url && row.packing_list_url) g.packing_list_url = row.packing_list_url;
+      const { gkey, ...container } = row;
+      g.containers.push(container);
+    }
+    const all = [...groups.values()];
+    const total = all.length;
+    const pageGroups = all.slice((page - 1) * limit, page * limit);
+    for (const g of pageGroups) {
+      g.packing_list_url = await resolvePackingListUrl(g.packing_list_url);
+      g.containers.sort((a, b) => String(a.dn_no || '').localeCompare(String(b.dn_no || '')) || a.id - b.id);
+      for (const c of g.containers) c.packing_list_url = await resolvePackingListUrl(c.packing_list_url);
+    }
+    res.json({ success: true, data: pageGroups, page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) });
+  } catch (err) {
+    console.error('Grouped shipments list error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to load shipments' });
+  }
+});
+
+// Record one REF with several containers at once — each container becomes its own shipment row
+// (one DN, one vehicle, its own bags) sharing the REF, customer, destination and date. All or
+// nothing: if any bag or the stock check fails, nothing is written.
+router.post('/shipments/batch', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { material, customer, destination, notes, packing_list_url } = req.body || {};
+    const category = parseCategory(req.body.category);
+    if (category !== 'finished_goods') {
+      return res.status(400).json({ success: false, message: 'Multi-container shipments are only for Finished Goods' });
+    }
+    if (!material || !MATERIALS.includes(material)) {
+      return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
+    }
+    const petType = normalizePetType(material, req.body.pet_type);
+    if (petType === null) {
+      return res.status(400).json({ success: false, message: 'pet_type must be "Bottle" or "Gallon" for PET' });
+    }
+    const refNo = String(req.body.ref_no || '').trim().slice(0, 80);
+    if (!refNo) return res.status(400).json({ success: false, message: 'REF / Invoice No. is required — it is the parent of every DN.' });
+    const shipment_date = req.body.shipment_date || null;
+    const containers = Array.isArray(req.body.containers) ? req.body.containers : [];
+    if (containers.length === 0) return res.status(400).json({ success: false, message: 'Add at least one container (DN).' });
+    if (containers.length > 50) return res.status(400).json({ success: false, message: 'At most 50 containers per REF.' });
+
+    const seenDn = new Set();
+    const seenBag = new Map();
+    for (let i = 0; i < containers.length; i += 1) {
+      const c = containers[i] || {};
+      const dn = String(c.dn_no || '').trim();
+      if (!dn) return res.status(400).json({ success: false, message: `Container ${i + 1}: DN (container) number is required.` });
+      if (seenDn.has(dn.toLowerCase())) return res.status(400).json({ success: false, message: `DN "${dn}" is entered twice — each container needs its own DN.` });
+      seenDn.add(dn.toLowerCase());
+      const bags = Array.isArray(c.bags) ? c.bags.map((b) => String(b).trim()).filter(Boolean) : [];
+      if (bags.length === 0) return res.status(400).json({ success: false, message: `Container ${i + 1} (DN ${dn}): add at least one jumbo bag.` });
+      for (const b of bags) {
+        if (seenBag.has(b)) return res.status(400).json({ success: false, message: `Jumbo bag "${b}" is in both DN ${seenBag.get(b)} and DN ${dn} — a bag can only ship once.` });
+        seenBag.set(b, dn);
+      }
+    }
+
+    await client.query('BEGIN');
+    const mtRes = await client.query('SELECT id FROM material_types WHERE name = $1', [material]);
+    if (mtRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Unknown material type' });
+    }
+    const materialTypeId = mtRes.rows[0].id;
+
+    // Validate every container's bags first (duplicates across containers were caught above, and
+    // bags are only linked after all validate), then check the REF's total against stock.
+    const prepared = [];
+    for (const c of containers) {
+      const { bags: validatedBags, totalWeight } = await validateAndSumBags(client, material, c.bags);
+      prepared.push({ dn_no: String(c.dn_no).trim().slice(0, 60), vehicle_no: c.vehicle_no ? String(c.vehicle_no).trim().slice(0, 60) : null, ref_id: c.ref_id || null, bags: validatedBags, weight: totalWeight });
+    }
+    const requested = prepared.reduce((n, p) => n + p.weight, 0);
+    const opening = await openingStockByMaterial(client, category);
+    const produced = await producedByMaterial(client, category, cutoffMapFrom(opening));
+    const producedWeight = material === 'PET' ? 0 : Number(produced.find((r) => r.material === material)?.produced_weight || 0);
+    const openingWeight = Number(opening[rowKey(material, petType)]?.weight || 0);
+    const shippedRes = await client.query(
+      'SELECT COALESCE(SUM(weight_kg), 0)::numeric AS n FROM finished_goods_shipments WHERE material_type_id = $1 AND category = $2 AND pet_type = $3',
+      [materialTypeId, category, petType],
+    );
+    const availableWeight = producedWeight + openingWeight - Number(shippedRes.rows[0].n);
+    if (requested > availableWeight) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: `Insufficient stock. Available: ${availableWeight.toFixed(2)} kg, Requested: ${requested} kg across ${prepared.length} container${prepared.length === 1 ? '' : 's'}` });
+    }
+
+    const actor = actorName(req);
+    const label = material === 'PET' ? `PET (${petType})` : material;
+    const created = [];
+    for (const p of prepared) {
+      const r = await client.query(
+        `INSERT INTO finished_goods_shipments
+           (shipment_date, material_type_id, pet_type, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, category, "createdBy", ref_no)
+         VALUES (COALESCE($1::date, CURRENT_DATE), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+         RETURNING *`,
+        [shipment_date, materialTypeId, petType, p.weight, customer || null, destination || null, p.vehicle_no, p.dn_no, notes || null, normalizePackingListForStorage(packing_list_url) || null, category, actor, refNo],
+      );
+      const row = r.rows[0];
+      await linkShipmentBags(client, row.id, p.bags);
+      if (p.ref_id) {
+        await client.query(`UPDATE finished_goods_bag_refs SET used_at = NOW(), shipment_id = $1 WHERE id = $2 AND used_at IS NULL`, [row.id, p.ref_id]);
+      }
+      await logShipmentHistory(client, {
+        shipmentId: row.id, category, materialTypeId, petType, action: 'created', actor,
+        details: `${fmtKg(p.weight)} ${label} recorded across ${p.bags.length} jumbo bag${p.bags.length === 1 ? '' : 's'}${customer ? ` for ${customer}` : ''} (REF ${refNo}, DN ${p.dn_no}${p.vehicle_no ? `, vehicle ${p.vehicle_no}` : ''}; ${prepared.length} container${prepared.length === 1 ? '' : 's'} on this REF).`,
+      });
+      created.push({ ...row, material });
+    }
+    await client.query('COMMIT');
+    res.status(201).json({ success: true, data: { ref_no: refNo, container_count: created.length, weight_kg: requested, shipments: created } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (err.status === 400) return res.status(400).json({ success: false, message: err.message });
+    console.error('Multi-container shipment create error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to record shipment' });
+  } finally {
+    client.release();
   }
 });
 
