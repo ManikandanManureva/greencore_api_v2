@@ -688,9 +688,26 @@ router.post('/upload-photo', authenticateToken, (req, res) => {
   });
 });
 
-// Reads the weight shown on a digital scale display photo via OpenAI vision, so the operator
-// doesn't have to type it in manually. The image is only ever held in memory for this one
-// request — it is never written to disk or S3 by this route. Requires OPENAI_API_KEY in .env.
+// Reads the weight shown on a digital scale display photo, so the operator doesn't have to type
+// it in manually. The image is only ever held in memory for this one request — it is never
+// written to disk or S3 by this route. WEIGHT_OCR_ENGINE in .env picks the reader:
+//   openai (default)  OpenAI vision for every photo. Requires OPENAI_API_KEY.
+//   local             the weight-ocr service on this server, no cost per read.
+//   local+openai      local first, OpenAI only for photos local can't read.
+const WEIGHT_OCR_LOCAL_URL = process.env.WEIGHT_OCR_LOCAL_URL || 'http://127.0.0.1:8099/read';
+const WEIGHT_OCR_LOCAL_TIMEOUT_MS = 30000;
+
+const readWeightLocally = async (imageBuffer) => {
+  const localRes = await fetch(WEIGHT_OCR_LOCAL_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: imageBuffer,
+    signal: AbortSignal.timeout(WEIGHT_OCR_LOCAL_TIMEOUT_MS),
+  });
+  if (!localRes.ok) throw new Error(`weight-ocr service returned ${localRes.status}`);
+  return localRes.json();
+};
+
 router.post('/ocr-weight', authenticateToken, (req, res) => {
   photoUpload.single('image')(req, res, async (err) => {
     if (err) {
@@ -698,6 +715,25 @@ router.post('/ocr-weight', authenticateToken, (req, res) => {
     }
     if (!req.file) {
       return res.status(400).json({ success: false, message: 'No image provided' });
+    }
+    const engine = process.env.WEIGHT_OCR_ENGINE || 'openai';
+    if (engine === 'local' || engine === 'local+openai') {
+      const fallBackToOpenAI = engine === 'local+openai';
+      try {
+        const local = await readWeightLocally(req.file.buffer);
+        if (local.weight != null) {
+          return res.json({ success: true, weight: local.weight, raw: local.raw });
+        }
+        console.warn('Weight OCR no read:', local.reason, local.raw);
+        if (!fallBackToOpenAI) {
+          return res.json({ success: true, weight: null, raw: local.raw || 'NONE' });
+        }
+      } catch (localErr) {
+        console.error('Local weight OCR failed:', localErr);
+        if (!fallBackToOpenAI) {
+          return res.status(502).json({ success: false, message: 'OCR service error' });
+        }
+      }
     }
     if (!process.env.OPENAI_API_KEY) {
       return res.status(500).json({ success: false, message: 'OCR is not configured on the server' });
