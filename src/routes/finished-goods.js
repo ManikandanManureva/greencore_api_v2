@@ -91,6 +91,20 @@ function parseCategory(value) {
   return CATEGORIES.includes(value) ? value : 'finished_goods';
 }
 
+// Finished Goods and Flakes are tracked bag-by-bag (jumbo bags scanned at the finishing / washing
+// station); By Products are a typed weight that was either sold or discarded.
+function usesBags(category) {
+  return category === 'finished_goods' || category === 'flakes';
+}
+function parseBagCategory(value) {
+  return value === 'flakes' ? 'flakes' : 'finished_goods';
+}
+const DISPOSITIONS = ['sold', 'discarded'];
+function normalizeDisposition(category, value) {
+  if (category !== 'by_products') return 'sold';
+  return DISPOSITIONS.includes(value) ? value : 'sold';
+}
+
 function actorName(req) {
   return (req.user && (req.user.name || req.user.employeeId)) || null;
 }
@@ -231,8 +245,8 @@ async function logOpeningStockHistory(client, { category, materialTypeId, petTyp
 // the sum of its bags' own recorded weight. A bag is "available" once: it's Completed at the
 // material's finishing station, wasn't later consumed as input to a further step, and isn't
 // already linked to another shipment.
-async function findAvailableBag(client, material, bagQr) {
-  const codes = CATEGORY_STATIONS.finished_goods[material];
+async function findAvailableBag(client, material, bagQr, category = 'finished_goods') {
+  const codes = (CATEGORY_STATIONS[category] || CATEGORY_STATIONS.finished_goods)[material];
   if (!codes) return null;
   const r = await client.query(
     `SELECT pl.id AS production_log_id, pl.output_bag_qr AS bag_qr, pl.weight::numeric AS weight_kg
@@ -254,8 +268,8 @@ async function findAvailableBag(client, material, bagQr) {
   return r.rows[0] || null;
 }
 
-async function searchAvailableBags(client, material, query) {
-  const codes = CATEGORY_STATIONS.finished_goods[material];
+async function searchAvailableBags(client, material, query, category = 'finished_goods') {
+  const codes = (CATEGORY_STATIONS[category] || CATEGORY_STATIONS.finished_goods)[material];
   if (!codes) return [];
   const params = [material, codes];
   let extra = '';
@@ -283,9 +297,9 @@ async function searchAvailableBags(client, material, query) {
 
 // Validates every bag in the list is available right now, rejects duplicates, and sums their
 // weight — this sum becomes the shipment's weight_kg (never a manually typed figure).
-async function validateAndSumBags(client, material, bagQrList) {
+async function validateAndSumBags(client, material, bagQrList, category = 'finished_goods') {
   if (!Array.isArray(bagQrList) || bagQrList.length === 0) {
-    const err = new Error('Add at least one jumbo bag for a Finished Goods shipment.');
+    const err = new Error('Add at least one jumbo bag for this shipment.');
     err.status = 400;
     throw err;
   }
@@ -298,7 +312,7 @@ async function validateAndSumBags(client, material, bagQrList) {
   }
   const bags = [];
   for (const bagQr of unique) {
-    const found = await findAvailableBag(client, material, bagQr);
+    const found = await findAvailableBag(client, material, bagQr, category);
     if (!found) {
       const err = new Error(`Jumbo bag "${bagQr}" isn't available — check it exists, is marked Completed, matches ${material}, and isn't already in another shipment.`);
       err.status = 400;
@@ -326,7 +340,7 @@ router.get('/bags/search', async (req, res) => {
     if (!material || !MATERIALS.includes(material)) {
       return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
     }
-    const rows = await searchAvailableBags(pool, material, q ? String(q).trim() : '');
+    const rows = await searchAvailableBags(pool, material, q ? String(q).trim() : '', parseBagCategory(req.query.category));
     res.json({ success: true, data: rows });
   } catch (err) {
     console.error('Bag search error:', err.message);
@@ -343,7 +357,7 @@ router.get('/bags/scan', async (req, res) => {
     if (!code || !String(code).trim()) {
       return res.status(400).json({ success: false, message: 'No code scanned' });
     }
-    const bag = await findAvailableBag(pool, material, String(code).trim());
+    const bag = await findAvailableBag(pool, material, String(code).trim(), parseBagCategory(req.query.category));
     if (!bag) {
       return res.status(404).json({ success: false, message: `Bag "${code}" isn't available for ${material} — check it's Completed and not already shipped.` });
     }
@@ -365,10 +379,11 @@ router.post('/bags/bulk-check', async (req, res) => {
     if (!Array.isArray(codes) || codes.length === 0) {
       return res.status(400).json({ success: false, message: 'codes must be a non-empty array' });
     }
+    const bagCategory = parseBagCategory(req.body.category);
     const trimmed = [...new Set(codes.map((c) => String(c).trim()).filter(Boolean))];
     const results = [];
     for (const code of trimmed.slice(0, 200)) {
-      const bag = await findAvailableBag(pool, material, code);
+      const bag = await findAvailableBag(pool, material, code, bagCategory);
       results.push(bag
         ? { code, ok: true, bag_qr: bag.bag_qr, weight_kg: Number(bag.weight_kg) }
         : { code, ok: false, reason: 'Not available — check it exists, is Completed, matches the material, and isn\'t already shipped.' });
@@ -601,6 +616,10 @@ const TRACE_STAGES = [
   { code: 'WSH', label: 'WASHING' },
   { code: 'EXT', label: 'EXTRUDER' },
 ];
+// Flakes leave the plant after washing, so their trail stops there.
+function stagesFor(category) {
+  return category === 'flakes' ? TRACE_STAGES.slice(0, 2) : TRACE_STAGES;
+}
 
 // Every jumbo bag on a shipment (one DN / container) with the first Crusher / Washing / Extruder
 // step found walking its production lineage — the same data the viewer and the Excel export show.
@@ -651,6 +670,7 @@ async function shipmentsByIds(ids) {
 // shift, unit (sub-line), shift leader and a QC stamp column left for QC to fill.
 async function buildTraceabilityWorkbook(shipments) {
   const ExcelJS = require('exceljs');
+  const stages = stagesFor(shipments[0]?.category);
   const wb = new ExcelJS.Workbook();
   wb.creator = 'Greencore API';
   const ws = wb.addWorksheet('Traceability', { views: [{ state: 'frozen', ySplit: 2 }] });
@@ -658,11 +678,11 @@ async function buildTraceabilityWorkbook(shipments) {
   const baseHeaders = ['No. Invoice', 'No. DN', 'Tgl Shipment', 'Customer', 'No. Palet', 'No. Bag (Ext)', 'Qty/Net Weight (kg)'];
   const stageHeaders = ['MFG DATE', 'SHIFT', 'UNIT', 'SHIFT LEADER', 'STAMP QC'];
   // Base headers live in row 1 (the merged cell keeps its top-left value); stage headers in row 2.
-  const groupRow = ws.addRow([...baseHeaders, ...TRACE_STAGES.flatMap((st) => stageHeaders.map(() => `BATCH NUMBER ${st.label}`))]);
-  const headerRow = ws.addRow([...baseHeaders.map(() => null), ...TRACE_STAGES.flatMap(() => stageHeaders)]);
+  const groupRow = ws.addRow([...baseHeaders, ...stages.flatMap((st) => stageHeaders.map(() => `BATCH NUMBER ${st.label}`))]);
+  const headerRow = ws.addRow([...baseHeaders.map(() => null), ...stages.flatMap(() => stageHeaders)]);
   for (let i = 0; i < baseHeaders.length; i += 1) ws.mergeCells(1, i + 1, 2, i + 1);
   let col = baseHeaders.length + 1;
-  for (const stage of TRACE_STAGES) {
+  for (const stage of stages) {
     ws.mergeCells(1, col, 1, col + stageHeaders.length - 1);
     col += stageHeaders.length;
   }
@@ -688,13 +708,13 @@ async function buildTraceabilityWorkbook(shipments) {
     const bags = await traceShipmentBags(shipment.id);
     for (const bag of bags) {
       const row = [shipment.ref_no || '', shipment.dn_no || '', asDay(shipment.shipment_date), shipment.customer || '', '', bag.bag_qr, Number(bag.weight_kg)];
-      for (const stage of TRACE_STAGES) {
+      for (const stage of stages) {
         const e = bag.stages[stage.code];
         row.push(asDay(e?.mfg_date), e?.shift || '', e?.unit ?? '', e?.leader || '', '');
       }
       const added = ws.addRow(row);
       added.getCell(3).numFmt = 'dd/mm/yyyy';
-      TRACE_STAGES.forEach((_, i) => { added.getCell(baseHeaders.length + 1 + i * stageHeaders.length).numFmt = 'dd/mm/yyyy'; });
+      stages.forEach((_, i) => { added.getCell(baseHeaders.length + 1 + i * stageHeaders.length).numFmt = 'dd/mm/yyyy'; });
       added.eachCell({ includeEmpty: true }, (cell) => { cell.border = border; cell.alignment = { horizontal: 'center' }; });
       rows += 1;
     }
@@ -734,7 +754,7 @@ router.get('/shipments/traceability', async (req, res) => {
       success: true,
       data: {
         ref_no: first.ref_no, customer: first.customer, destination: first.destination, material: first.material, pet_type: first.pet_type,
-        stages: TRACE_STAGES, containers,
+        stages: stagesFor(first.category), containers,
         total_weight: containers.reduce((n, c) => n + c.weight_kg, 0),
         total_bags: containers.reduce((n, c) => n + c.bags.length, 0),
       },
@@ -922,7 +942,8 @@ router.get('/summary', async (req, res) => {
     const opening = await openingStockByMaterial(pool, category);
     const produced = await producedByMaterial(pool, category, cutoffMapFrom(opening));
     const shipped = await pool.query(
-      `SELECT mt.name AS material, s.pet_type, COALESCE(SUM(s.weight_kg), 0)::numeric AS shipped_weight
+      `SELECT mt.name AS material, s.pet_type, COALESCE(SUM(s.weight_kg), 0)::numeric AS shipped_weight,
+              COALESCE(SUM(s.weight_kg) FILTER (WHERE s.disposition = 'discarded'), 0)::numeric AS discarded_weight
        FROM finished_goods_shipments s
        JOIN material_types mt ON mt.id = s.material_type_id
        WHERE s.category = $1
@@ -931,6 +952,7 @@ router.get('/summary', async (req, res) => {
     );
     const producedMap = Object.fromEntries(produced.map((r) => [r.material, r]));
     const shippedMap = Object.fromEntries(shipped.rows.map((r) => [rowKey(r.material, r.pet_type), Number(r.shipped_weight)]));
+    const discardedMap = Object.fromEntries(shipped.rows.map((r) => [rowKey(r.material, r.pet_type), Number(r.discarded_weight)]));
 
     // PET's two types have no live "produced" figure — production doesn't distinguish
     // Bottle-sourced from Gallon-sourced output, so their available stock is opening - shipped
@@ -947,6 +969,7 @@ router.get('/summary', async (req, res) => {
         opening_weight: openingWeight,
         bag_count: trackedLive ? Number(producedMap[material]?.bag_count || 0) : 0,
         shipped_weight: shippedWeight,
+        discarded_weight: discardedMap[key] || 0,
         available_weight: Math.max(producedWeight + openingWeight - shippedWeight, 0),
         tracked_live: trackedLive,
       };
@@ -1176,8 +1199,8 @@ router.post('/shipments/batch', async (req, res) => {
   try {
     const { material, customer, destination, notes, packing_list_url } = req.body || {};
     const category = parseCategory(req.body.category);
-    if (category !== 'finished_goods') {
-      return res.status(400).json({ success: false, message: 'Multi-container shipments are only for Finished Goods' });
+    if (!usesBags(category)) {
+      return res.status(400).json({ success: false, message: 'Multi-container shipments are for Finished Goods and Flakes' });
     }
     if (!material || !MATERIALS.includes(material)) {
       return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
@@ -1221,7 +1244,7 @@ router.post('/shipments/batch', async (req, res) => {
     // bags are only linked after all validate), then check the REF's total against stock.
     const prepared = [];
     for (const c of containers) {
-      const { bags: validatedBags, totalWeight } = await validateAndSumBags(client, material, c.bags);
+      const { bags: validatedBags, totalWeight } = await validateAndSumBags(client, material, c.bags, category);
       prepared.push({ dn_no: String(c.dn_no).trim().slice(0, 60), vehicle_no: c.vehicle_no ? String(c.vehicle_no).trim().slice(0, 60) : null, ref_id: c.ref_id || null, bags: validatedBags, weight: totalWeight });
     }
     const requested = prepared.reduce((n, p) => n + p.weight, 0);
@@ -1289,6 +1312,7 @@ router.post('/shipments', async (req, res) => {
     const { material, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, bags, ref_id } = req.body || {};
     const refNo = await resolveRefNo(client, req.body.ref_no, ref_id);
     const category = parseCategory(req.body.category);
+    const disposition = normalizeDisposition(category, req.body.disposition);
     const shipment_date = req.body.shipment_date || null;
     if (!material || !MATERIALS.includes(material)) {
       return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
@@ -1304,8 +1328,8 @@ router.post('/shipments', async (req, res) => {
     // shipped, and the shipment's weight is the sum of those bags — never a typed-in figure.
     let weightNum;
     let bagsToLink = null;
-    if (category === 'finished_goods') {
-      const { bags: validatedBags, totalWeight } = await validateAndSumBags(client, material, bags);
+    if (usesBags(category)) {
+      const { bags: validatedBags, totalWeight } = await validateAndSumBags(client, material, bags, category);
       weightNum = totalWeight;
       bagsToLink = validatedBags;
     } else {
@@ -1341,10 +1365,10 @@ router.post('/shipments', async (req, res) => {
     const label = material === 'PET' ? `PET (${petType})` : material;
     const r = await client.query(
       `INSERT INTO finished_goods_shipments
-         (shipment_date, material_type_id, pet_type, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, category, "createdBy", ref_no)
-       VALUES (COALESCE($1::date, CURRENT_DATE), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+         (shipment_date, material_type_id, pet_type, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, category, "createdBy", ref_no, disposition)
+       VALUES (COALESCE($1::date, CURRENT_DATE), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        RETURNING *`,
-      [shipment_date, materialTypeId, petType, weightNum, customer || null, destination || null, vehicle_no || null, dn_no || null, notes || null, normalizePackingListForStorage(packing_list_url) || null, category, actor, refNo],
+      [shipment_date, materialTypeId, petType, weightNum, customer || null, destination || null, vehicle_no || null, dn_no || null, notes || null, normalizePackingListForStorage(packing_list_url) || null, category, actor, refNo, disposition],
     );
     const row = r.rows[0];
     if (bagsToLink) await linkShipmentBags(client, row.id, bagsToLink);
@@ -1357,7 +1381,9 @@ router.post('/shipments', async (req, res) => {
     const bagDetail = bagsToLink ? ` across ${bagsToLink.length} jumbo bag${bagsToLink.length === 1 ? '' : 's'}` : '';
     await logShipmentHistory(client, {
       shipmentId: row.id, category, materialTypeId, petType, action: 'created', actor,
-      details: `${fmtKg(weightNum)} ${label} recorded${bagDetail}${customer ? ` for ${customer}` : ''}${refNo ? ` (REF ${refNo})` : ''}${dn_no ? ` (DN ${dn_no})` : ''}.`,
+      details: disposition === 'discarded'
+        ? `${fmtKg(weightNum)} ${label} discarded (no value)${notes ? ` — ${notes}` : ''}.`
+        : `${fmtKg(weightNum)} ${label} recorded${bagDetail}${customer ? ` for ${customer}` : ''}${refNo ? ` (REF ${refNo})` : ''}${dn_no ? ` (DN ${dn_no})` : ''}.`,
     });
     await client.query('COMMIT');
     const resolvedUrl = await resolvePackingListUrl(row.packing_list_url);
@@ -1390,6 +1416,7 @@ router.put('/shipments/:id', async (req, res) => {
 
     const { material, weight_kg, customer, destination, vehicle_no, dn_no, notes, packing_list_url, bags, ref_id } = req.body || {};
     const refNo = await resolveRefNo(client, req.body.ref_no, ref_id);
+    const disposition = normalizeDisposition(category, req.body.disposition ?? existing.disposition);
     const shipment_date = req.body.shipment_date || existing.shipment_date;
     if (!material || !MATERIALS.includes(material)) {
       return res.status(400).json({ success: false, message: 'material must be one of PC, PE, PET' });
@@ -1406,10 +1433,12 @@ router.put('/shipments/:id', async (req, res) => {
     let weightNum;
     let bagsToLink = null;
     let bagCountChanged = false;
-    if (category === 'finished_goods') {
+    // Flakes shipments recorded before bag tracking carry a typed weight and no bag list; those
+    // keep the typed-weight path when amended (the form sends no `bags` for them).
+    if (usesBags(category) && Array.isArray(bags)) {
       const prevBags = await client.query('SELECT bag_qr FROM finished_goods_shipment_bags WHERE shipment_id = $1', [existing.id]);
       await client.query('DELETE FROM finished_goods_shipment_bags WHERE shipment_id = $1', [existing.id]);
-      const { bags: validatedBags, totalWeight } = await validateAndSumBags(client, material, bags);
+      const { bags: validatedBags, totalWeight } = await validateAndSumBags(client, material, bags, category);
       weightNum = totalWeight;
       bagsToLink = validatedBags;
       const prevSet = new Set(prevBags.rows.map((r) => r.bag_qr));
@@ -1450,11 +1479,11 @@ router.put('/shipments/:id', async (req, res) => {
     const r = await client.query(
       `UPDATE finished_goods_shipments SET
          shipment_date = COALESCE($1::date, shipment_date), material_type_id = $2, pet_type = $3, weight_kg = $4,
-         customer = $5, destination = $6, vehicle_no = $7, dn_no = $8, notes = $9, packing_list_url = $10, ref_no = $12
+         customer = $5, destination = $6, vehicle_no = $7, dn_no = $8, notes = $9, packing_list_url = $10, ref_no = $12, disposition = $13
        WHERE id = $11
        RETURNING *`,
       [shipment_date, materialTypeId, petType, weightNum, customer || null, destination || null, vehicle_no || null, dn_no || null, notes || null,
-        normalizePackingListForStorage(packing_list_url) || existing.packing_list_url, existing.id, refNo],
+        normalizePackingListForStorage(packing_list_url) || existing.packing_list_url, existing.id, refNo, disposition],
     );
     const row = r.rows[0];
     if (bagsToLink) await linkShipmentBags(client, existing.id, bagsToLink);
@@ -1476,6 +1505,7 @@ router.put('/shipments/:id', async (req, res) => {
     if ((existing.ref_no || '') !== (refNo || '')) changes.push(`REF no. "${existing.ref_no || '—'}" → "${refNo || '—'}"`);
     if ((existing.dn_no || '') !== (dn_no || '')) changes.push(`DN no. "${existing.dn_no || '—'}" → "${dn_no || '—'}"`);
     if ((existing.vehicle_no || '') !== (vehicle_no || '')) changes.push(`vehicle "${existing.vehicle_no || '—'}" → "${vehicle_no || '—'}"`);
+    if ((existing.disposition || 'sold') !== disposition) changes.push(`outcome ${existing.disposition || 'sold'} → ${disposition}`);
     const details = changes.length ? `Amended: ${changes.join('; ')}.` : 'Amended (no field changes detected).';
     await logShipmentHistory(client, { shipmentId: existing.id, category, materialTypeId, petType, action: 'amended', details, actor });
 
@@ -1547,7 +1577,7 @@ router.delete('/shipments/:id', async (req, res) => {
     await client.query('BEGIN');
     await logShipmentHistory(client, {
       shipmentId: existing.id, category: existing.category, materialTypeId: existing.material_type_id, petType: existing.pet_type, action: 'deleted', actor,
-      details: `${fmtKg(existing.weight_kg)} ${label} shipment${existing.customer ? ` to ${existing.customer}` : ''} deleted — stock restored.`,
+      details: `${fmtKg(existing.weight_kg)} ${label} ${existing.disposition === 'discarded' ? 'discard record' : 'shipment'}${existing.customer ? ` to ${existing.customer}` : ''} deleted — stock restored.`,
     });
     await client.query('DELETE FROM finished_goods_shipments WHERE id = $1', [existing.id]);
     await client.query('COMMIT');
