@@ -48,7 +48,7 @@ router.get('/meta', async (req, res) => {
 async function listRoles() {
   const r = await pool.query(
     `SELECT r.id, r.key, r.name, r.description, r.is_system, r.created_at, r.updated_at,
-            (SELECT COUNT(*)::int FROM users u WHERE u.role_id = r.id) AS user_count,
+            (SELECT COUNT(*)::int FROM users u WHERE u.role_id = r.id AND u.deleted_at IS NULL) AS user_count,
             COALESCE(json_object_agg(rp.module_key, json_build_object('read', rp.can_read, 'write', rp.can_write, 'delete', rp.can_delete))
                      FILTER (WHERE rp.module_key IS NOT NULL), '{}'::json) AS permissions
      FROM roles r LEFT JOIN role_permissions rp ON rp.role_id = r.id
@@ -139,12 +139,40 @@ router.delete('/roles/:id', async (req, res) => {
     const role = await roleById(pool, Number(req.params.id));
     if (!role) return res.status(404).json({ success: false, message: 'Role not found' });
     if (role.is_system) return res.status(400).json({ success: false, message: 'Built-in roles cannot be deleted' });
-    const inUse = await pool.query('SELECT COUNT(*)::int AS n FROM users WHERE role_id = $1', [role.id]);
-    if (inUse.rows[0].n > 0) {
-      return res.status(400).json({ success: false, message: `${inUse.rows[0].n} user(s) still have this role — move them to another role first` });
+    const inUse = await pool.query('SELECT COUNT(*)::int AS n FROM users WHERE role_id = $1 AND deleted_at IS NULL', [role.id]);
+    const n = inUse.rows[0].n;
+    // Users still on the role are moved first: to another dashboard role (?reassign_to=<id>) or
+    // to no dashboard role at all (?reassign_to=none — operator-app logins keep their PC/PE/PET
+    // role string and just stop appearing as a dashboard role).
+    const reassign = String(req.query.reassign_to || '').trim();
+    if (n > 0 && !reassign) {
+      return res.status(400).json({ success: false, message: `${n} user(s) still have this role — choose where to move them first` });
     }
-    await pool.query('DELETE FROM roles WHERE id = $1', [role.id]);
-    res.json({ success: true, message: 'Role deleted' });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      if (n > 0) {
+        if (reassign === 'none') {
+          await client.query('UPDATE users SET role_id = NULL WHERE role_id = $1', [role.id]);
+        } else {
+          const target = await roleById(client, Number(reassign));
+          if (!target || target.id === role.id) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, message: 'Choose a valid role to move the users to' });
+          }
+          await client.query('UPDATE users SET role_id = $1, role = $2 WHERE role_id = $3', [target.id, target.key, role.id]);
+        }
+        // Moved users pick up their new access on the next request (permissions are loaded per request).
+      }
+      await client.query('DELETE FROM roles WHERE id = $1', [role.id]);
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+    res.json({ success: true, message: n > 0 ? `Role deleted; ${n} user(s) moved` : 'Role deleted' });
   } catch (err) {
     console.error('Role delete error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to delete role' });
@@ -155,7 +183,7 @@ router.delete('/roles/:id', async (req, res) => {
 router.get('/', async (req, res) => {
   try {
     const { search, role, status } = req.query;
-    const where = [];
+    const where = ['u.deleted_at IS NULL'];
     const params = [];
     if (role && role !== 'all') {
       params.push(String(role));
@@ -293,13 +321,28 @@ router.delete('/:id', async (req, res) => {
   try {
     const targetId = Number(req.params.id);
     if (targetId === req.user.id) return res.status(400).json({ success: false, message: 'You cannot delete your own account' });
+    const existing = await pool.query('SELECT id, employee_id FROM users WHERE id = $1 AND deleted_at IS NULL', [targetId]);
+    if (existing.rows.length === 0) return res.status(404).json({ success: false, message: 'User not found' });
     await pool.query('DELETE FROM refresh_tokens WHERE user_id = $1', [targetId]).catch(() => {});
-    const r = await pool.query('DELETE FROM users WHERE id = $1 RETURNING id', [targetId]);
-    if (r.rows.length === 0) return res.status(404).json({ success: false, message: 'User not found' });
-    res.json({ success: true, message: 'User deleted' });
+    try {
+      await pool.query('DELETE FROM users WHERE id = $1', [targetId]);
+      return res.json({ success: true, message: 'User deleted' });
+    } catch (err) {
+      if (err.code !== '23503') throw err; // anything but "still referenced" is a real failure
+    }
+    // The login has production history (operator shifts point at it), which must stay intact for
+    // traceability. Retire the record instead: no login, hidden from the list, employee ID freed
+    // so it can be given to someone else, and dropped from its dashboard role.
+    await pool.query(
+      `UPDATE users SET is_active = false, deleted_at = NOW(), role_id = NULL,
+              employee_id = employee_id || '~deleted-' || id
+       WHERE id = $1`,
+      [targetId],
+    );
+    res.json({ success: true, message: 'User deleted — their past shifts and bags are kept for traceability', data: { retained_history: true } });
   } catch (err) {
     console.error('User delete error:', err.message);
-    res.status(500).json({ success: false, message: 'Could not delete user — they have linked records (shifts, bags…). Deactivate them instead.' });
+    res.status(500).json({ success: false, message: 'Could not delete user' });
   }
 });
 

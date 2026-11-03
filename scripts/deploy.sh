@@ -45,6 +45,7 @@ node src/scripts/create-finished-goods-bag-refs.js
 node src/scripts/add-finished-goods-bag-ref-used.js
 node src/scripts/add-finished-goods-shipment-ref-no.js
 node src/scripts/create-roles-permissions.js
+node src/scripts/add-users-deleted-at.js
 
 # QC Lab
 node src/scripts/create-qc-lab.js
@@ -66,6 +67,10 @@ echo "==> Restarting app under PM2..."
 # ecosystem.config.cjs name would suggest — it was started directly, not via that file).
 # Must run as root: this app's PM2 process lives under root's PM2 daemon, not ec2-user's.
 pm2 restart server --update-env
+# The free scale-photo reader, if it has been set up on this box (scripts/install-weight-ocr.sh).
+if pm2 describe weight-ocr > /dev/null 2>&1; then
+  pm2 restart weight-ocr
+fi
 
 echo "==> Done. Recent logs:"
 pm2 logs server --lines 20 --nostream
