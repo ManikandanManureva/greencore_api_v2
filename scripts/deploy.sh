@@ -47,6 +47,7 @@ node src/scripts/add-finished-goods-shipment-ref-no.js
 node src/scripts/create-roles-permissions.js
 node src/scripts/add-users-deleted-at.js
 node src/scripts/add-finished-goods-disposition.js
+node src/scripts/add-finished-goods-opening-stock-as-of.js
 
 # QC Lab
 node src/scripts/create-qc-lab.js

@@ -120,6 +120,14 @@ const CATEGORY_STATIONS = {
 // balance has been set for that material — so produced is counted only from the point the
 // opening balance was taken, instead of double-counting production already folded into it.
 // A material with no opening stock yet keeps the old all-time behaviour (no cutoff).
+//
+// The cutoff is the balance's as_of_date when one was entered (the balance is a closing figure
+// for that day, so production counts from the next day, in the DB session's time zone), else
+// the timestamp the balance was first saved.
+function cutoffSql(cutoff, paramIndex) {
+  return cutoff.kind === 'date' ? `($${paramIndex}::date + 1)` : `$${paramIndex}`;
+}
+
 function stationsSql(stationMap, cutoffMap, paramsOffset) {
   const clauses = [];
   const params = [];
@@ -130,9 +138,9 @@ function stationsSql(stationMap, cutoffMap, paramsOffset) {
     i += 2;
     const cutoff = cutoffMap[material];
     if (cutoff) {
-      params.push(cutoff);
+      params.push(cutoff.value);
       i += 1;
-      clause += ` AND pl.created_at >= $${i}`;
+      clause += ` AND pl.created_at >= ${cutoffSql(cutoff, i)}`;
     }
     clauses.push(`${clause})`);
   }
@@ -168,9 +176,9 @@ function byProductSql(cutoffMap, paramsOffset) {
     i += 1;
     const cutoff = cutoffMap[material];
     if (cutoff) {
-      params.push(cutoff);
+      params.push(cutoff.value);
       i += 1;
-      clause += ` AND b.created_at >= $${i}`;
+      clause += ` AND b.created_at >= ${cutoffSql(cutoff, i)}`;
     }
     clauses.push(`${clause})`);
   }
@@ -198,13 +206,14 @@ async function producedByMaterial(client, category, cutoffMap = {}) {
 
 async function openingStockByMaterial(client, category) {
   const r = await client.query(
-    `SELECT mt.name AS material, o.pet_type, o.weight_kg::numeric AS weight_kg, o."createdAt" AS created_at
+    `SELECT mt.name AS material, o.pet_type, o.weight_kg::numeric AS weight_kg, o."createdAt" AS created_at,
+            to_char(o.as_of_date, 'YYYY-MM-DD') AS as_of_date
      FROM finished_goods_opening_stock o
      JOIN material_types mt ON mt.id = o.material_type_id
      WHERE o.category = $1`,
     [category],
   );
-  return Object.fromEntries(r.rows.map((row) => [rowKey(row.material, row.pet_type), { weight: Number(row.weight_kg), createdAt: row.created_at }]));
+  return Object.fromEntries(r.rows.map((row) => [rowKey(row.material, row.pet_type), { weight: Number(row.weight_kg), createdAt: row.created_at, asOfDate: row.as_of_date }]));
 }
 
 // Only PC/PE get a cutoff — production doesn't distinguish PET's Bottle/Gallon types, so those
@@ -213,9 +222,28 @@ function cutoffMapFrom(opening) {
   const map = {};
   for (const material of ['PC', 'PE']) {
     const o = opening[rowKey(material, 'NA')];
-    if (o) map[material] = o.createdAt;
+    if (o) map[material] = o.asOfDate ? { kind: 'date', value: o.asOfDate } : { kind: 'ts', value: o.createdAt };
   }
   return map;
+}
+
+// The day production starts counting on top of the opening balance, as YYYY-MM-DD (null = never set).
+function producedFrom(o) {
+  if (!o) return null;
+  if (o.asOfDate) {
+    const d = new Date(`${o.asOfDate}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + 1);
+    return d.toISOString().slice(0, 10);
+  }
+  return o.createdAt ? new Date(o.createdAt).toISOString() : null;
+}
+
+const AS_OF_RE = /^\d{4}-\d{2}-\d{2}$/;
+function parseAsOfDate(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const s = String(v).slice(0, 10);
+  if (!AS_OF_RE.test(s) || Number.isNaN(new Date(`${s}T00:00:00Z`).getTime())) return undefined;
+  return s;
 }
 
 function fmtKg(n) {
@@ -826,7 +854,7 @@ router.get('/opening-stock', async (req, res) => {
   try {
     const category = parseCategory(req.query.category);
     const r = await pool.query(
-      `SELECT o.*, mt.name AS material
+      `SELECT o.*, to_char(o.as_of_date, 'YYYY-MM-DD') AS as_of_date, mt.name AS material
        FROM finished_goods_opening_stock o
        JOIN material_types mt ON mt.id = o.material_type_id
        WHERE o.category = $1`,
@@ -838,6 +866,8 @@ router.get('/opening-stock', async (req, res) => {
       return {
         material, pet_type: material === 'PET' ? petType : null,
         weight_kg: Number(row?.weight_kg || 0),
+        as_of_date: row?.as_of_date || null,
+        produced_from: row ? producedFrom({ asOfDate: row.as_of_date, createdAt: row.createdAt }) : null,
         notes: row?.notes || null,
         updatedAt: row?.updatedAt || null,
         updatedBy: row?.updatedBy || null,
@@ -866,6 +896,10 @@ router.put('/opening-stock', async (req, res) => {
     if (!Number.isFinite(weightNum) || weightNum < 0) {
       return res.status(400).json({ success: false, message: 'weight_kg must be a non-negative number' });
     }
+    const asOfDate = parseAsOfDate(req.body.as_of_date);
+    if (asOfDate === undefined) {
+      return res.status(400).json({ success: false, message: 'as_of_date must be a date (YYYY-MM-DD) or empty' });
+    }
     const mtRes = await client.query('SELECT id FROM material_types WHERE name = $1', [material]);
     if (mtRes.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Unknown material type' });
@@ -876,21 +910,29 @@ router.put('/opening-stock', async (req, res) => {
 
     await client.query('BEGIN');
     const existing = await client.query(
-      'SELECT weight_kg FROM finished_goods_opening_stock WHERE category = $1 AND material_type_id = $2 AND pet_type = $3',
+      `SELECT weight_kg, to_char(as_of_date, 'YYYY-MM-DD') AS as_of_date
+       FROM finished_goods_opening_stock WHERE category = $1 AND material_type_id = $2 AND pet_type = $3`,
       [category, materialTypeId, petType],
     );
     const r = await client.query(
-      `INSERT INTO finished_goods_opening_stock (category, material_type_id, pet_type, weight_kg, notes, "createdBy", "updatedBy")
-       VALUES ($1, $2, $3, $4, $5, $6, $6)
+      `INSERT INTO finished_goods_opening_stock (category, material_type_id, pet_type, weight_kg, as_of_date, notes, "createdBy", "updatedBy")
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
        ON CONFLICT (category, material_type_id, pet_type)
-       DO UPDATE SET weight_kg = $4, notes = $5, "updatedBy" = $6, "updatedAt" = NOW()
-       RETURNING *`,
-      [category, materialTypeId, petType, weightNum, notes || null, actor],
+       DO UPDATE SET weight_kg = $4, as_of_date = $5, notes = $6, "updatedBy" = $7, "updatedAt" = NOW()
+       RETURNING *, to_char(as_of_date, 'YYYY-MM-DD') AS as_of_date`,
+      [category, materialTypeId, petType, weightNum, asOfDate, notes || null, actor],
     );
     const isNew = existing.rows.length === 0;
-    const details = isNew
-      ? `Opening stock set to ${fmtKg(weightNum)} for ${label}.`
+    const prevAsOf = existing.rows[0]?.as_of_date || null;
+    const asOfText = asOfDate ? ` as of ${asOfDate}` : '';
+    let details = isNew
+      ? `Opening stock set to ${fmtKg(weightNum)}${asOfText} for ${label}.`
       : `Opening stock corrected from ${fmtKg(existing.rows[0].weight_kg)} to ${fmtKg(weightNum)} for ${label}.`;
+    if (!isNew && prevAsOf !== asOfDate) {
+      details += asOfDate
+        ? ` As-of date ${prevAsOf ? `changed from ${prevAsOf} to` : 'set to'} ${asOfDate}; production now counts from the next day.`
+        : ` As-of date ${prevAsOf} cleared; production counts from the first save again.`;
+    }
     await logOpeningStockHistory(client, {
       category, materialTypeId, petType, weightKg: weightNum, action: isNew ? 'created' : 'amended', details, actor,
     });
@@ -972,6 +1014,8 @@ router.get('/summary', async (req, res) => {
         discarded_weight: discardedMap[key] || 0,
         available_weight: Math.max(producedWeight + openingWeight - shippedWeight, 0),
         tracked_live: trackedLive,
+        // Day (YYYY-MM-DD) or timestamp production is counted from; null when no opening stock yet.
+        produced_from: trackedLive ? producedFrom(opening[rowKey(material, 'NA')]) : null,
       };
     });
     res.json({ success: true, data });
