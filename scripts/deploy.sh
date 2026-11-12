@@ -54,6 +54,9 @@ node src/scripts/create-qc-lab.js
 node src/scripts/create-qc-lab-user.js
 node src/scripts/add-qc-lab-photo-column.js
 
+# Procurement (PB → approvals → PO → LPB)
+node src/scripts/create-procurement.js
+
 # One-time data loads below are NOT run here — they're safe to re-run (they skip if data
 # already exists) but are listed separately since they're one-off imports, not schema setup:
 #   node src/scripts/seed-spareparts.js                     (initial spare parts catalog)

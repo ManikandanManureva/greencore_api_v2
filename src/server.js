@@ -16,6 +16,7 @@ const partsInventoryRoutes = require('./routes/parts-inventory');
 const sparePartsRoutes = require('./routes/spareparts');
 const finishedGoodsRoutes = require('./routes/finished-goods');
 const qcLabRoutes = require('./routes/qc-lab');
+const procurementRoutes = require('./routes/procurement');
 const usersRoutes = require('./routes/users');
 
 const app = express();
@@ -77,6 +78,8 @@ app.use('/api/spareparts', sparePartsRoutes);
 app.use('/spareparts', sparePartsRoutes);
 app.use('/api/finished-goods', finishedGoodsRoutes);
 app.use('/finished-goods', finishedGoodsRoutes);
+app.use('/api/procurement', procurementRoutes);
+app.use('/procurement', procurementRoutes);
 app.use('/api/qc-lab', qcLabRoutes);
 app.use('/qc-lab', qcLabRoutes);
 app.use('/api/users', usersRoutes);
