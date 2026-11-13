@@ -1,5 +1,15 @@
 const express = require('express');
 const router = express.Router();
+
+// A 500 whose real cause is "relation proc_requests does not exist" means the API was restarted
+// without running scripts/deploy.sh (which runs src/scripts/create-procurement.js) — say so,
+// instead of making someone dig through pm2 logs for it.
+function fail(res, err, message) {
+  if (err && err.code === '42P01') {
+    return res.status(500).json({ success: false, message: `${message}: the procurement tables are missing — run "node src/scripts/create-procurement.js" (part of scripts/deploy.sh) on the server.` });
+  }
+  res.status(500).json({ success: false, message });
+}
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -208,7 +218,7 @@ router.get('/approvers', async (req, res) => {
     res.json({ success: true, data: r.rows, stage, stage_label: STAGE_LABELS[stage] });
   } catch (err) {
     console.error('Procurement approvers error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to load approvers' });
+    fail(res, err, 'Failed to load approvers');
   }
 });
 
@@ -268,7 +278,7 @@ router.get('/items', async (req, res) => {
     res.json({ success: true, data: out });
   } catch (err) {
     console.error('Procurement items error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to load items' });
+    fail(res, err, 'Failed to load items');
   }
 });
 
@@ -302,7 +312,7 @@ router.get('/suppliers', async (req, res) => {
     res.json({ success: true, data: r.rows, suggestions: sugg.rows });
   } catch (err) {
     console.error('Procurement suppliers error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to load suppliers' });
+    fail(res, err, 'Failed to load suppliers');
   }
 });
 
@@ -343,7 +353,7 @@ router.post('/suppliers', async (req, res) => {
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ success: false, message: 'That supplier code is already used.' });
     console.error('Supplier create error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to create supplier' });
+    fail(res, err, 'Failed to create supplier');
   } finally { client.release(); }
 });
 
@@ -375,7 +385,7 @@ router.post('/suppliers/import', async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('Supplier import error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to import suppliers' });
+    fail(res, err, 'Failed to import suppliers');
   } finally { client.release(); }
 });
 
@@ -394,7 +404,7 @@ router.put('/suppliers/:id', async (req, res) => {
     res.json({ success: true, data: r.rows[0] });
   } catch (err) {
     console.error('Supplier update error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to update supplier' });
+    fail(res, err, 'Failed to update supplier');
   }
 });
 
@@ -409,7 +419,7 @@ router.delete('/suppliers/:id', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('Supplier delete error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to delete supplier' });
+    fail(res, err, 'Failed to delete supplier');
   }
 });
 
@@ -429,7 +439,7 @@ router.post('/uploads', imageUpload.single('image'), async (req, res) => {
     res.json({ success: true, data: { key: url, url, name: req.file.originalname } });
   } catch (err) {
     console.error('Procurement upload error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to upload image' });
+    fail(res, err, 'Failed to upload image');
   }
 });
 
@@ -526,7 +536,7 @@ router.get('/requests', async (req, res) => {
     res.json({ success: true, data: r.rows.map((row) => decorate(req, row)), total: count.rows[0].n, page, limit });
   } catch (err) {
     console.error('Procurement requests list error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to load requests' });
+    fail(res, err, 'Failed to load requests');
   }
 });
 
@@ -559,7 +569,7 @@ router.get('/requests/:id', async (req, res) => {
     });
   } catch (err) {
     console.error('Procurement request detail error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to load request' });
+    fail(res, err, 'Failed to load request');
   }
 });
 
@@ -606,7 +616,7 @@ router.post('/requests', async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('Procurement request create error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to create request' });
+    fail(res, err, 'Failed to create request');
   } finally { client.release(); }
 });
 
@@ -634,7 +644,7 @@ router.put('/requests/:id', async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('Procurement request update error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to update request' });
+    fail(res, err, 'Failed to update request');
   } finally { client.release(); }
 });
 
@@ -648,7 +658,7 @@ router.delete('/requests/:id', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('Procurement request delete error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to delete request' });
+    fail(res, err, 'Failed to delete request');
   }
 });
 
@@ -738,7 +748,7 @@ router.post('/requests/:id/note', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('Procurement note error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to add note' });
+    fail(res, err, 'Failed to add note');
   }
 });
 
@@ -754,7 +764,7 @@ router.post('/requests/:id/remind', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('Procurement remind error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to log reminder' });
+    fail(res, err, 'Failed to log reminder');
   }
 });
 
@@ -789,7 +799,7 @@ router.get('/receipts', async (req, res) => {
     res.json({ success: true, data: r.rows.map((x) => ({ ...x, total_qty: Number(x.total_qty) })), total: count.rows[0].n, page, limit });
   } catch (err) {
     console.error('Procurement receipts list error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to load receipts' });
+    fail(res, err, 'Failed to load receipts');
   }
 });
 
@@ -805,7 +815,7 @@ router.get('/receipts/:id', async (req, res) => {
     res.json({ success: true, data: { ...g.rows[0], items: items.rows.map((i) => ({ ...i, qty: Number(i.qty), ordered_qty: Number(i.ordered_qty), received_total: Number(i.received_total) })) } });
   } catch (err) {
     console.error('Procurement receipt detail error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to load receipt' });
+    fail(res, err, 'Failed to load receipt');
   }
 });
 
@@ -923,7 +933,7 @@ router.post('/receipts', async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('Procurement receipt create error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to record goods receipt' });
+    fail(res, err, 'Failed to record goods receipt');
   } finally { client.release(); }
 });
 
@@ -1003,7 +1013,7 @@ router.get('/summary', async (req, res) => {
     });
   } catch (err) {
     console.error('Procurement summary error:', err.message);
-    res.status(500).json({ success: false, message: 'Failed to load summary' });
+    fail(res, err, 'Failed to load summary');
   }
 });
 
