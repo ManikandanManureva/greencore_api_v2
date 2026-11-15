@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const pdfParse = require('pdf-parse');
+const ai = require('../utils/aiClient');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { requireModule } = require('../middleware/permissions');
@@ -1025,7 +1026,7 @@ router.get('/summary', async (req, res) => {
   }
 });
 
-// ─── Packing list extraction (upload PDF, OpenAI reads it, pre-fills the Record Shipment form) ─
+// ─── Packing list extraction (upload PDF, AI reads it, pre-fills the Record Shipment form) ─
 const MATERIAL_HINTS = `
   Use these phrases (seen on real packing lists) to identify the material in the "Description" line:
     - "PC Recycled Pellets", "Grade A - PC Recycled Pellets", "100% Post-Consumer Recycled Pellets",
@@ -1043,13 +1044,13 @@ router.post('/extract-packing-list', upload.single('file'), async (req, res) => 
 
     const parsed = await pdfParse(req.file.buffer).catch(() => null);
     const text = (parsed?.text || '').trim();
-    if (!text) {
-      return res.status(422).json({ success: false, message: 'Could not read text from that PDF' });
+    if (!ai.isConfigured()) {
+      return res.status(500).json({ success: false, message: 'OCR is not configured (missing ANTHROPIC_API_KEY / OPENAI_API_KEY)' });
     }
-
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      return res.status(500).json({ success: false, message: 'OCR is not configured (missing OPENAI_API_KEY)' });
+    // Claude reads the PDF itself, so scanned PDFs (no text layer) still work. Without Claude,
+    // we only have the text layer to go on.
+    if (!text && !ai.canReadScannedPdf()) {
+      return res.status(422).json({ success: false, message: 'Could not read text from that PDF' });
     }
 
     const prompt = `You are reading a packing list / shipping invoice from a plastic recycling exporter.
@@ -1066,30 +1067,17 @@ Extract shipment details as JSON only (no prose, no markdown fences). Fields:
   "notes": string | null            // short summary of extra shipping details (vessel, pallets, package count, gross weight) if present, else null
 }
 ${MATERIAL_HINTS}
-If a field isn't present in the document, use null. Respond with JSON only.
+If a field isn't present in the document, use null. Respond with JSON only.`;
 
-DOCUMENT TEXT:
-"""
-${text.slice(0, 12000)}
-"""`;
-
-    const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 500,
-        temperature: 0,
-      }),
-    });
-    if (!aiRes.ok) {
-      const errText = await aiRes.text().catch(() => '');
-      console.error('Packing list OCR OpenAI error:', aiRes.status, errText);
+    let raw = '';
+    try {
+      ({ text: raw } = await ai.askPdf({
+        buffer: req.file.buffer, text, prompt, maxTokens: 500, label: 'Packing list OCR',
+      }));
+    } catch (aiErr) {
+      console.error('Packing list OCR error:', aiErr.message, aiErr.details || '');
       return res.status(502).json({ success: false, message: 'Could not read the packing list right now' });
     }
-    const aiJson = await aiRes.json();
-    const raw = aiJson?.choices?.[0]?.message?.content || '';
     let extracted = {};
     try {
       const match = raw.match(/\{[\s\S]*\}/);

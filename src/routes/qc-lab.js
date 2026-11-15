@@ -6,6 +6,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const ai = require('../utils/aiClient');
 const { requireModule } = require('../middleware/permissions');
 const { isS3Configured, uploadBuffer, getSignedUrlForKey, keyFromS3Url } = require('../config/s3');
 
@@ -292,7 +293,7 @@ router.delete('/samples/:id', async (req, res) => {
 
 // ─── IV OCR ─────────────────────────────────────────────────────────────────────
 // Reads the Intrinsic Viscosity value off a lab instrument's display/printout photo via
-// OpenAI vision (same model/prompt style as production.js's /ocr-weight), and — unlike that
+// AI vision via utils/aiClient (same prompt style as production.js's /ocr-weight), and — unlike that
 // route — also persists the photo (S3 when configured, else local disk) so it can be reviewed
 // later from the sample record. Returns `stored` (what the client should submit back as
 // iv_photo_url when saving the sample) and `photo_url` (a URL usable immediately for preview).
@@ -315,47 +316,28 @@ router.post('/ocr-iv', (req, res) => {
     if (!req.file) {
       return res.status(400).json({ success: false, message: 'No image provided' });
     }
-    if (!process.env.OPENAI_API_KEY) {
+    if (!ai.isConfigured()) {
       return res.status(500).json({ success: false, message: 'OCR is not configured on the server' });
     }
     try {
-      const base64 = req.file.buffer.toString('base64');
       const mime = req.file.mimetype || 'image/jpeg';
-      const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'gpt-4o-mini',
-          messages: [
-            {
-              role: 'user',
-              content: [
-                {
-                  type: 'text',
-                  text:
-                    'This photo shows a lab instrument\'s display or printout for an Intrinsic Viscosity (IV) ' +
-                    'measurement of PET pellets, in dl/g. Typical readings are between 0.6 and 0.9. Read the IV ' +
-                    'value shown. Respond with ONLY the number (e.g. "0.798"), no units, no other words. If no ' +
-                    'readable IV value is visible, respond with exactly "NONE".',
-                },
-                { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}` } },
-              ],
-            },
-          ],
-          max_tokens: 20,
-          temperature: 0,
-        }),
-      });
-      if (!aiRes.ok) {
-        const errText = await aiRes.text();
-        console.error('OpenAI OCR error:', aiRes.status, errText);
+      let raw;
+      try {
+        ({ text: raw } = await ai.askImage({
+          buffer: req.file.buffer,
+          mime,
+          maxTokens: 20,
+          label: 'IV OCR',
+          prompt:
+            'This photo shows a lab instrument\'s display or printout for an Intrinsic Viscosity (IV) ' +
+            'measurement of PET pellets, in dl/g. Typical readings are between 0.6 and 0.9. Read the IV ' +
+            'value shown. Respond with ONLY the number (e.g. "0.798"), no units, no other words. If no ' +
+            'readable IV value is visible, respond with exactly "NONE".',
+        }));
+      } catch (aiErr) {
+        console.error('IV OCR error:', aiErr.message, aiErr.details || '');
         return res.status(502).json({ success: false, message: 'OCR service error' });
       }
-      const aiJson = await aiRes.json();
-      const raw = (aiJson?.choices?.[0]?.message?.content || '').trim();
       const match = raw.match(/-?\d+(\.\d+)?/);
       const iv = match ? parseFloat(match[0]) : null;
 

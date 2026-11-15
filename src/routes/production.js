@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const ai = require('../utils/aiClient');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -691,9 +692,10 @@ router.post('/upload-photo', authenticateToken, (req, res) => {
 // Reads the weight shown on a digital scale display photo, so the operator doesn't have to type
 // it in manually. The image is only ever held in memory for this one request — it is never
 // written to disk or S3 by this route. WEIGHT_OCR_ENGINE in .env picks the reader:
-//   openai (default)  OpenAI vision for every photo. Requires OPENAI_API_KEY.
+//   cloud (default)   AI vision for every photo, via utils/aiClient (Claude or OpenAI, picked by
+//                     AI_PROVIDER). "openai" is still accepted as an old name for this.
 //   local             the weight-ocr service on this server, no cost per read.
-//   local+openai      local first, OpenAI only for photos local can't read.
+//   local+cloud       local first, AI vision only for photos local can't read ("local+openai" also works).
 const WEIGHT_OCR_LOCAL_URL = process.env.WEIGHT_OCR_LOCAL_URL || 'http://127.0.0.1:8099/read';
 const WEIGHT_OCR_LOCAL_TIMEOUT_MS = 30000;
 
@@ -716,65 +718,45 @@ router.post('/ocr-weight', authenticateToken, (req, res) => {
     if (!req.file) {
       return res.status(400).json({ success: false, message: 'No image provided' });
     }
-    const engine = process.env.WEIGHT_OCR_ENGINE || 'openai';
-    if (engine === 'local' || engine === 'local+openai') {
-      const fallBackToOpenAI = engine === 'local+openai';
+    const engine = (process.env.WEIGHT_OCR_ENGINE || 'cloud').trim().toLowerCase();
+    if (engine === 'local' || engine === 'local+cloud' || engine === 'local+openai') {
+      const fallBackToCloud = engine !== 'local';
       try {
         const local = await readWeightLocally(req.file.buffer);
         if (local.weight != null) {
           return res.json({ success: true, weight: local.weight, raw: local.raw });
         }
         console.warn('Weight OCR no read:', local.reason, local.raw);
-        if (!fallBackToOpenAI) {
+        if (!fallBackToCloud) {
           return res.json({ success: true, weight: null, raw: local.raw || 'NONE' });
         }
       } catch (localErr) {
         console.error('Local weight OCR failed:', localErr);
-        if (!fallBackToOpenAI) {
+        if (!fallBackToCloud) {
           return res.status(502).json({ success: false, message: 'OCR service error' });
         }
       }
     }
-    if (!process.env.OPENAI_API_KEY) {
+    if (!ai.isConfigured()) {
       return res.status(500).json({ success: false, message: 'OCR is not configured on the server' });
     }
     try {
-      const base64 = req.file.buffer.toString('base64');
-      const mime = req.file.mimetype || 'image/jpeg';
-      const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'gpt-4o-mini',
-          messages: [
-            {
-              role: 'user',
-              content: [
-                {
-                  type: 'text',
-                  text:
-                    'This photo shows a digital weighing scale display. Read the numeric weight value ' +
-                    'currently shown on the display. Respond with ONLY the number (e.g. "510.0"), no ' +
-                    'units, no other words. If no readable number is visible, respond with exactly "NONE".',
-                },
-                { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}` } },
-              ],
-            },
-          ],
-          max_tokens: 20,
-          temperature: 0,
-        }),
-      });
-      if (!aiRes.ok) {
-        const errText = await aiRes.text();
-        console.error('OpenAI OCR error:', aiRes.status, errText);
+      let raw;
+      try {
+        ({ text: raw } = await ai.askImage({
+          buffer: req.file.buffer,
+          mime: req.file.mimetype || 'image/jpeg',
+          maxTokens: 20,
+          label: 'Weight OCR',
+          prompt:
+            'This photo shows a digital weighing scale display. Read the numeric weight value ' +
+            'currently shown on the display. Respond with ONLY the number (e.g. "510.0"), no ' +
+            'units, no other words. If no readable number is visible, respond with exactly "NONE".',
+        }));
+      } catch (aiErr) {
+        console.error('Weight OCR error:', aiErr.message, aiErr.details || '');
         return res.status(502).json({ success: false, message: 'OCR service error' });
       }
-      const aiJson = await aiRes.json();
-      const raw = (aiJson?.choices?.[0]?.message?.content || '').trim();
       const match = raw.match(/-?\d+(\.\d+)?/);
       const weight = match ? parseFloat(match[0]) : null;
       res.json({ success: true, weight, raw });
