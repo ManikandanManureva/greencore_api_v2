@@ -3,6 +3,8 @@ const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { requireModule, hasPermission } = require('../middleware/permissions');
+const { maybeAutoDraftPb } = require('../services/autoDraftPb');
+const ISSUE_TYPES = ['PM', 'BREAKDOWN', 'PPE', 'RETURN', 'OTHER'];
 
 /**
  * Spare Parts module — unified schema (v2). One catalog registry (spare_parts_catalogs) plus
@@ -255,7 +257,11 @@ async function logTransaction(req, res, itemId, fixedType) {
   const client = await pool.connect();
   try {
     const { transaction_type, qty, description, technician, remark, log_date } = req.body || {};
-    const type = fixedType || transaction_type;
+    // Issue type (PM / breakdown / PPE / return) and the machine the part went to. A RETURN puts
+    // the part back on the shelf, so it books as Received even on the Outgoing screen.
+    const issueType = ISSUE_TYPES.includes(String(req.body?.issue_type || '').toUpperCase()) ? String(req.body.issue_type).toUpperCase() : null;
+    let type = fixedType || transaction_type;
+    if (issueType === 'RETURN') type = 'Received';
     if (!['Received', 'Used'].includes(type)) {
       return res.status(400).json({ success: false, message: "transaction_type must be 'Received' or 'Used'" });
     }
@@ -267,9 +273,14 @@ async function logTransaction(req, res, itemId, fixedType) {
 
     await client.query('BEGIN');
     const partRes = await client.query(
-      'SELECT id, current_qty FROM spare_parts_items WHERE id = $1 AND catalog_id = $2 FOR UPDATE',
+      'SELECT id, part_no, description, unit, current_qty, min_stock FROM spare_parts_items WHERE id = $1 AND catalog_id = $2 FOR UPDATE',
       [itemId, req.catalog.id],
     );
+    let machine = { machine_id: null, machine_name: String(req.body?.machine_name || '').trim().slice(0, 120) || null };
+    if (Number(req.body?.machine_id)) {
+      const m = await client.query('SELECT id, name FROM proc_machines WHERE id = $1', [Number(req.body.machine_id)]);
+      if (m.rows.length) machine = { machine_id: m.rows[0].id, machine_name: m.rows[0].name };
+    }
     if (partRes.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ success: false, message: 'Part not found' });
@@ -279,16 +290,22 @@ async function logTransaction(req, res, itemId, fixedType) {
       return res.status(400).json({ success: false, message: `Insufficient stock. Available: ${partRes.rows[0].current_qty}, Requested: ${qtyNum}` });
     }
     const logRes = await client.query(
-      `INSERT INTO spare_parts_log (item_id, log_date, transaction_type, qty, description, technician, remark, "createdBy")
-       VALUES ($1, COALESCE($2::date, CURRENT_DATE), $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [itemId, log_date || null, type, signedQty, description || null, technician || null, remark || null, actorName(req)],
+      `INSERT INTO spare_parts_log (item_id, log_date, transaction_type, qty, description, technician, remark, "createdBy", issue_type, machine_id, machine_name)
+       VALUES ($1, COALESCE($2::date, CURRENT_DATE), $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+      [itemId, log_date || null, type, signedQty, description || null, technician || null, remark || null, actorName(req), issueType || (type === 'Used' ? 'OTHER' : null), machine.machine_id, machine.machine_name],
     );
     const updateRes = await client.query(
       `UPDATE spare_parts_items SET current_qty = current_qty + $2, "updatedAt" = NOW() WHERE id = $1 RETURNING *`,
       [itemId, signedQty],
     );
+    let autoPb = null;
+    if (type === 'Used' && req.body?.auto_pb !== false) {
+      const p = updateRes.rows[0];
+      autoPb = await maybeAutoDraftPb(client, req, { source: 'spare_part', source_id: p.id, code: p.part_no, description: p.description, unit: p.unit, stock: Number(p.current_qty), min: Number(p.min_stock) || 0, category: 'Sparepart' }, `SPI-${logRes.rows[0].id}`);
+      if (autoPb) await client.query('UPDATE spare_parts_log SET auto_pb_no = $2 WHERE id = $1', [logRes.rows[0].id, autoPb.pr_no]);
+    }
     await client.query('COMMIT');
-    res.status(201).json({ success: true, data: { log: logRes.rows[0], part: updateRes.rows[0] } });
+    res.status(201).json({ success: true, data: { log: { ...logRes.rows[0], auto_pb_no: autoPb ? autoPb.pr_no : null }, part: updateRes.rows[0] }, auto_pb: autoPb });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('Spare parts log error:', err.message);

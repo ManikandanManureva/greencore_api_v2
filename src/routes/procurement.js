@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { poolBalanceSql } = require('../services/stockPools');
 
 // A 500 whose real cause is "relation proc_requests does not exist" means the API was restarted
 // without running scripts/deploy.sh (which runs src/scripts/create-procurement.js) — say so,
@@ -470,10 +471,8 @@ router.get('/items', async (req, res) => {
     if (source === 'all' || source === 'part') {
       const r = await pool.query(
         `SELECT p.id, p.code, p.description, p.category AS group_name, p.uom AS unit, p.size_spec, p.variant, p.supplier, p.reorder_level,
-                COALESCE((SELECT SUM(quantity_received) FROM parts_stock_in WHERE part_id = p.id), 0)
-              + COALESCE((SELECT SUM(variance) FROM parts_stock_correction WHERE part_id = p.id AND status = 'approved'), 0)
-              - COALESCE((SELECT SUM(quantity_sent) FROM parts_outgoing WHERE part_id = p.id AND status IN ('issued','received')), 0)
-              - COALESCE((SELECT SUM(quantity_affected) FROM parts_damage_waste WHERE part_id = p.id AND status = 'approved'), 0) AS stock
+                ${poolBalanceSql('SALES', 'p.id')} AS stock,
+                ${poolBalanceSql('MOVING', 'p.id')} AS moving_stock
          FROM pm_item p
          WHERE p.is_active = true
            AND ($1 = '' OR p.code ILIKE $2 OR p.description ILIKE $2 OR p.category ILIKE $2 OR p.variant ILIKE $2)
@@ -486,7 +485,7 @@ router.get('/items', async (req, res) => {
         const min = x.reorder_level == null ? null : Number(x.reorder_level);
         out.push({
           source: 'part', source_id: x.id, code: x.code, description: x.description, unit: x.unit || 'Pcs',
-          stock, min_stock: min, group: x.group_name, catalog: 'Parts Inventory', catalog_key: null,
+          stock, moving_stock: Number(x.moving_stock || 0), min_stock: min, group: x.group_name, catalog: 'Parts Inventory', catalog_key: null,
           specification: [x.size_spec, x.variant].filter(Boolean).join(' · ') || null, supplier: x.supplier, category: 'Packaging',
           low: min != null && min > 0 && stock <= min,
         });
@@ -1028,6 +1027,7 @@ function parseLine(x) {
     qc_note: String(x.qc_note || '').trim() || null,
     image_key: String(x.image_key || '').trim() || null,
     image_name: String(x.image_name || '').trim().slice(0, 200) || null,
+    pool: String(x.pool || '').toUpperCase() === 'MOVING' ? 'MOVING' : 'SALES',
   };
 }
 // Outstanding on a PB line = ordered − received OK − hold still in quarantine.
@@ -1055,7 +1055,7 @@ async function reverseStock(client, req, { line, qty, receipt, reason }) {
   if (line.source === 'spare_part' && line.source_id) {
     await client.query(
       `INSERT INTO spare_parts_log (item_id, log_date, transaction_type, qty, description, technician, remark, "createdBy") VALUES ($1, $2, 'Used', $3, $4, $5, $6, $7)`,
-      [line.source_id, today, qty, `VOID ${receipt.grn_no}`, by, reason, by]);
+      [line.source_id, today, -qty, `VOID ${receipt.grn_no}`, by, reason, by]);
     await client.query(`UPDATE spare_parts_items SET current_qty = GREATEST(current_qty - $2, 0), "updatedAt" = NOW() WHERE id = $1`, [line.source_id, qty]);
     return true;
   }
@@ -1063,16 +1063,16 @@ async function reverseStock(client, req, { line, qty, receipt, reason }) {
     const part = await client.query('SELECT id, code, description, uom FROM pm_item WHERE id = $1', [line.source_id]);
     if (!part.rows.length) return false;
     const p = part.rows[0];
-    const bal = await client.query(
-      `SELECT COALESCE((SELECT SUM(quantity_received) FROM parts_stock_in WHERE part_id=$1),0)
-            + COALESCE((SELECT SUM(variance) FROM parts_stock_correction WHERE part_id=$1 AND status='approved'),0)
-            - COALESCE((SELECT SUM(quantity_sent) FROM parts_outgoing WHERE part_id=$1 AND status IN ('issued','received')),0)
-            - COALESCE((SELECT SUM(quantity_affected) FROM parts_damage_waste WHERE part_id=$1 AND status='approved'),0) AS qty`, [p.id]);
+    const siRef = String(line.stock_ref || line.hold_stock_ref || '');
+    const siId = /^SI-(\d+)$/.test(siRef) ? Number(siRef.slice(3)) : null;
+    const poolRow = siId ? await client.query('SELECT pool FROM parts_stock_in WHERE id = $1', [siId]) : { rows: [] };
+    const pool_ = poolRow.rows.length && poolRow.rows[0].pool === 'MOVING' ? 'MOVING' : 'SALES';
+    const bal = await client.query(`SELECT ${poolBalanceSql(pool_)} AS qty`, [p.id]);
     const current = parseFloat(bal.rows[0].qty) || 0;
     const ins = await client.query(
-      `INSERT INTO parts_stock_correction (correction_date, part_id, part_code, part_description, uom, current_stock, counted_stock, variance, reason, corrected_by, status, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'approved',$11) RETURNING id`,
-      [today, p.id, p.code, p.description, p.uom, current, current - qty, -qty, `VOID ${receipt.grn_no}`, by, reason]);
+      `INSERT INTO parts_stock_correction (correction_date, part_id, part_code, part_description, uom, current_stock, counted_stock, variance, reason, corrected_by, status, notes, pool)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'approved',$11,$12) RETURNING id`,
+      [today, p.id, p.code, p.description, p.uom, current, current - qty, -qty, `VOID ${receipt.grn_no}`, by, reason, pool_]);
     await client.query(
       `INSERT INTO parts_stock_ledger (transaction_date, transaction_type, reference_id, part_id, part_code, part_description, quantity_in, quantity_out, balance_after, performed_by, notes)
        VALUES ($1,'correction',$2,$3,$4,$5,NULL,$6,$7,$8,$9)`,
@@ -1201,22 +1201,17 @@ async function postToStock(client, req, { item, qty, receipt, row }) {
     if (!part.rows.length) return null;
     const p = part.rows[0];
     const ins = await client.query(
-      `INSERT INTO parts_stock_in (purchase_order_id, entry_date, supplier_name, part_id, part_code, part_description, uom, quantity_received, received_by, notes, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'verified') RETURNING id`,
-      [poNo || receipt.grn_no, receipt.receipt_date, receipt.supplier_name || (row && row.supplier_name) || 'Procurement', p.id, p.code, p.description, p.uom, qty, by, `${receipt.grn_no}${receipt.delivery_note ? ` · SJ ${receipt.delivery_note}` : ''}`],
+      `INSERT INTO parts_stock_in (purchase_order_id, entry_date, supplier_name, part_id, part_code, part_description, uom, quantity_received, received_by, notes, status, pool)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'verified',$11) RETURNING id`,
+      [poNo || receipt.grn_no, receipt.receipt_date, receipt.supplier_name || (row && row.supplier_name) || 'Procurement', p.id, p.code, p.description, p.uom, qty, by, `${receipt.grn_no}${receipt.delivery_note ? ` · SJ ${receipt.delivery_note}` : ''}`, item.pool === 'MOVING' ? 'MOVING' : 'SALES'],
     );
-    const bal = await client.query(
-      `SELECT COALESCE((SELECT SUM(quantity_received) FROM parts_stock_in WHERE part_id=$1),0)
-            + COALESCE((SELECT SUM(variance) FROM parts_stock_correction WHERE part_id=$1 AND status='approved'),0)
-            - COALESCE((SELECT SUM(quantity_sent) FROM parts_outgoing WHERE part_id=$1 AND status IN ('issued','received')),0)
-            - COALESCE((SELECT SUM(quantity_affected) FROM parts_damage_waste WHERE part_id=$1 AND status='approved'),0) AS qty`,
-      [p.id],
-    );
+    const pool_ = item.pool === 'MOVING' ? 'MOVING' : 'SALES';
+    const bal = await client.query(`SELECT ${poolBalanceSql(pool_)} AS qty`, [p.id]);
     const refId = `SI-${String(ins.rows[0].id).padStart(4, '0')}`;
     await client.query(
       `INSERT INTO parts_stock_ledger (transaction_date, transaction_type, reference_id, part_id, part_code, part_description, quantity_in, quantity_out, balance_after, performed_by, notes)
        VALUES ($1,'stock_in',$2,$3,$4,$5,$6,NULL,$7,$8,$9)`,
-      [receipt.receipt_date, refId, p.id, p.code, p.description, qty, parseFloat(bal.rows[0].qty) || 0, by, receipt.grn_no],
+      [receipt.receipt_date, refId, p.id, p.code, p.description, qty, parseFloat(bal.rows[0].qty) || 0, by, `${receipt.grn_no}${pool_ === 'MOVING' ? ' (moving pool)' : ''}`],
     );
     return refId;
   }
@@ -1316,10 +1311,10 @@ router.post('/receipts', async (req, res) => {
         if (stockRef) posted += 1;
       }
       await client.query(
-        `INSERT INTO proc_receipt_items (receipt_id, request_item_id, qty, condition, stock_ref, qty_ok, qty_reject, qty_hold, qc_note, image_key, image_name, source, source_id, item_code, description, unit)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+        `INSERT INTO proc_receipt_items (receipt_id, request_item_id, qty, condition, stock_ref, qty_ok, qty_reject, qty_hold, qc_note, image_key, image_name, source, source_id, item_code, description, unit, pool)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
         [receipt.id, l.request_item_id, l.qty_ok, l.qty_hold > 0 ? 'partial_damage' : l.qty_reject > 0 && l.qty_ok === 0 ? 'damaged' : l.qty_reject > 0 ? 'partial_damage' : 'good', stockRef,
-          l.qty_ok, l.qty_reject, l.qty_hold, l.qc_note, l.image_key, l.image_name, l.source, l.source_id, l.item_code, l.description, l.unit],
+          l.qty_ok, l.qty_reject, l.qty_hold, l.qc_note, l.image_key, l.image_name, l.source, l.source_id, l.item_code, l.description, l.unit, l.source === 'part' ? l.pool : null],
       );
       if (l.request_item_id && l.qty_ok > 0) await client.query('UPDATE proc_request_items SET received_qty = received_qty + $2 WHERE id = $1', [l.request_item_id, l.qty_ok]);
     }

@@ -4,8 +4,39 @@ const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { requireModule } = require('../middleware/permissions');
+const { POOLS, MOVEMENT_TYPES, poolForMovement, poolBalanceSql, poolQty, bothPools } = require('../services/stockPools');
+const { maybeAutoDraftPb } = require('../services/autoDraftPb');
 
 router.use(authenticateToken, requireModule('parts', 'Parts Inventory'));
+
+function parsePool(v, fallback = 'SALES') { return POOLS.includes(String(v || '').toUpperCase()) ? String(v).toUpperCase() : fallback; }
+// Movement type decides the pool an issue draws from; old clients still send only `purpose`.
+function parseMovement(v, purpose) {
+  const m = String(v || '').toUpperCase();
+  if (MOVEMENT_TYPES.includes(m) && m !== 'LEGACY') return m;
+  if (purpose === 'sale') return 'SALES_DISPATCH';
+  if (purpose === 'return') return 'RETURN';
+  if (purpose === 'production') return 'DAILY_MOVING';
+  return 'SALES_DISPATCH';
+}
+async function resolveMachine(client, body) {
+  const id = Number(body && body.machine_id) || null;
+  if (id) {
+    const r = await client.query('SELECT id, name FROM proc_machines WHERE id = $1', [id]);
+    if (r.rows.length) return { machine_id: r.rows[0].id, machine_name: r.rows[0].name };
+  }
+  const name = String((body && body.machine_name) || '').trim().slice(0, 120) || null;
+  return { machine_id: null, machine_name: name };
+}
+// After a SALES-pool deduction: draft a PB when the part sits at or below its reorder level.
+async function autoPbForPart(client, req, partId, sourceDoc, optOut) {
+  if (optOut === false) return null;
+  const p = await client.query('SELECT id, code, description, uom, reorder_level FROM pm_item WHERE id = $1', [partId]);
+  if (!p.rows.length) return null;
+  const part = p.rows[0];
+  const stock = await poolQty(client, partId, 'SALES');
+  return maybeAutoDraftPb(client, req, { source: 'part', source_id: part.id, code: part.code, description: part.description, unit: part.uom, stock, min: Number(part.reorder_level) || 0, category: 'Packaging' }, sourceDoc);
+}
 
 function paginate(query) {
   const page = Math.max(1, parseInt(query.page) || 1);
@@ -24,16 +55,9 @@ function parseDate(val) {
   return s; // already YYYY-MM-DD or ISO
 }
 
-async function availableQty(client, partId) {
-  const r = await client.query(`
-    SELECT
-      COALESCE((SELECT SUM(quantity_received) FROM parts_stock_in        WHERE part_id=$1),0)
-    + COALESCE((SELECT SUM(variance)           FROM parts_stock_correction WHERE part_id=$1 AND status='approved'),0)
-    - COALESCE((SELECT SUM(quantity_sent)       FROM parts_outgoing         WHERE part_id=$1 AND status IN ('issued','received')),0)
-    - COALESCE((SELECT SUM(quantity_affected)   FROM parts_damage_waste     WHERE part_id=$1 AND status='approved'),0)
-    AS qty
-  `, [partId]);
-  return parseFloat(r.rows[0].qty) || 0;
+// Balance of one pool (SALES = actual stock by default). See services/stockPools.js.
+async function availableQty(client, partId, pool = 'SALES') {
+  return poolQty(client, partId, pool);
 }
 
 async function writeLedger(client, { date, type, refId, partId, partCode, partDesc, qtyIn, qtyOut, balance, by, notes }) {
@@ -95,7 +119,7 @@ router.get('/available-stock', async (req, res) => {
         FROM parts_outgoing WHERE status IN ('issued','received') GROUP BY part_id
       ), rs AS (
         SELECT part_id, SUM(quantity_sent) AS total_reserved
-        FROM parts_outgoing WHERE status = 'issued' GROUP BY part_id
+        FROM parts_outgoing WHERE status = 'issued' AND movement_type <> 'RETURN' GROUP BY part_id
       ), dw AS (
         SELECT part_id,
           SUM(CASE WHEN incident_type = 'damaged' THEN quantity_affected ELSE 0 END) AS total_damaged,
@@ -109,8 +133,8 @@ router.get('/available-stock', async (req, res) => {
         SELECT
           p.id AS part_id, p.code AS part_code, p.description AS part_description,
           p.category, p.uom, p.reorder_level,
-          (COALESCE(si.total_in,0) + COALESCE(co.total_correction,0)
-           - COALESCE(og.total_out,0) - COALESCE(dw.total_damage,0)) AS available_quantity,
+          ${poolBalanceSql('SALES', 'p.id')} AS available_quantity,
+          ${poolBalanceSql('MOVING', 'p.id')} AS moving_quantity,
           COALESCE(rs.total_reserved,0) AS reserved_quantity,
           COALESCE(dw.total_damaged,0) AS damaged_quantity,
           COALESCE(dw.total_wasted,0) AS wasted_quantity,
@@ -126,7 +150,8 @@ router.get('/available-stock', async (req, res) => {
       ), with_status AS (
         SELECT
           part_id AS id, part_id, part_code, part_description, category, uom,
-          available_quantity, reserved_quantity, damaged_quantity, wasted_quantity,
+          available_quantity, moving_quantity, (available_quantity + moving_quantity) AS total_quantity,
+          reserved_quantity, damaged_quantity, wasted_quantity,
           reorder_level, last_counted_date,
           CASE
             WHEN available_quantity <= 0 THEN 'out_of_stock'
@@ -187,6 +212,7 @@ router.post('/stock-in', async (req, res) => {
   try {
     await client.query('BEGIN');
     const { purchase_order_id, supplier_name, part_id, quantity_received, unit_price, notes } = req.body || {};
+    const pool_ = parsePool(req.body.pool);
     const entry_date = parseDate(req.body.entry_date);
     const received_by = req.body.received_by || (req.user && req.user.name) || 'system';
     if (!entry_date || !supplier_name || !part_id || !quantity_received)
@@ -198,13 +224,13 @@ router.post('/stock-in', async (req, res) => {
     const r = await client.query(`
       INSERT INTO parts_stock_in
         (purchase_order_id, entry_date, supplier_name, part_id, part_code, part_description, uom,
-         quantity_received, unit_price, received_by, notes, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'verified')
+         quantity_received, unit_price, received_by, notes, status, pool)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'verified',$12)
       RETURNING *
     `, [purchase_order_id || null, entry_date, supplier_name, part_id, part.code, part.description,
-        part.uom, qty, unit_price || null, received_by, notes || null]);
+        part.uom, qty, unit_price || null, received_by, notes || null, pool_]);
     const inserted = r.rows[0];
-    const bal = await availableQty(client, part_id);
+    const bal = await availableQty(client, part_id, pool_);
     await writeLedger(client, {
       date: entry_date, type: 'stock_in',
       refId: `SI-${String(inserted.id).padStart(4, '0')}`,
@@ -296,6 +322,7 @@ router.post('/stock-correction', async (req, res) => {
   try {
     await client.query('BEGIN');
     const { part_id, current_stock, counted_stock, reason, notes } = req.body || {};
+    const pool_ = parsePool(req.body.pool);
     const correction_date = parseDate(req.body.correction_date);
     const corrected_by = req.body.corrected_by || (req.user && req.user.name) || 'system';
     if (!correction_date || part_id == null || current_stock == null || counted_stock == null || !reason)
@@ -307,11 +334,11 @@ router.post('/stock-correction', async (req, res) => {
     const r = await client.query(`
       INSERT INTO parts_stock_correction
         (correction_date, part_id, part_code, part_description, uom,
-         current_stock, counted_stock, variance, reason, corrected_by, notes, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending')
+         current_stock, counted_stock, variance, reason, corrected_by, notes, status, pool)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',$12)
       RETURNING *
     `, [correction_date, part_id, part.code, part.description, part.uom,
-        curr, counted, variance, reason, corrected_by, notes || null]);
+        curr, counted, variance, reason, corrected_by, notes || null, pool_]);
     await client.query('COMMIT');
     res.json({ success: true, data: r.rows[0] });
   } catch (err) {
@@ -429,29 +456,40 @@ router.post('/outgoing', async (req, res) => {
     const qty = parseFloat(quantity_sent);
     if (isNaN(qty) || qty <= 0)
       return res.status(400).json({ success: false, message: 'quantity_sent must be a positive number' });
+    const movement = parseMovement(req.body.movement_type, purpose);
+    const pool_ = poolForMovement(movement);
+    const machine = await resolveMachine(client, req.body);
     const part = await partInfo(client, part_id);
-    const currentQty = await availableQty(client, part_id);
-    if (qty > currentQty)
-      return res.status(400).json({ success: false, message: `Insufficient stock. Available: ${currentQty}, Requested: ${qty}` });
+    if (movement !== 'RETURN') {
+      const currentQty = await availableQty(client, part_id, pool_);
+      if (qty > currentQty)
+        return res.status(400).json({ success: false, message: `Insufficient ${pool_ === 'MOVING' ? 'moving pool' : 'sales'} stock. Available: ${currentQty}, Requested: ${qty}` });
+    }
     const r = await client.query(`
       INSERT INTO parts_outgoing
         (outgoing_date, reference_id, part_id, part_code, part_description, uom,
-         quantity_sent, destination, purpose, issued_by, received_by, notes, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'issued')
+         quantity_sent, destination, purpose, issued_by, received_by, notes, status, movement_type, machine_id, machine_name)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'issued',$13,$14,$15)
       RETURNING *
     `, [outgoing_date, reference_id || null, part_id, part.code, part.description, part.uom,
-        qty, destination || null, purpose, issued_by, received_by || null, notes || null]);
-    const inserted = r.rows[0];
-    const bal = await availableQty(client, part_id);
+        qty, destination || null, purpose, issued_by, received_by || null, notes || null, movement, machine.machine_id, machine.machine_name]);
+    let inserted = r.rows[0];
+    const refId = `OUT-${String(inserted.id).padStart(4, '0')}`;
+    const bal = await availableQty(client, part_id, pool_);
     await writeLedger(client, {
-      date: outgoing_date, type: 'outgoing',
-      refId: `OUT-${String(inserted.id).padStart(4, '0')}`,
+      date: outgoing_date, type: movement === 'RETURN' ? 'return' : 'outgoing',
+      refId,
       partId: part_id, partCode: part.code, partDesc: part.description,
-      qtyIn: null, qtyOut: qty,
-      balance: bal, by: issued_by, notes: notes || null,
+      qtyIn: movement === 'RETURN' ? qty : null, qtyOut: movement === 'RETURN' ? null : qty,
+      balance: bal, by: issued_by, notes: `${movement}${pool_ === 'MOVING' ? ' (moving pool)' : ''}${machine.machine_name ? ` · ${machine.machine_name}` : ''}${notes ? ` · ${notes}` : ''}`,
     });
+    let autoPb = null;
+    if (pool_ === 'SALES' && movement !== 'RETURN') {
+      autoPb = await autoPbForPart(client, req, part_id, refId, req.body.auto_pb);
+      if (autoPb) { await client.query('UPDATE parts_outgoing SET auto_pb_no = $2 WHERE id = $1', [inserted.id, autoPb.pr_no]); inserted = { ...inserted, auto_pb_no: autoPb.pr_no }; }
+    }
     await client.query('COMMIT');
-    res.json({ success: true, data: inserted });
+    res.json({ success: true, data: inserted, auto_pb: autoPb, pool: pool_, balance_after: bal });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     if (err.status === 404) return res.status(404).json({ success: false, message: err.message });
@@ -550,6 +588,8 @@ router.post('/damage-waste', async (req, res) => {
   try {
     await client.query('BEGIN');
     const { part_id, quantity_affected, incident_type, root_cause, location, approver, notes } = req.body || {};
+    const pool_ = parsePool(req.body.pool);
+    const machine = await resolveMachine(client, req.body);
     const incident_date = parseDate(req.body.incident_date);
     const reported_by = req.body.reported_by || (req.user && req.user.name) || 'system';
     if (!incident_date || !part_id || !quantity_affected || !incident_type || !root_cause || !location)
@@ -563,11 +603,11 @@ router.post('/damage-waste', async (req, res) => {
     const r = await client.query(`
       INSERT INTO parts_damage_waste
         (incident_date, part_id, part_code, part_description, uom,
-         quantity_affected, incident_type, root_cause, location, reported_by, approver, notes, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'reported')
+         quantity_affected, incident_type, root_cause, location, reported_by, approver, notes, status, pool, machine_id, machine_name)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'reported',$13,$14,$15)
       RETURNING *
     `, [incident_date, part_id, part.code, part.description, part.uom,
-        qty, incident_type, root_cause, location, reported_by, approver || null, notes || null]);
+        qty, incident_type, root_cause, location, reported_by, approver || null, notes || null, pool_, machine.machine_id, machine.machine_name]);
     await client.query('COMMIT');
     res.json({ success: true, data: r.rows[0] });
   } catch (err) {
@@ -599,20 +639,22 @@ router.put('/damage-waste/:id', async (req, res) => {
       `UPDATE parts_damage_waste SET ${sets.join(',')} WHERE id=$${vals.length} RETURNING *`, vals,
     );
     const updated = r.rows[0];
+    let autoPb = null;
     if (prev.status !== 'approved' && updated.status === 'approved') {
       const qty = parseFloat(updated.quantity_affected);
-      const bal = await availableQty(client, updated.part_id);
+      const bal = await availableQty(client, updated.part_id, updated.pool || 'SALES');
       await writeLedger(client, {
         date: updated.incident_date, type: 'damage_waste',
         refId: `DW-${String(id).padStart(4, '0')}`,
         partId: updated.part_id, partCode: updated.part_code, partDesc: updated.part_description,
         qtyIn: null, qtyOut: qty,
         balance: bal, by: updated.reported_by,
-        notes: `${updated.incident_type}: ${updated.root_cause}`,
+        notes: `${updated.incident_type}: ${updated.root_cause}${updated.pool === 'MOVING' ? ' (moving pool)' : ''}`,
       });
+      if ((updated.pool || 'SALES') === 'SALES') autoPb = await autoPbForPart(client, req, updated.part_id, `DW-${String(id).padStart(4, '0')}`, body.auto_pb);
     }
     await client.query('COMMIT');
-    res.json({ success: true, data: updated });
+    res.json({ success: true, data: updated, auto_pb: autoPb });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('Damage-waste update error:', err.message);
@@ -643,7 +685,7 @@ router.get('/stock-ledger', async (req, res) => {
       params.push(`%${String(search).trim()}%`);
       conds.push(`(part_code ILIKE $${params.length} OR part_description ILIKE $${params.length} OR reference_id ILIKE $${params.length})`);
     }
-    if (transaction_type && ['stock_in', 'correction', 'outgoing', 'damage_waste'].includes(transaction_type)) {
+    if (transaction_type && ['stock_in', 'correction', 'outgoing', 'return', 'damage_waste'].includes(transaction_type)) {
       params.push(transaction_type); conds.push(`transaction_type=$${params.length}`);
     }
     if (date_from) { params.push(date_from); conds.push(`transaction_date >= $${params.length}`); }
@@ -660,6 +702,84 @@ router.get('/stock-ledger', async (req, res) => {
   } catch (err) {
     console.error('Stock ledger error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to load stock ledger' });
+  }
+});
+
+// ─── 6b. Pool opening balances (warehouse cut-off sheet) ──────────────────────
+// The MOVING pool starts from the warehouse cut-off sheet; SALES can be seeded too when the
+// counted actual differs from the system balance at cut-off. One row per part+pool is kept —
+// re-importing a part replaces its previous opening for that pool.
+router.get('/pool-opening', async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT o.*, p.code AS part_code, p.description AS part_description, p.uom
+      FROM parts_pool_opening o JOIN pm_item p ON p.id = o.part_id
+      ORDER BY p.code, o.pool`);
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    console.error('Pool opening list error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to load opening balances' });
+  }
+});
+
+// Body: { as_of_date, notes?, rows: [{ code | part_id, sales?, moving? }] }  (either pool may be omitted)
+router.post('/pool-opening/import', async (req, res) => {
+  const { hasPermission } = require('../middleware/permissions');
+  if (!hasPermission(req.user, 'parts', 'delete'))
+    return res.status(403).json({ success: false, message: 'Only a Parts Inventory admin can import opening balances' });
+  const client = await pool.connect();
+  try {
+    const as_of_date = parseDate(req.body && req.body.as_of_date);
+    const rows = Array.isArray(req.body && req.body.rows) ? req.body.rows : [];
+    if (!as_of_date || !rows.length)
+      return res.status(400).json({ success: false, message: 'as_of_date and at least one row are required' });
+    const notes = String((req.body && req.body.notes) || '').trim().slice(0, 500) || null;
+    const by = (req.user && (req.user.name || req.user.employeeId)) || 'system';
+    const results = []; const errors = [];
+    await client.query('BEGIN');
+    for (let i = 0; i < rows.length; i += 1) {
+      const x = rows[i] || {};
+      const code = String(x.code || '').trim();
+      const found = x.part_id
+        ? await client.query('SELECT id, code FROM pm_item WHERE id = $1', [Number(x.part_id)])
+        : await client.query('SELECT id, code FROM pm_item WHERE UPPER(code) = UPPER($1)', [code]);
+      if (!found.rows.length) { errors.push({ row: i + 1, code: code || x.part_id, message: 'Item code not found' }); continue; }
+      const part = found.rows[0];
+      for (const p of POOLS) {
+        const key = p.toLowerCase();
+        if (x[key] === undefined || x[key] === null || x[key] === '') continue;
+        const qty = parseFloat(x[key]);
+        if (isNaN(qty) || qty < 0) { errors.push({ row: i + 1, code: part.code, message: `${key} must be a number ≥ 0` }); continue; }
+        await client.query('DELETE FROM parts_pool_opening WHERE part_id = $1 AND pool = $2', [part.id, p]);
+        await client.query(
+          `INSERT INTO parts_pool_opening (part_id, pool, qty, as_of_date, notes, "createdBy") VALUES ($1,$2,$3,$4,$5,$6)`,
+          [part.id, p, qty, as_of_date, notes, by]);
+        results.push({ code: part.code, pool: p, qty });
+      }
+    }
+    if (errors.length && !(req.body && req.body.partial)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: `${errors.length} row(s) could not be imported — nothing was saved`, errors });
+    }
+    await client.query('COMMIT');
+    res.json({ success: true, data: { imported: results.length, rows: results, errors } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('Pool opening import error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to import opening balances' });
+  } finally { client.release(); }
+});
+
+router.delete('/pool-opening/:id', async (req, res) => {
+  const { hasPermission } = require('../middleware/permissions');
+  if (!hasPermission(req.user, 'parts', 'delete'))
+    return res.status(403).json({ success: false, message: 'Only a Parts Inventory admin can remove opening balances' });
+  try {
+    const r = await pool.query('DELETE FROM parts_pool_opening WHERE id = $1 RETURNING id', [parseInt(req.params.id)]);
+    if (!r.rows.length) return res.status(404).json({ success: false, message: 'Record not found' });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to delete opening balance' });
   }
 });
 
