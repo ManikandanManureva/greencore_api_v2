@@ -56,6 +56,7 @@ node src/scripts/add-qc-lab-photo-column.js
 
 # Procurement (PB → approvals → PO → LPB)
 node src/scripts/create-procurement.js
+node src/scripts/add-procurement-approval-config.js
 
 # One-time data loads below are NOT run here — they're safe to re-run (they skip if data
 # already exists) but are listed separately since they're one-off imports, not schema setup:
