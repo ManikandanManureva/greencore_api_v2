@@ -417,7 +417,10 @@ router.get('/outgoing', async (req, res) => {
     const conds = [];
     if (search && String(search).trim()) {
       params.push(`%${String(search).trim()}%`);
-      conds.push(`(part_code ILIKE $${params.length} OR part_description ILIKE $${params.length} OR reference_id ILIKE $${params.length} OR destination ILIKE $${params.length})`);
+      conds.push(`(part_code ILIKE $${params.length} OR part_description ILIKE $${params.length} OR reference_id ILIKE $${params.length} OR destination ILIKE $${params.length} OR batch_no ILIKE $${params.length} OR shipment_ref ILIKE $${params.length} OR customer ILIKE $${params.length})`);
+    }
+    if (req.query.batch_no) { params.push(String(req.query.batch_no)); conds.push(`batch_no=$${params.length}`); }
+    if (req.query.shipment_ref) { params.push(String(req.query.shipment_ref)); conds.push(`shipment_ref=$${params.length}`);
     }
     if (status && ['issued', 'received', 'cancelled'].includes(status)) {
       params.push(status); conds.push(`status=$${params.length}`);
@@ -425,6 +428,7 @@ router.get('/outgoing', async (req, res) => {
     if (purpose && ['production', 'sale', 'sample', 'return', 'other'].includes(purpose)) {
       params.push(purpose); conds.push(`purpose=$${params.length}`);
     }
+    if (req.query.movement_type && ['SALES_DISPATCH','DAILY_MOVING','SPECIAL_CASE','RETURN','LEGACY'].includes(req.query.movement_type)) { params.push(req.query.movement_type); conds.push(`movement_type=$${params.length}`); }
     if (date_from) { params.push(parseDate(date_from)); conds.push(`outgoing_date >= $${params.length}`); }
     if (date_to) { params.push(parseDate(date_to)); conds.push(`outgoing_date <= $${params.length}`); }
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
@@ -442,60 +446,188 @@ router.get('/outgoing', async (req, res) => {
   }
 });
 
+// One issue line, shared by the single-row and the batch endpoint. Runs inside the caller's
+// transaction; throws { status, message } on validation problems.
+async function issueLine(client, req, header, line) {
+  const qty = parseFloat(line.quantity_sent);
+  if (isNaN(qty) || qty <= 0) throw Object.assign(new Error('quantity_sent must be a positive number'), { status: 400 });
+  const purpose = line.purpose || header.purpose || 'other';
+  const movement = parseMovement(line.movement_type || header.movement_type, purpose);
+  const pool_ = poolForMovement(movement);
+  const machine = await resolveMachine(client, line.machine_id || line.machine_name ? line : header);
+  const part = await partInfo(client, line.part_id);
+  if (movement !== 'RETURN') {
+    const currentQty = await availableQty(client, line.part_id, pool_);
+    if (qty > currentQty) throw Object.assign(new Error(`${part.code}: insufficient ${pool_ === 'MOVING' ? 'moving pool' : 'sales'} stock. Available: ${currentQty}, requested: ${qty}`), { status: 400 });
+  }
+  const notes = line.notes || header.notes || null;
+  const r = await client.query(`
+    INSERT INTO parts_outgoing
+      (outgoing_date, reference_id, part_id, part_code, part_description, uom,
+       quantity_sent, destination, purpose, issued_by, received_by, notes, status, movement_type, machine_id, machine_name, batch_no, shipment_ref, customer)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'issued',$13,$14,$15,$16,$17,$18)
+    RETURNING *
+  `, [header.outgoing_date, header.reference_id || null, line.part_id, part.code, part.description, part.uom,
+      qty, header.destination || null, purpose, header.issued_by, header.received_by || null, notes,
+      movement, movement === 'SALES_DISPATCH' ? null : machine.machine_id, movement === 'SALES_DISPATCH' ? null : machine.machine_name,
+      header.batch_no || null, movement === 'SALES_DISPATCH' ? header.shipment_ref || null : null, header.customer || null]);
+  let inserted = r.rows[0];
+  const refId = `OUT-${String(inserted.id).padStart(4, '0')}`;
+  const bal = await availableQty(client, line.part_id, pool_);
+  await writeLedger(client, {
+    date: header.outgoing_date, type: movement === 'RETURN' ? 'return' : 'outgoing',
+    refId,
+    partId: line.part_id, partCode: part.code, partDesc: part.description,
+    qtyIn: movement === 'RETURN' ? qty : null, qtyOut: movement === 'RETURN' ? null : qty,
+    balance: bal, by: header.issued_by,
+    notes: `${movement}${pool_ === 'MOVING' ? ' (moving pool)' : ''}${header.shipment_ref && movement === 'SALES_DISPATCH' ? ` · DO ${header.shipment_ref}` : ''}${movement !== 'SALES_DISPATCH' && machine.machine_name ? ` · ${machine.machine_name}` : ''}${notes ? ` · ${notes}` : ''}`,
+  });
+  let autoPb = null;
+  if (pool_ === 'SALES' && movement !== 'RETURN') {
+    autoPb = await autoPbForPart(client, req, line.part_id, refId, header.auto_pb);
+    if (autoPb) { await client.query('UPDATE parts_outgoing SET auto_pb_no = $2 WHERE id = $1', [inserted.id, autoPb.pr_no]); inserted = { ...inserted, auto_pb_no: autoPb.pr_no }; }
+  }
+  return { row: inserted, auto_pb: autoPb, pool: pool_, balance_after: bal };
+}
+
+function readHeader(req) {
+  const b = req.body || {};
+  return {
+    outgoing_date: parseDate(b.outgoing_date),
+    reference_id: String(b.reference_id || '').trim().slice(0, 100) || null,
+    shipment_ref: String(b.shipment_ref || '').trim().slice(0, 80) || null,
+    customer: String(b.customer || '').trim().slice(0, 160) || null,
+    destination: String(b.destination || '').trim().slice(0, 200) || null,
+    purpose: b.purpose, movement_type: b.movement_type, machine_id: b.machine_id, machine_name: b.machine_name,
+    issued_by: b.issued_by || (req.user && req.user.name) || 'system',
+    received_by: b.received_by || null, notes: b.notes || null, auto_pb: b.auto_pb,
+  };
+}
+
 router.post('/outgoing', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const { reference_id, part_id, quantity_sent, destination, purpose, received_by, notes } = req.body || {};
-    const outgoing_date = parseDate(req.body.outgoing_date);
-    const issued_by = req.body.issued_by || (req.user && req.user.name) || 'system';
-    if (!outgoing_date || !part_id || !quantity_sent || !purpose)
+    const header = readHeader(req);
+    const { part_id, quantity_sent, purpose } = req.body || {};
+    if (!header.outgoing_date || !part_id || !quantity_sent || !purpose)
       return res.status(400).json({ success: false, message: 'outgoing_date, part_id, quantity_sent, purpose are required' });
     if (!['production', 'sale', 'sample', 'return', 'other'].includes(purpose))
       return res.status(400).json({ success: false, message: 'purpose must be one of: production, sale, sample, return, other' });
-    const qty = parseFloat(quantity_sent);
-    if (isNaN(qty) || qty <= 0)
-      return res.status(400).json({ success: false, message: 'quantity_sent must be a positive number' });
-    const movement = parseMovement(req.body.movement_type, purpose);
-    const pool_ = poolForMovement(movement);
-    const machine = await resolveMachine(client, req.body);
-    const part = await partInfo(client, part_id);
-    if (movement !== 'RETURN') {
-      const currentQty = await availableQty(client, part_id, pool_);
-      if (qty > currentQty)
-        return res.status(400).json({ success: false, message: `Insufficient ${pool_ === 'MOVING' ? 'moving pool' : 'sales'} stock. Available: ${currentQty}, Requested: ${qty}` });
-    }
-    const r = await client.query(`
-      INSERT INTO parts_outgoing
-        (outgoing_date, reference_id, part_id, part_code, part_description, uom,
-         quantity_sent, destination, purpose, issued_by, received_by, notes, status, movement_type, machine_id, machine_name)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'issued',$13,$14,$15)
-      RETURNING *
-    `, [outgoing_date, reference_id || null, part_id, part.code, part.description, part.uom,
-        qty, destination || null, purpose, issued_by, received_by || null, notes || null, movement, machine.machine_id, machine.machine_name]);
-    let inserted = r.rows[0];
-    const refId = `OUT-${String(inserted.id).padStart(4, '0')}`;
-    const bal = await availableQty(client, part_id, pool_);
-    await writeLedger(client, {
-      date: outgoing_date, type: movement === 'RETURN' ? 'return' : 'outgoing',
-      refId,
-      partId: part_id, partCode: part.code, partDesc: part.description,
-      qtyIn: movement === 'RETURN' ? qty : null, qtyOut: movement === 'RETURN' ? null : qty,
-      balance: bal, by: issued_by, notes: `${movement}${pool_ === 'MOVING' ? ' (moving pool)' : ''}${machine.machine_name ? ` · ${machine.machine_name}` : ''}${notes ? ` · ${notes}` : ''}`,
-    });
-    let autoPb = null;
-    if (pool_ === 'SALES' && movement !== 'RETURN') {
-      autoPb = await autoPbForPart(client, req, part_id, refId, req.body.auto_pb);
-      if (autoPb) { await client.query('UPDATE parts_outgoing SET auto_pb_no = $2 WHERE id = $1', [inserted.id, autoPb.pr_no]); inserted = { ...inserted, auto_pb_no: autoPb.pr_no }; }
-    }
+    const out = await issueLine(client, req, header, { part_id, quantity_sent, purpose, movement_type: req.body.movement_type, notes: req.body.notes });
     await client.query('COMMIT');
-    res.json({ success: true, data: inserted, auto_pb: autoPb, pool: pool_, balance_after: bal });
+    res.json({ success: true, data: out.row, auto_pb: out.auto_pb, pool: out.pool, balance_after: out.balance_after });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
-    if (err.status === 404) return res.status(404).json({ success: false, message: err.message });
+    if (err.status) return res.status(err.status).json({ success: false, message: err.message });
     console.error('Outgoing create error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to create outgoing record' });
   } finally { client.release(); }
+});
+
+// Several packaging items under one reference in one go (one DO can need jumbo bags, inner
+// bags, liners, strapping…). Each line carries its own quantity and movement type; the header
+// carries the date, reference, customer (from the shipment when linked) and machine. All or
+// nothing: if any line fails its stock check, nothing is written.
+// Body: { outgoing_date, reference_id?, shipment_ref?, customer?, destination?, movement_type (default),
+//         machine_id|machine_name, received_by?, notes?, auto_pb?, mark_complete?,
+//         lines: [{ part_id, quantity_sent, movement_type?, machine_id?, machine_name?, notes? }] }
+router.post('/outgoing/batch', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const header = readHeader(req);
+    const lines = Array.isArray(req.body && req.body.lines) ? req.body.lines : [];
+    if (!header.outgoing_date) return res.status(400).json({ success: false, message: 'outgoing_date is required' });
+    if (!lines.length) return res.status(400).json({ success: false, message: 'Add at least one line' });
+    if (lines.some((l) => !l || !Number(l.part_id))) return res.status(400).json({ success: false, message: 'Every line needs a part' });
+    await client.query('BEGIN');
+    await client.query('LOCK TABLE parts_outgoing IN SHARE ROW EXCLUSIVE MODE');
+    const seq = await client.query(`SELECT COUNT(DISTINCT batch_no)::int AS n FROM parts_outgoing WHERE batch_no IS NOT NULL`);
+    header.batch_no = `PKG-${String(seq.rows[0].n + 1).padStart(5, '0')}`;
+    // purpose is a legacy column: derive it from the movement so old reports stay meaningful
+    const purposeFor = (m) => (m === 'SALES_DISPATCH' ? 'sale' : m === 'RETURN' ? 'return' : 'production');
+    const results = [];
+    for (const l of lines) {
+      const mv = parseMovement(l.movement_type || header.movement_type, 'other');
+      results.push(await issueLine(client, req, header, { ...l, purpose: purposeFor(mv), movement_type: mv }));
+    }
+    let refStatus = null;
+    if (header.shipment_ref) {
+      const complete = req.body.mark_complete === true;
+      await client.query(
+        `INSERT INTO parts_packaging_refs (ref_no, status, completed_by, completed_at, "updatedAt")
+         VALUES ($1, $2, $3, $4, NOW())
+         ON CONFLICT (ref_no) DO UPDATE SET status = EXCLUDED.status, completed_by = EXCLUDED.completed_by, completed_at = EXCLUDED.completed_at, "updatedAt" = NOW()`,
+        [header.shipment_ref, complete ? 'complete' : 'open', complete ? header.issued_by : null, complete ? new Date() : null]);
+      refStatus = complete ? 'complete' : 'open';
+    }
+    await client.query('COMMIT');
+    res.status(201).json({
+      success: true,
+      data: { batch_no: header.batch_no, rows: results.map((x) => x.row), shipment_ref: header.shipment_ref, ref_status: refStatus },
+      auto_pbs: results.map((x) => x.auto_pb).filter(Boolean),
+    });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (err.status) return res.status(err.status).json({ success: false, message: err.message });
+    console.error('Outgoing batch error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to save the packaging movement' });
+  } finally { client.release(); }
+});
+
+// Shipment references (Finished Goods / Flakes / By-products DO) that still need packaging.
+// A reference stays here until someone ticks "all packaging issued" — the system has no bill of
+// materials per shipment, so completeness is a human decision. ?all=1 lists completed ones too.
+router.get('/outgoing/sales-refs', async (req, res) => {
+  try {
+    const all = req.query.all === '1';
+    const search = String(req.query.search || '').trim();
+    const params = [];
+    const conds = [];
+    if (!all) conds.push(`COALESCE(p.status, 'open') = 'open'`);
+    if (search) { params.push(`%${search}%`); conds.push(`(g.ref_no ILIKE $${params.length} OR g.customer ILIKE $${params.length} OR g.destination ILIKE $${params.length} OR g.dn_nos ILIKE $${params.length})`); }
+    if (!search && !all) conds.push(`g.shipment_date >= CURRENT_DATE - INTERVAL '120 days'`);
+    const r = await pool.query(`
+      WITH g AS (
+        SELECT COALESCE(NULLIF(s.ref_no, ''), '#' || s.id) AS key, MAX(s.ref_no) AS ref_no, MIN(s.shipment_date) AS shipment_date,
+               MAX(s.customer) AS customer, MAX(s.destination) AS destination, MAX(s.category) AS category,
+               string_agg(DISTINCT mt.name, ', ') AS materials, string_agg(DISTINCT NULLIF(s.dn_no, ''), ', ') AS dn_nos,
+               COUNT(*)::int AS containers, SUM(s.weight_kg) AS weight_kg,
+               SUM((SELECT COUNT(*) FROM finished_goods_shipment_bags b WHERE b.shipment_id = s.id))::int AS bags
+        FROM finished_goods_shipments s JOIN material_types mt ON mt.id = s.material_type_id
+        GROUP BY 1
+      )
+      SELECT g.*, COALESCE(p.status, 'open') AS pkg_status, p.completed_at, p.completed_by, p.notes AS pkg_notes,
+             (SELECT COALESCE(json_agg(json_build_object('part_code', o.part_code, 'description', o.part_description, 'qty', o.quantity_sent, 'uom', o.uom, 'date', o.outgoing_date, 'batch_no', o.batch_no) ORDER BY o.id), '[]'::json)
+                FROM parts_outgoing o WHERE o.shipment_ref = g.key AND o.status <> 'cancelled') AS issued
+      FROM g LEFT JOIN parts_packaging_refs p ON p.ref_no = g.key
+      ${conds.length ? `WHERE ${conds.join(' AND ')}` : ''}
+      ORDER BY g.shipment_date DESC, g.key DESC
+      LIMIT 150`, params);
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    console.error('Sales refs error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to load shipment references' });
+  }
+});
+
+// Mark a reference's packaging complete (leaves the picker) or re-open it.
+router.put('/outgoing/sales-refs/:ref', async (req, res) => {
+  try {
+    const ref = String(req.params.ref || '').trim().slice(0, 80);
+    const status = req.body && req.body.status === 'complete' ? 'complete' : 'open';
+    const by = (req.user && (req.user.name || req.user.employeeId)) || 'system';
+    const r = await pool.query(
+      `INSERT INTO parts_packaging_refs (ref_no, status, notes, completed_by, completed_at, "updatedAt")
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (ref_no) DO UPDATE SET status = EXCLUDED.status, notes = COALESCE(EXCLUDED.notes, parts_packaging_refs.notes), completed_by = EXCLUDED.completed_by, completed_at = EXCLUDED.completed_at, "updatedAt" = NOW()
+       RETURNING *`,
+      [ref, status, String((req.body && req.body.notes) || '').trim() || null, status === 'complete' ? by : null, status === 'complete' ? new Date() : null]);
+    res.json({ success: true, data: r.rows[0] });
+  } catch (err) {
+    console.error('Sales ref status error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to update the reference' });
+  }
 });
 
 router.put('/outgoing/:id', async (req, res) => {

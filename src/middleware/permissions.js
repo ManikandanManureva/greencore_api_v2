@@ -14,7 +14,7 @@ const MODULES = [
   { key: 'overview',    label: 'Overview',           description: 'Plant-wide KPIs, trends and the live production-line view.' },
   { key: 'production',  label: 'Production Data',    description: 'Every jumbo bag scanned at every station, and shifts.' },
   { key: 'inventory',   label: 'Material Inventory', description: 'Gate entry, opening stock, consumption, outgoing and the stock ledger.' },
-  { key: 'parts',       label: 'Parts Inventory',    description: 'Packaging / parts master and its stock movements.' },
+  { key: 'parts',       label: 'Packing Material',   description: 'Packaging material master and its stock movements.' },
   { key: 'spare_parts', label: 'Spare Parts',        description: 'Machine spare parts for PC/PE and PET lines.' },
   { key: 'outgoing',    label: 'Outgoing / Sales',   description: 'Finished goods, flakes and by-product shipments, bag REF lists.' },
   { key: 'qc_lab',      label: 'QC Lab',             description: 'Pellet sampling and lab results.' },
