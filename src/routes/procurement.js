@@ -446,6 +446,7 @@ router.get('/items', async (req, res) => {
     const search = String(req.query.search || '').trim();
     const source = String(req.query.source || 'all');
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 60, 1), 500);
+    const sourceId = Number(req.query.source_id) || null; // one exact item (deep links from reminders)
     const like = `%${search}%`;
     const out = [];
     if (source === 'all' || source === 'spare_part') {
@@ -454,9 +455,10 @@ router.get('/items', async (req, res) => {
                 i.min_stock, i.supplier, c.label AS catalog, c.key AS catalog_key, i.machine, i.location
          FROM spare_parts_items i JOIN spare_parts_catalogs c ON c.id = i.catalog_id
          WHERE ($1 = '' OR i.part_no ILIKE $2 OR i.description ILIKE $2 OR i.category ILIKE $2 OR i.machine ILIKE $2)
+           AND ($4::int IS NULL OR i.id = $4)
          ORDER BY (i.min_stock IS NOT NULL AND i.current_qty <= i.min_stock) DESC, i.description
          LIMIT $3`,
-        [search, like, limit],
+        [search, like, limit, sourceId],
       );
       for (const x of r.rows) {
         out.push({
@@ -476,9 +478,10 @@ router.get('/items', async (req, res) => {
          FROM pm_item p
          WHERE p.is_active = true
            AND ($1 = '' OR p.code ILIKE $2 OR p.description ILIKE $2 OR p.category ILIKE $2 OR p.variant ILIKE $2)
+           AND ($4::int IS NULL OR p.id = $4)
          ORDER BY p.category, p.code
          LIMIT $3`,
-        [search, like, limit],
+        [search, like, limit, sourceId],
       );
       for (const x of r.rows) {
         const stock = Number(x.stock || 0);
@@ -1420,6 +1423,91 @@ router.post('/receipts/:id/void', async (req, res) => {
 });
 
 // ─── summary for the dashboard and reports ──────────────────────────────────
+// ─── Reminders (bell) ─────────────────────────────────────────────────────────
+// What needs this user's attention right now, grouped. Each group carries a link into the page
+// that resolves it. Nothing is stored — it is recomputed on every call, so there is no "mark as
+// read"; an item disappears when the work is done.
+function daysAgo(ts) { return ts ? Math.max(0, Math.floor((Date.now() - new Date(ts).getTime()) / 86400000)) : 0; }
+router.get('/reminders', async (req, res) => {
+  try {
+    const admin = isProcAdmin(req);
+    const k = roleKey(req);
+    const isPurchasing = admin || POST_APPROVAL_ROLES.approved.includes(k);
+    const isWarehouse = admin || POST_APPROVAL_ROLES.purchasing.includes(k);
+    const groups = [];
+    const reqRow = (r) => ({
+      id: r.id, title: r.pr_no, subtitle: `${r.department} · ${CATEGORY_LABELS[r.category] || r.category}${r.priority === 'Urgent' ? ' · URGENT' : ''}`,
+      link: `/procurement/requests/${r.id}`, age_days: daysAgo(r.updatedAt), urgent: r.priority === 'Urgent',
+    });
+
+    // 1. Approvals waiting for me
+    const qp = [];
+    const cond = queueCondition(req, qp);
+    const mine = await pool.query(`SELECT r.* FROM proc_requests r WHERE r.status = 'pending' AND ${cond} ORDER BY (r.priority = 'Urgent') DESC, r."updatedAt" LIMIT 20`, qp);
+    if (mine.rows.length) groups.push({ key: 'approvals', label: 'Waiting for your approval', count: mine.rows.length, link: '/procurement/approvals', tone: 'warning', items: mine.rows.map(reqRow) });
+
+    // 2. Approved, no PO yet (Purchasing)
+    if (isPurchasing) {
+      const r = await pool.query(`SELECT r.* FROM proc_requests r WHERE r.status = 'approved' ORDER BY (r.priority = 'Urgent') DESC, r."updatedAt" LIMIT 20`);
+      if (r.rows.length) groups.push({ key: 'po', label: 'Approved — PO not issued', count: r.rows.length, link: '/procurement/approvals?status=approved', tone: 'info', items: r.rows.map(reqRow) });
+    }
+
+    // 3. PO issued, goods not fully received (Warehouse)
+    if (isWarehouse) {
+      const r = await pool.query(`SELECT r.* FROM proc_requests r WHERE r.status IN ('purchasing','partially_received') ORDER BY r."updatedAt" LIMIT 20`);
+      if (r.rows.length) groups.push({ key: 'lpb', label: 'On PO — awaiting goods receipt', count: r.rows.length, link: '/procurement/approvals?status=purchasing', tone: 'info',
+        items: r.rows.map((x) => ({ ...reqRow(x), subtitle: `${x.po_no ? `PO ${x.po_no}` : 'PO'}${x.supplier_name ? ` · ${x.supplier_name}` : ''}${x.status === 'partially_received' ? ' · partial' : ''}` })) });
+      // 4. QC hold not resolved
+      const h = await pool.query(
+        `SELECT g.id, g.grn_no, g.receipt_date, g.supplier_name, SUM(x.qty_hold) AS hold FROM proc_receipts g JOIN proc_receipt_items x ON x.receipt_id = g.id
+         WHERE g.voided = false AND x.qty_hold > 0 GROUP BY g.id ORDER BY g.receipt_date LIMIT 20`);
+      if (h.rows.length) groups.push({ key: 'hold', label: 'QC hold waiting for a decision', count: h.rows.length, link: '/procurement/receipts?quick=hold', tone: 'warning',
+        items: h.rows.map((x) => ({ id: x.id, title: x.grn_no, subtitle: `${Number(x.hold)} on hold${x.supplier_name ? ` · ${x.supplier_name}` : ''}`, link: `/procurement/receipts?open=${x.id}`, age_days: daysAgo(x.receipt_date), urgent: false })) });
+    }
+
+    // 5. Unmatched manual PB (Purchasing reconciles)
+    if (isPurchasing) {
+      const u = await pool.query(`SELECT g.id, g.grn_no, g.manual_pb_no, g.receipt_date, g.supplier_name FROM proc_receipts g WHERE g.unmatched = true AND g.voided = false ORDER BY g.receipt_date LIMIT 20`);
+      if (u.rows.length) groups.push({ key: 'unmatched', label: 'Unmatched PB on a receipt', count: u.rows.length, link: '/procurement/receipts?quick=unmatched', tone: 'critical',
+        items: u.rows.map((x) => ({ id: x.id, title: x.grn_no, subtitle: `PB ${x.manual_pb_no || '-'}${x.supplier_name ? ` · ${x.supplier_name}` : ''}`, link: `/procurement/receipts?open=${x.id}`, age_days: daysAgo(x.receipt_date), urgent: false })) });
+      // 6. Overdue: required date passed, still open
+      const o = await pool.query(`SELECT r.* FROM proc_requests r WHERE r.required_date < CURRENT_DATE AND r.status NOT IN ('completed','rejected','cancelled','draft') ORDER BY r.required_date LIMIT 20`);
+      if (o.rows.length) groups.push({ key: 'overdue', label: 'Past the required date', count: o.rows.length, link: '/procurement/requests?status=open', tone: 'critical',
+        items: o.rows.map((x) => ({ ...reqRow(x), subtitle: `${x.department} · needed ${new Date(x.required_date).toISOString().slice(0, 10)} · ${STAGE_LABELS[x.status] || stageLabelFor(req.procStages, x) || x.status}` })) });
+    }
+
+    // 7. Auto-drafted PBs waiting to be reviewed (mine, or all for admin)
+    const dp = []; let dcond = "r.is_auto = true AND r.status = 'draft'";
+    if (!admin) { dp.push(req.user.id); dcond += ' AND r.requested_by_id = $1'; }
+    const d = await pool.query(`SELECT r.* FROM proc_requests r WHERE ${dcond} ORDER BY r."createdAt" DESC LIMIT 20`, dp);
+    if (d.rows.length) groups.push({ key: 'auto', label: 'Auto-drafted PB to review', count: d.rows.length, link: '/procurement/requests?status=draft', tone: 'info',
+      items: d.rows.map((x) => ({ ...reqRow(x), subtitle: `${x.source_doc ? `from ${x.source_doc} · ` : ''}${x.department}`, link: `/procurement/requests/${x.id}/edit` })) });
+
+    // 8. Low stock without an open PB (anyone who can raise a PB)
+    const low = await pool.query(`
+      WITH open_items AS (
+        SELECT i.source, i.source_id FROM proc_request_items i JOIN proc_requests r ON r.id = i.request_id
+        WHERE r.status NOT IN ('completed','rejected','cancelled')
+      ), sp AS (
+        SELECT 'spare_part' AS source, i.id AS source_id, i.part_no AS code, i.description, i.unit, i.current_qty AS stock, i.min_stock AS min
+        FROM spare_parts_items i WHERE i.min_stock IS NOT NULL AND i.min_stock > 0 AND i.current_qty <= i.min_stock
+      ), pm AS (
+        SELECT 'part' AS source, p.id AS source_id, p.code, p.description, p.uom AS unit, ${poolBalanceSql('SALES', 'p.id')} AS stock, p.reorder_level AS min
+        FROM pm_item p WHERE p.is_active = true AND p.reorder_level IS NOT NULL AND p.reorder_level > 0
+      )
+      SELECT * FROM (SELECT * FROM sp UNION ALL SELECT * FROM pm WHERE pm.stock <= pm.min) u
+      WHERE NOT EXISTS (SELECT 1 FROM open_items o WHERE o.source = u.source AND o.source_id = u.source_id)
+      ORDER BY (u.stock / NULLIF(u.min, 0)) LIMIT 30`);
+    if (low.rows.length) groups.push({ key: 'low', label: 'Low stock with no open PB', count: low.rows.length, link: '/procurement/requests/new', tone: 'critical',
+      items: low.rows.map((x) => ({ id: x.source_id, title: x.code || x.description, subtitle: `${x.description} · ${Number(x.stock)} / min ${Number(x.min)} ${x.unit || ''}`, link: `/procurement/requests/new?source=${x.source}&source_id=${x.source_id}`, age_days: 0, urgent: Number(x.stock) <= 0, source: x.source, source_id: x.source_id })) });
+
+    res.json({ success: true, data: { total: groups.reduce((a, g) => a + g.count, 0), groups, generated_at: new Date().toISOString() } });
+  } catch (err) {
+    console.error('Procurement reminders error:', err.message);
+    fail(res, err, 'Failed to load reminders');
+  }
+});
+
 router.get('/summary', async (req, res) => {
   try {
     const from = parseDate(req.query.from);
