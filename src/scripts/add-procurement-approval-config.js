@@ -79,7 +79,7 @@ async function run() {
         // Seed only when neither the code nor the name exists: the PB history import renames
         // DEPT-002 "Maintenance" to "Mechanical", and the seed must not recreate it.
         `INSERT INTO proc_departments (code, name, default_category)
-         SELECT $1, $2, $3 WHERE NOT EXISTS (SELECT 1 FROM proc_departments WHERE code = $1 OR name = $2)`,
+         SELECT $1::varchar, $2::varchar, $3::varchar WHERE NOT EXISTS (SELECT 1 FROM proc_departments WHERE code = $1::varchar OR name = $2::varchar)`,
         [d.code, d.name, d.default_category],
       );
     }
