@@ -60,6 +60,7 @@ node src/scripts/add-procurement-approval-config.js
 node src/scripts/add-procurement-receipt-qc.js
 node src/scripts/add-packaging-pools-issue-types.js
 node src/scripts/add-packaging-batch-sales-link.js
+node src/scripts/add-procurement-general-items.js
 
 # One-time data loads below are NOT run here — they're safe to re-run (they skip if data
 # already exists) but are listed separately since they're one-off imports, not schema setup:

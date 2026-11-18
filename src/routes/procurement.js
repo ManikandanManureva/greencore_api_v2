@@ -40,6 +40,14 @@ const { isS3Configured, uploadBuffer, getSignedUrlForKey } = require('../config/
  */
 
 const CATEGORIES = ['Sparepart', 'Packaging', 'General'];
+// Standard units of measure offered on PB / LPB lines and the general item master. Free text is
+// still accepted ("Other…") so an unusual unit never blocks a request.
+const UNITS = ['Pcs', 'Unit', 'Set', 'Pair', 'Box', 'Pack', 'Roll', 'Meter', 'Kg', 'Liter', 'Lot', 'Rim', 'Lembar', 'Dus', 'Lonjor', 'Batang', 'Galon', 'Botol', 'Kaleng', 'Sak', 'Drum', 'Tube', 'Bag', 'Jerigen', 'Service'];
+function canWriteProc(req) {
+  if (isProcAdmin(req)) return true;
+  const p = req.user && req.user.permissions && req.user.permissions.procurement;
+  return !!(p && p.write);
+}
 const CATEGORY_LABELS = { Sparepart: 'Sparepart', Packaging: 'Packaging', General: 'General & IT' };
 const STATUSES = ['draft', 'pending', 'approved', 'purchasing', 'partially_received', 'completed', 'rejected', 'cancelled'];
 const PENDING = ['pending'];
@@ -264,6 +272,7 @@ router.get('/me', async (req, res) => {
         categories: CATEGORIES,
         category_labels: CATEGORY_LABELS,
         statuses: STATUSES,
+        units: UNITS,
       },
     });
   } catch (err) {
@@ -507,10 +516,99 @@ router.get('/items', async (req, res) => {
         });
       }
     }
+    if (source === 'all' || source === 'general') {
+      const r = await pool.query(
+        `SELECT g.* FROM proc_general_items g
+         WHERE g.is_active = true
+           AND ($1 = '' OR g.code ILIKE $2 OR g.description ILIKE $2 OR g.group_name ILIKE $2 OR g.specification ILIKE $2)
+           AND ($4::int IS NULL OR g.id = $4)
+         ORDER BY g.description
+         LIMIT $3`,
+        [search, like, limit, sourceId],
+      );
+      for (const x of r.rows) {
+        out.push({
+          source: 'general', source_id: x.id, code: x.code, description: x.description, unit: x.uom || 'Pcs',
+          stock: null, min_stock: x.min_stock == null ? null : Number(x.min_stock), group: x.group_name, catalog: 'General & IT items', catalog_key: null,
+          specification: x.specification, supplier: x.supplier, location: x.location, category: 'General', low: false,
+        });
+      }
+    }
     res.json({ success: true, data: out });
   } catch (err) {
     console.error('Procurement items error:', err.message);
     fail(res, err, 'Failed to load items');
+  }
+});
+
+// ─── general & IT item master ────────────────────────────────────────────────
+// Items that are neither spare parts nor packaging. No stock is tracked; the master gives a PB a
+// stable code, description and unit. Any procurement user may add one (a requester typing a new
+// item), admins and Purchasing maintain them.
+function readGeneralItem(b) {
+  return {
+    code: String(b.code || '').trim().toUpperCase().slice(0, 40) || null,
+    description: String(b.description || '').trim().slice(0, 300),
+    specification: String(b.specification || '').trim() || null,
+    uom: String(b.uom || b.unit || 'Pcs').trim().slice(0, 30) || 'Pcs',
+    min_stock: b.min_stock === '' || b.min_stock == null ? null : Number(b.min_stock),
+    location: String(b.location || '').trim().slice(0, 80) || null,
+    supplier: String(b.supplier || '').trim().slice(0, 160) || null,
+    group_name: String(b.group_name || b.group || '').trim().slice(0, 80) || null,
+  };
+}
+async function nextGeneralCode(client) {
+  const r = await client.query(`SELECT COALESCE(MAX((regexp_match(code, '^GEN-(\\d+)$'))[1]::int), 0) AS n FROM proc_general_items`);
+  return `GEN-${String(r.rows[0].n + 1).padStart(4, '0')}`;
+}
+router.get('/general-items', async (req, res) => {
+  try {
+    const all = req.query.all === '1';
+    const r = await pool.query(`SELECT g.*, (SELECT COUNT(*)::int FROM proc_request_items i WHERE i.source = 'general' AND i.source_id = g.id) AS request_count
+                                FROM proc_general_items g ${all ? '' : 'WHERE g.is_active = true'} ORDER BY g.description`);
+    res.json({ success: true, data: r.rows });
+  } catch (err) { console.error('General items error:', err.message); fail(res, err, 'Failed to load general items'); }
+});
+router.post('/general-items', async (req, res) => {
+  if (!canWriteProc(req)) return res.status(403).json({ success: false, message: 'Your role cannot add items to the master.' });
+  const client = await pool.connect();
+  try {
+    const g = readGeneralItem(req.body);
+    if (!g.description) return res.status(400).json({ success: false, message: 'Description is required.' });
+    await client.query('BEGIN');
+    await client.query('LOCK TABLE proc_general_items IN SHARE ROW EXCLUSIVE MODE');
+    if (!g.code) g.code = await nextGeneralCode(client);
+    const dup = await client.query('SELECT id, code, description FROM proc_general_items WHERE UPPER(code) = $1 OR LOWER(description) = LOWER($2)', [g.code, g.description]);
+    if (dup.rows.length) { await client.query('ROLLBACK'); return res.status(409).json({ success: false, message: `Already in the master as ${dup.rows[0].code} — ${dup.rows[0].description}`, existing: dup.rows[0] }); }
+    const ins = await client.query(
+      `INSERT INTO proc_general_items (code, description, specification, uom, min_stock, location, supplier, group_name, "createdBy", "updatedBy")
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) RETURNING *`,
+      [g.code, g.description, g.specification, g.uom, g.min_stock, g.location, g.supplier, g.group_name, actorName(req)]);
+    await client.query('COMMIT');
+    const x = ins.rows[0];
+    res.status(201).json({ success: true, data: x, item: { source: 'general', source_id: x.id, code: x.code, description: x.description, unit: x.uom, stock: null, min_stock: x.min_stock == null ? null : Number(x.min_stock), group: x.group_name, catalog: 'General & IT items', catalog_key: null, specification: x.specification, supplier: x.supplier, location: x.location, category: 'General', low: false } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('General item create error:', err.message); fail(res, err, 'Failed to add the item');
+  } finally { client.release(); }
+});
+router.put('/general-items/:id', async (req, res) => {
+  if (!(isProcAdmin(req) || POST_APPROVAL_ROLES.approved.includes(roleKey(req)))) return res.status(403).json({ success: false, message: 'Only Purchasing or an admin can change the item master.' });
+  try {
+    const id = Number(req.params.id);
+    const cur = await pool.query('SELECT * FROM proc_general_items WHERE id = $1', [id]);
+    if (!cur.rows.length) return res.status(404).json({ success: false, message: 'Item not found' });
+    const g = readGeneralItem({ ...cur.rows[0], ...req.body, uom: req.body.uom || req.body.unit || cur.rows[0].uom, group_name: req.body.group_name ?? cur.rows[0].group_name });
+    if (!g.description) return res.status(400).json({ success: false, message: 'Description is required.' });
+    const isActive = req.body.is_active == null ? cur.rows[0].is_active : !!req.body.is_active;
+    const r = await pool.query(
+      `UPDATE proc_general_items SET code = $2, description = $3, specification = $4, uom = $5, min_stock = $6, location = $7, supplier = $8, group_name = $9, is_active = $10, "updatedBy" = $11, "updatedAt" = NOW()
+       WHERE id = $1 RETURNING *`,
+      [id, g.code || cur.rows[0].code, g.description, g.specification, g.uom, g.min_stock, g.location, g.supplier, g.group_name, isActive, actorName(req)]);
+    res.json({ success: true, data: r.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ success: false, message: 'That code is already used by another item.' });
+    console.error('General item update error:', err.message); fail(res, err, 'Failed to update the item');
   }
 });
 
@@ -685,7 +783,7 @@ function validateItems(items) {
     if (!desc) return { error: `Line ${i + 1}: description is required.` };
     const qty = Number(it.qty);
     if (!Number.isFinite(qty) || qty <= 0) return { error: `Line ${i + 1} (${desc}): quantity must be greater than 0.` };
-    const source = ['spare_part', 'part', 'custom'].includes(it.source) ? it.source : 'custom';
+    const source = ['spare_part', 'part', 'general', 'custom'].includes(it.source) ? it.source : 'custom';
     out.push({
       source, source_id: source === 'custom' ? null : (Number(it.source_id) || null),
       item_code: it.item_code ? String(it.item_code).trim() : null, description: desc,
@@ -1070,7 +1168,7 @@ function parseQty(v) { const n = Number(v); return Number.isFinite(n) && n > 0 ?
 function parseLine(x) {
   return {
     request_item_id: Number(x.request_item_id) || null,
-    source: ['spare_part', 'part', 'custom'].includes(x.source) ? x.source : null,
+    source: ['spare_part', 'part', 'general', 'custom'].includes(x.source) ? x.source : null,
     source_id: Number(x.source_id) || null,
     item_code: String(x.item_code || '').trim().slice(0, 60) || null,
     description: String(x.description || '').trim() || null,
@@ -1364,7 +1462,7 @@ router.post('/receipts', async (req, res) => {
     let posted = 0;
     for (const l of lines) {
       let stockRef = null;
-      if (postToStockFlag && l.qty_ok > 0 && l.source && l.source !== 'custom' && l.source_id) {
+      if (postToStockFlag && l.qty_ok > 0 && ['spare_part', 'part'].includes(l.source) && l.source_id) {
         stockRef = await postToStock(client, req, { item: l, qty: l.qty_ok, receipt, row });
         if (stockRef) posted += 1;
       }
@@ -1416,7 +1514,7 @@ router.post('/receipts/:id/hold', async (req, res) => {
       const h = Number(l.qty_hold);
       if (action === 'release') {
         let ref = null;
-        if (receipt.posted_to_stock && l.source && l.source !== 'custom' && l.source_id) ref = await postToStock(client, req, { item: l, qty: h, receipt, row });
+        if (receipt.posted_to_stock && ['spare_part', 'part'].includes(l.source) && l.source_id) ref = await postToStock(client, req, { item: l, qty: h, receipt, row });
         await client.query(`UPDATE proc_receipt_items SET qty_ok = qty_ok + $2, qty = qty + $2, qty_hold = 0, hold_resolved = 'ok', hold_stock_ref = $3, qc_note = CASE WHEN $4 <> '' THEN COALESCE(qc_note, '') || ' · released: ' || $4 ELSE qc_note END WHERE id = $1`, [l.id, h, ref, note]);
         if (l.request_item_id) await client.query('UPDATE proc_request_items SET received_qty = received_qty + $2 WHERE id = $1', [l.request_item_id, h]);
       } else {
