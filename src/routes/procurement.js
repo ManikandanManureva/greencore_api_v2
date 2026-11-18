@@ -1519,6 +1519,28 @@ router.get('/reminders', async (req, res) => {
   }
 });
 
+// ─── One-off migration: Google Form PB register upload (admin) ───────────────
+// Two workbooks in one multipart request: field "format" (PB_Upload_Format.xlsx) and field
+// "responses" (PB (Responses).xlsx). ?commit=1 writes; otherwise a dry run. Super admin / admin only.
+const { importPbHistory, reportCsv } = require('../services/pbHistoryImport');
+const historyUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 40 * 1024 * 1024 } });
+router.post('/import/pb-history', historyUpload.fields([{ name: 'format', maxCount: 1 }, { name: 'responses', maxCount: 1 }]), async (req, res) => {
+  const k = roleKey(req);
+  if (k !== 'super_admin' && k !== 'admin') return res.status(403).json({ success: false, message: 'Only an administrator can import the PB history' });
+  const f = req.files && req.files.format && req.files.format[0];
+  const r = req.files && req.files.responses && req.files.responses[0];
+  if (!f || !r) return res.status(400).json({ success: false, message: 'Upload both workbooks: the upload format and the form responses' });
+  const commit = req.query.commit === '1' || req.body.commit === '1' || req.body.commit === 'true';
+  try {
+    const out = await importPbHistory({ format: f.buffer, responses: r.buffer, commit });
+    console.log(`PB history import by ${actorName(req)}: ${commit ? 'COMMIT' : 'dry run'} — ${out.summary.inserted} inserted, ${out.summary.skipped} skipped`);
+    res.json({ success: true, data: { ...out.summary, report_csv: reportCsv(out.report), sample: out.report.slice(0, 50) } });
+  } catch (err) {
+    console.error('PB history import error:', err.message);
+    res.status(400).json({ success: false, message: `Import failed, nothing written: ${err.message}` });
+  }
+});
+
 router.get('/summary', async (req, res) => {
   try {
     const from = parseDate(req.query.from);
