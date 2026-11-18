@@ -72,14 +72,35 @@ node src/scripts/add-packaging-batch-sales-link.js
 # Run any of these by hand only if this server has never had that data loaded.
 
 echo "==> Restarting app under PM2..."
-# The running PM2 process on this box is named "server" (not "greencore-api" as its
-# ecosystem.config.cjs name would suggest — it was started directly, not via that file).
-# Must run as root: this app's PM2 process lives under root's PM2 daemon, not ec2-user's.
-pm2 restart server --update-env
-# The free scale-photo reader, if it has been set up on this box (scripts/install-weight-ocr.sh).
-if pm2 describe weight-ocr > /dev/null 2>&1; then
-  pm2 restart weight-ocr
+# The API normally runs under root's PM2 daemon as "server", but after a reboot or when the
+# console session lands in a different account it may live under ec2-user's daemon instead.
+# Find the process that runs this repo (any name, root first, then ec2-user) and restart it.
+find_pm2_name() {  # $1 = pm2 command prefix
+  $1 jlist 2>/dev/null | node -e '
+    let s = ""; process.stdin.on("data", (d) => s += d).on("end", () => {
+      try {
+        const l = JSON.parse(s);
+        const p = l.find((x) => /greencore_api_v2/.test((x.pm2_env && (x.pm2_env.pm_cwd + " " + x.pm2_env.pm_exec_path)) || "")) || l.find((x) => x.name === "server");
+        console.log(p ? p.name : "");
+      } catch { console.log(""); }
+    });'
+}
+restart_with() {  # $1 = pm2 command prefix, $2 = label
+  local name; name=$(find_pm2_name "$1")
+  [ -z "$name" ] && return 1
+  echo "   restarting PM2 process '$name' ($2)"
+  $1 restart "$name" --update-env
+  if $1 describe weight-ocr > /dev/null 2>&1; then $1 restart weight-ocr; fi
+  echo "==> Done. Recent logs:"
+  $1 logs "$name" --lines 20 --nostream
+  return 0
+}
+if ! restart_with "pm2" "$(whoami)"; then
+  if id ec2-user > /dev/null 2>&1 && restart_with "sudo -u ec2-user -i pm2" "ec2-user"; then :; else
+    echo "!! No PM2 process for this API was found under $(whoami) or ec2-user."
+    echo "   Check who owns port 3000:   ss -ltnp | grep ':3000'"
+    echo "   List processes:              pm2 list      and      sudo -u ec2-user -i pm2 list"
+    echo "   If nothing runs the API:     pm2 start src/server.js --name server && pm2 save"
+    exit 1
+  fi
 fi
-
-echo "==> Done. Recent logs:"
-pm2 logs server --lines 20 --nostream
