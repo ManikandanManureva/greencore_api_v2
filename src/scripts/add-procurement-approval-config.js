@@ -76,8 +76,10 @@ async function run() {
       )`);
     for (const d of DEPARTMENTS) {
       await client.query(
-        `INSERT INTO proc_departments (code, name, default_category) VALUES ($1, $2, $3)
-         ON CONFLICT (name) DO NOTHING`,
+        // Seed only when neither the code nor the name exists: the PB history import renames
+        // DEPT-002 "Maintenance" to "Mechanical", and the seed must not recreate it.
+        `INSERT INTO proc_departments (code, name, default_category)
+         SELECT $1, $2, $3 WHERE NOT EXISTS (SELECT 1 FROM proc_departments WHERE code = $1 OR name = $2)`,
         [d.code, d.name, d.default_category],
       );
     }
