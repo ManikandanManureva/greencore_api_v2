@@ -875,7 +875,12 @@ router.get('/requests/:id', async (req, res) => {
   try {
     const row = await loadRequest(pool, req.params.id);
     if (!row) return res.status(404).json({ success: false, message: 'Request not found' });
-    const items = await pool.query('SELECT * FROM proc_request_items WHERE request_id = $1 ORDER BY line_no', [row.id]);
+    const items = await pool.query(
+      `SELECT i.*, p.po_no, p.supplier_name AS po_supplier FROM proc_request_items i LEFT JOIN proc_request_pos p ON p.id = i.po_id
+       WHERE i.request_id = $1 ORDER BY i.line_no`, [row.id]);
+    const pos = await pool.query(
+      `SELECT p.*, (SELECT COUNT(*)::int FROM proc_request_items i WHERE i.po_id = p.id) AS line_count
+       FROM proc_request_pos p WHERE p.request_id = $1 ORDER BY p.po_at, p.id`, [row.id]);
     const receipts = await pool.query(
       `SELECT g.*, (SELECT COALESCE(SUM(qty), 0) FROM proc_receipt_items x WHERE x.receipt_id = g.id) AS total_qty
        FROM proc_receipts g WHERE g.request_id = $1 ORDER BY g.receipt_date DESC, g.id DESC`, [row.id]);
@@ -897,7 +902,7 @@ router.get('/requests/:id', async (req, res) => {
     }
     res.json({
       success: true,
-      data: { ...decorate(req, row), items: withImages, receipts: receipts.rows.map((g) => ({ ...g, total_qty: Number(g.total_qty) })), history: history.rows, approvers },
+      data: { ...decorate(req, row), items: withImages, pos: pos.rows, receipts: receipts.rows.map((g) => ({ ...g, total_qty: Number(g.total_qty) })), history: history.rows, approvers },
     });
   } catch (err) {
     console.error('Procurement request detail error:', err.message);
@@ -1057,25 +1062,89 @@ router.post('/requests/:id/cancel', (req, res) => transition(req, res, {
   apply: () => ({ to: 'cancelled', stageNo: null, note: String((req.body && req.body.reason) || '').trim() || 'Cancelled by requester' }),
 }));
 
-router.post('/requests/:id/purchase', (req, res) => transition(req, res, {
-  allowed: 'purchase', action: 'po_issued',
-  check: () => (String((req.body && req.body.po_no) || '').trim() ? null : 'Enter the PO number issued to the supplier.'),
-  apply: () => {
-    const b = req.body || {};
-    const poNo = String(b.po_no).trim();
-    const supplierId = Number(b.supplier_id) || null;
-    const supplierName = String(b.supplier_name || '').trim() || null;
-    const notes = String(b.purchase_notes || '').trim() || null;
-    return {
-      to: 'purchasing', stageNo: null, note: `PO ${poNo}${supplierName ? ` · ${supplierName}` : ''}${notes ? ` — ${notes}` : ''}`,
-      extraSql: ', po_no = $4, supplier_id = $5, supplier_name = COALESCE((SELECT name FROM proc_suppliers WHERE id = $5), $6), purchase_notes = $7, po_at = NOW()',
-      extraParams: [poNo, supplierId, supplierName, notes],
-    };
-  },
-}));
+// ─── POs: one PB can be split over several vendors ───────────────────────────
+// Each PO covers a chosen set of lines. proc_requests.po_no / supplier_* hold a summary of all POs
+// so lists, search, LPB matching and old reports keep working.
+async function syncPoSummary(client, requestId) {
+  const r = await client.query(
+    `SELECT string_agg(DISTINCT po_no, ', ' ORDER BY po_no) AS po_no, string_agg(DISTINCT supplier_name, ', ' ORDER BY supplier_name) AS supplier_name,
+            MIN(po_at) AS po_at, COUNT(*)::int AS n, MIN(supplier_id) AS one_supplier, COUNT(DISTINCT supplier_id)::int AS n_suppliers,
+            string_agg(notes, ' | ' ORDER BY id) FILTER (WHERE notes IS NOT NULL AND notes <> '') AS notes
+     FROM proc_request_pos WHERE request_id = $1`, [requestId]);
+  const x = r.rows[0];
+  await client.query(
+    `UPDATE proc_requests SET po_no = $2, supplier_name = $3, supplier_id = $4, po_at = $5, purchase_notes = $6 WHERE id = $1`,
+    [requestId, x.n ? x.po_no : null, x.n ? x.supplier_name : null, x.n_suppliers === 1 ? x.one_supplier : null, x.n ? x.po_at : null, x.n ? x.notes : null]);
+}
+function readPo(b) {
+  return {
+    po_no: String((b && b.po_no) || '').trim().slice(0, 60),
+    supplier_id: Number(b && b.supplier_id) || null,
+    supplier_name: String((b && b.supplier_name) || '').trim().slice(0, 160) || null,
+    notes: String((b && b.purchase_notes) || (b && b.notes) || '').trim() || null,
+    po_id: Number(b && b.po_id) || null,
+    item_ids: Array.isArray(b && b.item_ids) ? b.item_ids.map(Number).filter(Boolean) : null,
+  };
+}
+// Create or update a PO on a request and assign its lines. Shared by /purchase (first PO: moves
+// approved → purchasing) and /po (further POs or corrections while already in process).
+async function savePo(client, req, row, po) {
+  const lines = (await client.query('SELECT id, po_id, description FROM proc_request_items WHERE request_id = $1 ORDER BY line_no', [row.id])).rows;
+  let wanted = po.item_ids ? lines.filter((l) => po.item_ids.includes(l.id)) : lines.filter((l) => !l.po_id || l.po_id === po.po_id);
+  if (!po.item_ids && !po.po_id) wanted = lines.filter((l) => !l.po_id);
+  if (!wanted.length) throw Object.assign(new Error('Tick at least one line for this PO.'), { status: 400 });
+  const taken = wanted.find((l) => l.po_id && l.po_id !== po.po_id);
+  if (taken) throw Object.assign(new Error(`"${taken.description}" is already on another PO — edit that PO instead.`), { status: 400 });
+  let poId = po.po_id;
+  if (poId) {
+    const cur = await client.query('SELECT id FROM proc_request_pos WHERE id = $1 AND request_id = $2', [poId, row.id]);
+    if (!cur.rows.length) throw Object.assign(new Error('PO not found on this request'), { status: 404 });
+    await client.query(
+      `UPDATE proc_request_pos SET po_no = $2, supplier_id = $3, supplier_name = COALESCE((SELECT name FROM proc_suppliers WHERE id = $3), $4), notes = $5, "updatedBy" = $6, "updatedAt" = NOW() WHERE id = $1`,
+      [poId, po.po_no, po.supplier_id, po.supplier_name, po.notes, actorName(req)]);
+    await client.query('UPDATE proc_request_items SET po_id = NULL WHERE request_id = $1 AND po_id = $2', [row.id, poId]);
+  } else {
+    const ins = await client.query(
+      `INSERT INTO proc_request_pos (request_id, po_no, supplier_id, supplier_name, notes, "createdBy", "updatedBy")
+       VALUES ($1,$2,$3,COALESCE((SELECT name FROM proc_suppliers WHERE id = $3), $4),$5,$6,$6) RETURNING id`,
+      [row.id, po.po_no, po.supplier_id, po.supplier_name, po.notes, actorName(req)]);
+    poId = ins.rows[0].id;
+  }
+  await client.query('UPDATE proc_request_items SET po_id = $2 WHERE id = ANY($1::int[])', [wanted.map((l) => l.id), poId]);
+  await syncPoSummary(client, row.id);
+  const sup = (await client.query('SELECT supplier_name FROM proc_request_pos WHERE id = $1', [poId])).rows[0];
+  const left = (await client.query('SELECT COUNT(*)::int AS n FROM proc_request_items WHERE request_id = $1 AND po_id IS NULL', [row.id])).rows[0].n;
+  return { poId, lineCount: wanted.length, supplierName: sup && sup.supplier_name, left };
+}
 
-// Set or change the PO number / supplier on a request that is already on PO (e.g. imported history
-// that came without a PO number, or a corrected PO). Status does not change.
+router.post('/requests/:id/purchase', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const row = await loadRequest(client, req.params.id);
+    if (!row) return res.status(404).json({ success: false, message: 'Request not found' });
+    const d = decorate(req, row);
+    if (!d.can.purchase && !d.can.set_po) return res.status(403).json({ success: false, message: `You cannot process ${row.pr_no} to purchase at its current stage (${d.stage_label || row.status}).` });
+    const po = readPo(req.body);
+    if (!po.po_no) return res.status(400).json({ success: false, message: 'Enter the PO number issued to the supplier.' });
+    await client.query('BEGIN');
+    const out = await savePo(client, req, row, po);
+    const to = row.status === 'approved' ? 'purchasing' : row.status;
+    if (to !== row.status) await client.query(`UPDATE proc_requests SET status = $2, stage_no = NULL, "updatedBy" = $3, "updatedAt" = NOW() WHERE id = $1`, [row.id, to, actorName(req)]);
+    else await client.query(`UPDATE proc_requests SET "updatedBy" = $2, "updatedAt" = NOW() WHERE id = $1`, [row.id, actorName(req)]);
+    await logHistory(client, { requestId: row.id, action: 'po_issued', from: row.status, to,
+      note: `PO ${po.po_no}${out.supplierName ? ` · ${out.supplierName}` : ''} · ${out.lineCount} line(s)${out.left ? ` · ${out.left} line(s) still without PO` : ''}${po.notes ? ` — ${po.notes}` : ''}`, req });
+    await client.query('COMMIT');
+    const full = await loadRequest(pool, row.id);
+    res.json({ success: true, data: decorate(req, full), po_id: out.poId });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (err.status) return res.status(err.status).json({ success: false, message: err.message });
+    console.error('Procurement purchase error:', err.message);
+    fail(res, err, 'Failed to record the PO');
+  } finally { client.release(); }
+});
+
+// Further PO on a request already in process, or a correction of an existing one (po_id).
 router.post('/requests/:id/po', async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1083,25 +1152,20 @@ router.post('/requests/:id/po', async (req, res) => {
     if (!row) return res.status(404).json({ success: false, message: 'Request not found' });
     const d = decorate(req, row);
     if (!d.can.set_po) return res.status(403).json({ success: false, message: 'Only Purchasing can set the PO number on a request that is on PO.' });
-    const b = req.body || {};
-    const poNo = String(b.po_no || '').trim();
-    if (!poNo) return res.status(400).json({ success: false, message: 'Enter the PO number issued to the supplier.' });
-    const supplierId = Number(b.supplier_id) || null;
-    const supplierName = String(b.supplier_name || '').trim() || null;
-    const notes = String(b.purchase_notes || '').trim() || null;
+    const po = readPo(req.body);
+    if (!po.po_no) return res.status(400).json({ success: false, message: 'Enter the PO number issued to the supplier.' });
+    const before = po.po_id ? (await client.query('SELECT po_no FROM proc_request_pos WHERE id = $1', [po.po_id])).rows[0] : null;
     await client.query('BEGIN');
-    await client.query(
-      `UPDATE proc_requests SET po_no = $2, supplier_id = $3, supplier_name = COALESCE((SELECT name FROM proc_suppliers WHERE id = $3), $4),
-              purchase_notes = COALESCE($5, purchase_notes), po_at = COALESCE(po_at, NOW()), "updatedBy" = $6, "updatedAt" = NOW()
-       WHERE id = $1`,
-      [row.id, poNo, supplierId, supplierName, notes, actorName(req)]);
-    await logHistory(client, { requestId: row.id, action: 'po_updated', from: row.status, to: row.status,
-      note: `${row.po_no ? `PO ${row.po_no} → ${poNo}` : `PO ${poNo}`}${supplierName || supplierId ? ` · ${supplierName || ''}` : ''}${notes ? ` — ${notes}` : ''}`, req });
+    const out = await savePo(client, req, row, po);
+    await client.query(`UPDATE proc_requests SET "updatedBy" = $2, "updatedAt" = NOW() WHERE id = $1`, [row.id, actorName(req)]);
+    await logHistory(client, { requestId: row.id, action: po.po_id ? 'po_updated' : 'po_issued', from: row.status, to: row.status,
+      note: `${before && before.po_no !== po.po_no ? `PO ${before.po_no} → ${po.po_no}` : `PO ${po.po_no}`}${out.supplierName ? ` · ${out.supplierName}` : ''} · ${out.lineCount} line(s)${out.left ? ` · ${out.left} line(s) still without PO` : ''}${po.notes ? ` — ${po.notes}` : ''}`, req });
     await client.query('COMMIT');
     const fresh = await loadRequest(pool, row.id);
-    res.json({ success: true, data: decorate(req, fresh) });
+    res.json({ success: true, data: decorate(req, fresh), po_id: out.poId });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
+    if (err.status) return res.status(err.status).json({ success: false, message: err.message });
     console.error('Procurement set PO error:', err.message);
     fail(res, err, 'Failed to update the PO number');
   } finally { client.release(); }
@@ -1293,7 +1357,8 @@ router.get('/receipts/open-requests', async (req, res) => {
     const out = [];
     for (const row of r.rows) {
       const holds = await pendingHoldByItem(pool, row.id);
-      const lines = await pool.query(`SELECT id, line_no, source, source_id, item_code, description, specification, qty, unit, received_qty FROM proc_request_items i WHERE request_id = $1 ${source ? 'AND i.source = $2' : ''} ORDER BY line_no`, source ? [row.id, source] : [row.id]);
+      const lines = await pool.query(`SELECT i.id, i.line_no, i.source, i.source_id, i.item_code, i.description, i.specification, i.qty, i.unit, i.received_qty, i.po_id, p.po_no, p.supplier_name AS po_supplier
+                                       FROM proc_request_items i LEFT JOIN proc_request_pos p ON p.id = i.po_id WHERE i.request_id = $1 ${source ? 'AND i.source = $2' : ''} ORDER BY i.line_no`, source ? [row.id, source] : [row.id]);
       out.push({
         ...row,
         lines: lines.rows.map((l) => {
