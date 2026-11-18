@@ -99,6 +99,7 @@ router.post('/login', async (req, res) => {
         roleName: access.roleName,
         permissions: access.permissions,
         materialTypeId: user.material_type_id,
+        language: user.language || null,
         canCorrectProduction: user.can_correct_production === true
       }
     });
@@ -187,7 +188,7 @@ router.post('/refresh', async (req, res) => {
 // Verify token endpoint
 router.get('/verify', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query('SELECT last_login_at, material_type_id FROM users WHERE id = $1', [req.user.id]);
+    const result = await pool.query('SELECT last_login_at, material_type_id, language FROM users WHERE id = $1', [req.user.id]);
     res.json({
       success: true,
       user: {
@@ -201,6 +202,7 @@ router.get('/verify', authenticateToken, async (req, res) => {
         phone: req.user.phone,
         materialTypeId: result.rows[0]?.material_type_id,
         lastLoginAt: result.rows[0]?.last_login_at,
+        language: result.rows[0]?.language || null,
         canCorrectProduction: req.user.canCorrectProduction === true
       }
     });
@@ -210,6 +212,22 @@ router.get('/verify', authenticateToken, async (req, res) => {
       success: false,
       message: 'Internal server error'
     });
+  }
+});
+
+// Save the user's UI preferences (currently just the language) so they follow the account.
+const LANGS = ['en', 'id', 'fr'];
+router.put('/preferences', authenticateToken, async (req, res) => {
+  try {
+    const language = String(req.body?.language || '').toLowerCase();
+    if (!LANGS.includes(language)) {
+      return res.status(400).json({ success: false, message: `language must be one of ${LANGS.join(', ')}` });
+    }
+    await pool.query('UPDATE users SET language = $1 WHERE id = $2', [language, req.user.id]);
+    res.json({ success: true, data: { language } });
+  } catch (error) {
+    console.error('Save preferences error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
   }
 });
 
