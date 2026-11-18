@@ -151,12 +151,23 @@ function docNumber(kind, seq, date) {
   const roman = ROMAN[d.getMonth()];
   const yy = String(d.getFullYear()).slice(-2);
   const n = String(seq).padStart(3, '0');
-  return kind === 'PR' ? `PR ${n}/PB/NB/GRI/${roman}/${yy}` : `LPB ${n}/GRI/${roman}/${yy}`;
+  // PB numbers follow the client's register: 001/PB/NB/GRI/<month>/<yy>, restarting every month
+  // (the imported history uses the same form, so the sequence continues seamlessly).
+  return kind === 'PR' ? `${n}/PB/NB/GRI/${roman}/${yy}` : `LPB ${n}/GRI/${roman}/${yy}`;
 }
 async function nextSeq(client, table, dateCol, date) {
   const r = await client.query(
     `SELECT COUNT(*)::int AS n FROM ${table} WHERE date_trunc('year', ${dateCol}) = date_trunc('year', $1::date)`,
     [date],
+  );
+  return r.rows[0].n + 1;
+}
+// Next PB sequence for the month of `date`: highest number already used in that month + 1.
+async function nextPrSeq(client, date) {
+  const d = new Date(date);
+  const r = await client.query(
+    `SELECT COALESCE(MAX((regexp_match(pr_no, '(\\d{3})/PB/NB/GRI/'))[1]::int), 0) AS n FROM proc_requests WHERE pr_no LIKE $1`,
+    [`%/PB/NB/GRI/${ROMAN[d.getMonth()]}/${String(d.getFullYear()).slice(-2)}%`],
   );
   return r.rows[0].n + 1;
 }
@@ -807,7 +818,7 @@ router.post('/requests', async (req, res) => {
 
     await client.query('BEGIN');
     await client.query('LOCK TABLE proc_requests IN SHARE ROW EXCLUSIVE MODE');
-    let seq = await nextSeq(client, 'proc_requests', 'pr_date', prDate);
+    let seq = await nextPrSeq(client, prDate);
     let prNo = docNumber('PR', seq, prDate);
     for (let tries = 0; tries < 100; tries += 1) {
       const dup = await client.query('SELECT 1 FROM proc_requests WHERE pr_no = $1', [prNo]);

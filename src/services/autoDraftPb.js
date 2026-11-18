@@ -8,7 +8,7 @@
 const ROMAN = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII'];
 function prNumber(seq, date) {
   const d = date ? new Date(date) : new Date();
-  return `PR ${String(seq).padStart(3, '0')}/PB/NB/GRI/${ROMAN[d.getMonth()]}/${String(d.getFullYear()).slice(-2)}`;
+  return `${String(seq).padStart(3, '0')}/PB/NB/GRI/${ROMAN[d.getMonth()]}/${String(d.getFullYear()).slice(-2)}`;
 }
 
 /**
@@ -41,8 +41,10 @@ async function maybeAutoDraftPb(client, req, item, sourceDoc) {
   const actor = (req.user && (req.user.name || req.user.employeeId)) || 'System';
 
   await client.query('LOCK TABLE proc_requests IN SHARE ROW EXCLUSIVE MODE');
+  const d = new Date(today);
   const cnt = await client.query(
-    `SELECT COUNT(*)::int AS n FROM proc_requests WHERE date_trunc('year', pr_date) = date_trunc('year', $1::date)`, [today]);
+    `SELECT COALESCE(MAX((regexp_match(pr_no, '(\\d{3})/PB/NB/GRI/'))[1]::int), 0) AS n FROM proc_requests WHERE pr_no LIKE $1`,
+    [`%/PB/NB/GRI/${ROMAN[d.getMonth()]}/${String(d.getFullYear()).slice(-2)}%`]);
   let seq = cnt.rows[0].n + 1;
   let prNo = prNumber(seq, today);
   for (let tries = 0; tries < 100; tries += 1) {
