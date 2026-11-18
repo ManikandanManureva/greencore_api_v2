@@ -108,9 +108,10 @@ async function importPbHistory({ format, responses, commit }) {
     }
     let qty = parseFloat(String(r.get('Qty') ?? '').replace(',', '.'));
     if (!(qty > 0)) { warn(ref, `row ${r.n}: qty "${s(r.get('Qty'))}" not a number → 1`); qty = 1; }
+    // The form had one sample photo per PB; it is kept once in the request notes (Attachments), not per line.
     const image = s(r.get('Sample image'));
-    let spec = s(r.get('Specification / notes'));
-    if (image) spec = spec ? `${spec}\nSample: ${image}` : `Sample: ${image}`;
+    if (image) pb.images = [...new Set([...(pb.images || []), image])];
+    const spec = s(r.get('Specification / notes'));
     const minStock = parseFloat(String(r.get('Min. stock') ?? ''));
     pb.lines.push({ description: item, specification: spec || null, qty, unit: s(r.get('Unit')) || 'Pcs', min_stock: Number.isFinite(minStock) ? minStock : null });
   }
@@ -144,7 +145,7 @@ async function importPbHistory({ format, responses, commit }) {
     const approvedAt = r ? asDate(r.get('Tanggal Approval')) : null;
     const reviewAt = r ? asDate(r.get('Tanggal Review')) : null;
     const st = statusFor(r);
-    const attachments = r ? [...new Set(['Lampiran 1', 'Lampiran 2', 'Lampiran 3', 'Upload Contoh Barang'].map((k) => s(r.get(k))).filter(Boolean))] : [];
+    const attachments = [...new Set([...(r ? ['Lampiran 1', 'Lampiran 2', 'Lampiran 3', 'Upload Contoh Barang'].map((k) => s(r.get(k))).filter(Boolean) : []), ...(pb.images || [])])];
     const ket = r ? s(r.get('Keterangan')) : '';
     const area = r ? s(r.get('Area Pembelian')) : '';
     const extra = [];
