@@ -80,7 +80,9 @@ find_pm2_name() {  # $1 = pm2 command prefix
     let s = ""; process.stdin.on("data", (d) => s += d).on("end", () => {
       try {
         const l = JSON.parse(s);
-        const p = l.find((x) => /greencore_api_v2/.test((x.pm2_env && (x.pm2_env.pm_cwd + " " + x.pm2_env.pm_exec_path)) || "")) || l.find((x) => x.name === "server");
+        // the API itself: node running this repo's server.js (not the weight-ocr python helper that lives in a sub-folder)
+        const isApi = (x) => x.name !== "weight-ocr" && /greencore_api_v2\/(src\/)?server\.(js|cjs|mjs)$/.test((x.pm2_env && x.pm2_env.pm_exec_path) || "");
+        const p = l.find(isApi) || l.find((x) => x.name === "server");
         console.log(p ? p.name : "");
       } catch { console.log(""); }
     });'
