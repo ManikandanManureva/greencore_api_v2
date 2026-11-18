@@ -235,6 +235,8 @@ function decorate(req, row) {
       reject: PENDING.includes(row.status) && actStage,
       purchase: row.status === 'approved' && actStage,
       receive: ['purchasing', 'partially_received'].includes(row.status) && actStage,
+      // Purchasing records or corrects the PO number while goods are still on the way
+      set_po: ['purchasing', 'partially_received'].includes(row.status) && (admin || POST_APPROVAL_ROLES.approved.includes(roleKey(req))),
       cancel: ['draft', ...PENDING, 'approved'].includes(row.status) && (owner || admin),
       remind: PENDING.includes(row.status) || row.status === 'approved',
       delete: row.status === 'draft' ? (owner || admin) : admin,
@@ -726,6 +728,11 @@ async function writeItems(client, requestId, items) {
 router.get('/requests', async (req, res) => {
   try {
     const { search, status, category, priority, department, from, to, mine, queue, budget_type } = req.query;
+    // Column sort from the list headers; default keeps urgent open requests on top, newest first.
+    const SORTS = { pr_no: 'r.pr_no', pr_date: 'r.pr_date', department: 'r.department', requested_by: 'r.requested_by', category: 'r.category',
+      status: 'r.status', priority: 'r.priority', required_date: 'r.required_date', updated_at: 'r."updatedAt"', budget_type: 'r.budget_type' };
+    const sortCol = SORTS[String(req.query.sort || '')];
+    const sortDir = String(req.query.order || '').toLowerCase() === 'desc' ? 'DESC' : 'ASC';
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), 500);
     const where = [];
@@ -755,7 +762,7 @@ router.get('/requests', async (req, res) => {
     const r = await pool.query(
       `SELECT ${REQUEST_COLS} FROM proc_requests r LEFT JOIN proc_suppliers s ON s.id = r.supplier_id
        ${whereSql}
-       ORDER BY (r.priority = 'Urgent' AND r.status NOT IN ('completed','rejected','cancelled')) DESC, r.pr_date DESC, r.id DESC
+       ORDER BY ${sortCol ? `${sortCol} ${sortDir} NULLS LAST, r.id ${sortDir}` : `(r.priority = 'Urgent' AND r.status NOT IN ('completed','rejected','cancelled')) DESC, r.pr_date DESC, r.id DESC`}
        LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params,
     );
@@ -969,6 +976,39 @@ router.post('/requests/:id/purchase', (req, res) => transition(req, res, {
   },
 }));
 
+// Set or change the PO number / supplier on a request that is already on PO (e.g. imported history
+// that came without a PO number, or a corrected PO). Status does not change.
+router.post('/requests/:id/po', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const row = await loadRequest(client, req.params.id);
+    if (!row) return res.status(404).json({ success: false, message: 'Request not found' });
+    const d = decorate(req, row);
+    if (!d.can.set_po) return res.status(403).json({ success: false, message: 'Only Purchasing can set the PO number on a request that is on PO.' });
+    const b = req.body || {};
+    const poNo = String(b.po_no || '').trim();
+    if (!poNo) return res.status(400).json({ success: false, message: 'Enter the PO number issued to the supplier.' });
+    const supplierId = Number(b.supplier_id) || null;
+    const supplierName = String(b.supplier_name || '').trim() || null;
+    const notes = String(b.purchase_notes || '').trim() || null;
+    await client.query('BEGIN');
+    await client.query(
+      `UPDATE proc_requests SET po_no = $2, supplier_id = $3, supplier_name = COALESCE((SELECT name FROM proc_suppliers WHERE id = $3), $4),
+              purchase_notes = COALESCE($5, purchase_notes), po_at = COALESCE(po_at, NOW()), "updatedBy" = $6, "updatedAt" = NOW()
+       WHERE id = $1`,
+      [row.id, poNo, supplierId, supplierName, notes, actorName(req)]);
+    await logHistory(client, { requestId: row.id, action: 'po_updated', from: row.status, to: row.status,
+      note: `${row.po_no ? `PO ${row.po_no} → ${poNo}` : `PO ${poNo}`}${supplierName || supplierId ? ` · ${supplierName || ''}` : ''}${notes ? ` — ${notes}` : ''}`, req });
+    await client.query('COMMIT');
+    const fresh = await loadRequest(pool, row.id);
+    res.json({ success: true, data: decorate(req, fresh) });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('Procurement set PO error:', err.message);
+    fail(res, err, 'Failed to update the PO number');
+  } finally { client.release(); }
+});
+
 router.post('/requests/:id/note', async (req, res) => {
   try {
     const note = String((req.body && req.body.note) || '').trim();
@@ -1099,6 +1139,10 @@ async function reverseStock(client, req, { line, qty, receipt, reason }) {
 router.get('/receipts', async (req, res) => {
   try {
     const { search, from, to, request_id, kind, qc, domain, source } = req.query;
+    const SORTS = { grn_no: 'g.grn_no', receipt_date: 'g.receipt_date', supplier_name: 'g.supplier_name', delivery_note: 'g.delivery_note',
+      checked_by: 'g.checked_by', pr_no: 'r.pr_no', po_no: 'r.po_no', kind: 'g.kind', received_by: 'g.received_by' };
+    const sortCol = SORTS[String(req.query.sort || '')];
+    const sortDir = String(req.query.order || '').toLowerCase() === 'desc' ? 'DESC' : 'ASC';
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), 500);
     const where = [];
@@ -1124,7 +1168,7 @@ router.get('/receipts', async (req, res) => {
     params.push(limit, (page - 1) * limit);
     const r = await pool.query(
       `SELECT ${RECEIPT_COLS} FROM proc_receipts g LEFT JOIN proc_requests r ON r.id = g.request_id
-       ${whereSql} ORDER BY g.receipt_date DESC, g.id DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+       ${whereSql} ORDER BY ${sortCol ? `${sortCol} ${sortDir} NULLS LAST, g.id ${sortDir}` : 'g.receipt_date DESC, g.id DESC'} LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params,
     );
     res.json({ success: true, data: r.rows.map(numReceipt), total: count.rows[0].n, page, limit });
