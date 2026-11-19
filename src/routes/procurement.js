@@ -1089,12 +1089,15 @@ function readPo(b) {
 // Create or update a PO on a request and assign its lines. Shared by /purchase (first PO: moves
 // approved → purchasing) and /po (further POs or corrections while already in process).
 async function savePo(client, req, row, po) {
-  const lines = (await client.query('SELECT id, po_id, description FROM proc_request_items WHERE request_id = $1 ORDER BY line_no', [row.id])).rows;
+  const lines = (await client.query('SELECT id, po_id, description, received_qty FROM proc_request_items WHERE request_id = $1 ORDER BY line_no', [row.id])).rows;
   let wanted = po.item_ids ? lines.filter((l) => po.item_ids.includes(l.id)) : lines.filter((l) => !l.po_id || l.po_id === po.po_id);
   if (!po.item_ids && !po.po_id) wanted = lines.filter((l) => !l.po_id);
   if (!wanted.length) throw Object.assign(new Error('Tick at least one line for this PO.'), { status: 400 });
   const taken = wanted.find((l) => l.po_id && l.po_id !== po.po_id);
   if (taken) throw Object.assign(new Error(`"${taken.description}" is already on another PO — edit that PO instead.`), { status: 400 });
+  // A line that already has goods received against this PO stays on it.
+  const stuck = po.po_id ? lines.find((l) => l.po_id === po.po_id && Number(l.received_qty) > 0 && !wanted.some((w) => w.id === l.id)) : null;
+  if (stuck) throw Object.assign(new Error(`"${stuck.description}" already has goods received on this PO and cannot be removed from it.`), { status: 400 });
   let poId = po.po_id;
   if (poId) {
     const cur = await client.query('SELECT id FROM proc_request_pos WHERE id = $1 AND request_id = $2', [poId, row.id]);
@@ -1168,6 +1171,39 @@ router.post('/requests/:id/po', async (req, res) => {
     if (err.status) return res.status(err.status).json({ success: false, message: err.message });
     console.error('Procurement set PO error:', err.message);
     fail(res, err, 'Failed to update the PO number');
+  } finally { client.release(); }
+});
+
+// Remove a PO entered by mistake. Its lines go back to "not on any PO"; when it was the only PO
+// the request returns to Approved so Purchasing can enter the right one.
+router.delete('/requests/:id/po/:poId', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const row = await loadRequest(client, req.params.id);
+    if (!row) return res.status(404).json({ success: false, message: 'Request not found' });
+    const d = decorate(req, row);
+    if (!d.can.set_po) return res.status(403).json({ success: false, message: 'Only Purchasing can remove a PO from a request.' });
+    const po = (await client.query('SELECT * FROM proc_request_pos WHERE id = $1 AND request_id = $2', [Number(req.params.poId), row.id])).rows[0];
+    if (!po) return res.status(404).json({ success: false, message: 'PO not found on this request' });
+    const lines = (await client.query('SELECT id, description, received_qty FROM proc_request_items WHERE request_id = $1 AND po_id = $2', [row.id, po.id])).rows;
+    const received = lines.find((l) => Number(l.received_qty) > 0);
+    if (received) return res.status(400).json({ success: false, message: `PO ${po.po_no} already has goods received against it ("${received.description}") — void the LPB first.` });
+    await client.query('BEGIN');
+    await client.query('UPDATE proc_request_items SET po_id = NULL WHERE request_id = $1 AND po_id = $2', [row.id, po.id]);
+    await client.query('DELETE FROM proc_request_pos WHERE id = $1', [po.id]);
+    await syncPoSummary(client, row.id);
+    const remaining = (await client.query('SELECT COUNT(*)::int AS n FROM proc_request_pos WHERE request_id = $1', [row.id])).rows[0].n;
+    const to = remaining === 0 && row.status === 'purchasing' ? 'approved' : row.status;
+    await client.query(`UPDATE proc_requests SET status = $2, "updatedBy" = $3, "updatedAt" = NOW() WHERE id = $1`, [row.id, to, actorName(req)]);
+    await logHistory(client, { requestId: row.id, action: 'po_removed', from: row.status, to,
+      note: `PO ${po.po_no} removed · ${lines.length} line(s) released${remaining === 0 ? ' · back to Approved, awaiting PO' : ''}`, req });
+    await client.query('COMMIT');
+    const fresh = await loadRequest(pool, row.id);
+    res.json({ success: true, data: decorate(req, fresh) });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('Procurement remove PO error:', err.message);
+    fail(res, err, 'Failed to remove the PO');
   } finally { client.release(); }
 });
 
