@@ -17,7 +17,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
-const { requireModule } = require('../middleware/permissions');
+const { requireModule, hasPermission } = require('../middleware/permissions');
 const { isS3Configured, uploadBuffer, getSignedUrlForKey } = require('../config/s3');
 
 /**
@@ -66,35 +66,87 @@ const STAGE_LABELS = {
 
 // Approval chain per category comes from proc_approval_stages (editable in Procurement →
 // Approval Settings). Cached briefly; PUT /settings/approvals refreshes it.
-let stageCache = { at: 0, byCat: {} };
+// Two kinds of chain live in proc_approval_stages:
+//   group_code = ''      the per-category chain (fallback for departments without a group)
+//   group_code = 'SCM'…  the per-department-group chain (client's approval matrix)
+// A stage is satisfied by a role (role_key) and/or named approvers (approver_user_ids).
+let stageCache = { at: 0, data: null };
 async function approvalStages(force = false) {
-  if (!force && Date.now() - stageCache.at < 30000 && Object.keys(stageCache.byCat).length) return stageCache.byCat;
-  const r = await pool.query('SELECT category, stage_no, role_key, label FROM proc_approval_stages ORDER BY category, stage_no');
-  const byCat = {};
-  for (const row of r.rows) { (byCat[row.category] = byCat[row.category] || []).push({ ...row, stage_no: Number(row.stage_no) }); }
-  stageCache = { at: Date.now(), byCat };
-  return byCat;
+  if (!force && stageCache.data && Date.now() - stageCache.at < 30000) return stageCache.data;
+  const r = await pool.query('SELECT category, group_code, stage_no, role_key, label, approver_user_ids, approver_hint FROM proc_approval_stages ORDER BY category, group_code, stage_no');
+  const byCat = {}; const byGroup = {};
+  for (const row of r.rows) {
+    const st = { ...row, stage_no: Number(row.stage_no), approver_user_ids: (row.approver_user_ids || []).map(Number) };
+    if (row.group_code) (byGroup[row.group_code] = byGroup[row.group_code] || []).push(st);
+    else (byCat[row.category] = byCat[row.category] || []).push(st);
+  }
+  const g = await pool.query('SELECT code, name, sort_no FROM proc_approval_groups ORDER BY sort_no, name');
+  const d = await pool.query('SELECT name, group_code FROM proc_departments');
+  const deptGroup = {};
+  for (const x of d.rows) if (x.group_code) deptGroup[x.name] = x.group_code;
+  const data = { byCat, byGroup, groups: g.rows, deptGroup };
+  stageCache = { at: Date.now(), data };
+  return data;
 }
-function stageOf(stages, row) {
-  const list = (stages && stages[row.category]) || [];
-  return list.find((x) => x.stage_no === Number(row.stage_no)) || null;
+/** The chain a request follows: its department's group chain when one is configured, else its category chain. */
+function chainFor(req, row) {
+  const all = req.procAll || {};
+  const g = all.deptGroup && row && all.deptGroup[row.department];
+  const gl = g && all.byGroup && all.byGroup[g];
+  if (gl && gl.length) return gl;
+  return (all.byCat && row && all.byCat[row.category]) || [];
 }
-function rolesFor(stages, row) {
-  if (row.status === 'pending') { const st = stageOf(stages, row); return st ? [st.role_key] : []; }
-  return POST_APPROVAL_ROLES[row.status] || [];
+function groupName(req, code) {
+  const g = ((req.procAll && req.procAll.groups) || []).find((x) => x.code === code);
+  return g ? g.name : code;
 }
-function stageLabelFor(stages, row) {
-  if (row.status === 'pending') { const st = stageOf(stages, row); return st ? `${st.label} approval` : 'Approval'; }
+function stageOf(req, row) {
+  return chainFor(req, row).find((x) => x.stage_no === Number(row.stage_no)) || null;
+}
+/** Who may act on a row: roles and/or named users. */
+function actorsFor(req, row) {
+  if (row.status === 'pending') {
+    const st = stageOf(req, row);
+    return st ? { roles: st.role_key ? [st.role_key] : [], users: st.approver_user_ids || [] } : { roles: [], users: [] };
+  }
+  return { roles: POST_APPROVAL_ROLES[row.status] || [], users: [] };
+}
+function rolesFor(req, row) { return actorsFor(req, row).roles; }
+function stageLabelFor(req, row) {
+  if (row.status === 'pending') { const st = stageOf(req, row); return st ? `${st.label} approval` : 'Approval'; }
   return STAGE_LABELS[row.status] || null;
 }
+async function actorUsers(client, { roles, users }) {
+  if (!roles.length && !users.length) return [];
+  const r = await client.query(
+    `SELECT u.id, u.name, u.phone, u.email, COALESCE(r.name, u.role) AS role_name
+     FROM users u LEFT JOIN roles r ON r.id = u.role_id
+     WHERE u.is_active = true AND u.deleted_at IS NULL AND (r.key = ANY($1::text[]) OR u.id = ANY($2::int[]))
+     ORDER BY u.name`,
+    [roles, users]);
+  return r.rows;
+}
 async function activeDepartments() {
-  const r = await pool.query('SELECT id, code, name, head_pic, cost_center, default_category FROM proc_departments WHERE is_active = true ORDER BY name');
+  const r = await pool.query('SELECT id, code, name, head_pic, cost_center, default_category, group_code FROM proc_departments WHERE is_active = true ORDER BY name');
   return r.rows;
 }
 
-router.use(authenticateToken, requireModule('procurement', 'Procurement'));
+// Full module access, or the "Approvals only" module which opens just the approval screens.
+const APPROVER_ONLY_ROUTES = [
+  ['GET', /^\/me$/], ['GET', /^\/requests$/], ['GET', /^\/requests\/\d+$/], ['POST', /^\/requests\/\d+\/(approve|reject|note|remind)$/],
+  ['GET', /^\/approvers$/], ['GET', /^\/reminders$/], ['GET', /^\/uploads\//], ['GET', /^\/departments$/],
+];
+router.use(authenticateToken, (req, res, next) => {
+  if (hasPermission(req.user, 'procurement', 'read')) return requireModule('procurement', 'Procurement')(req, res, next);
+  if (hasPermission(req.user, 'proc_approvals', 'read')) {
+    const p = req.path.replace(/\/+$/, '') || '/';
+    if (APPROVER_ONLY_ROUTES.some(([m, re]) => m === req.method && re.test(p))) { req.approverOnly = true; return next(); }
+    return res.status(403).json({ success: false, message: 'Your role can only approve or reject purchase requests.' });
+  }
+  return res.status(403).json({ success: false, message: 'Your role is not allowed to view Procurement.' });
+});
 router.use(async (req, res, next) => {
-  try { req.procStages = await approvalStages(); next(); } catch (err) { next(err); }
+  try { req.procAll = await approvalStages(); req.procStages = req.procAll.byCat; next(); } catch (err) { next(err); }
 });
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -112,27 +164,45 @@ function isProcAdmin(req) {
 }
 function canActAt(req, row) {
   if (isProcAdmin(req)) return true;
-  return rolesFor(req.procStages, row).includes(roleKey(req));
+  const a = actorsFor(req, row);
+  return a.roles.includes(roleKey(req)) || a.users.includes(Number(req.user.id));
 }
 // The user's approval steps, as { category, stage_no, label } for pending stages plus the
 // post-approval statuses their role owns — drives the "waiting for me" queue and /me.
 function myStages(req) {
   const k = roleKey(req);
+  const uid = Number(req.user.id);
   const admin = isProcAdmin(req);
+  const all = req.procAll || { byCat: {}, byGroup: {} };
+  const matches = (st) => admin || (st.role_key && st.role_key === k) || (st.approver_user_ids || []).includes(uid);
   const out = [];
-  for (const [category, list] of Object.entries(req.procStages || {})) {
-    for (const st of list) if (admin || st.role_key === k) out.push({ status: 'pending', category, stage_no: st.stage_no, label: `${st.label} approval (${CATEGORY_LABELS[category] || category})` });
+  for (const [code, list] of Object.entries(all.byGroup || {})) {
+    for (const st of list) if (matches(st)) out.push({ status: 'pending', group_code: code, stage_no: st.stage_no, label: `${st.label} approval (${groupName(req, code)})` });
   }
-  for (const [status, roles] of Object.entries(POST_APPROVAL_ROLES)) if (admin || roles.includes(k)) out.push({ status, label: STAGE_LABELS[status] });
+  for (const [category, list] of Object.entries(all.byCat || {})) {
+    for (const st of list) if (matches(st)) out.push({ status: 'pending', category, stage_no: st.stage_no, label: `${st.label} approval (${CATEGORY_LABELS[category] || category})` });
+  }
+  if (!req.approverOnly) for (const [status, roles] of Object.entries(POST_APPROVAL_ROLES)) if (admin || roles.includes(k)) out.push({ status, label: STAGE_LABELS[status] });
   return out;
+}
+/** Department names that follow a group chain (so the category chain no longer applies to them). */
+function groupedDepartments(req, code) {
+  const all = req.procAll || { deptGroup: {}, byGroup: {} };
+  return Object.entries(all.deptGroup || {}).filter(([, g]) => (code ? g === code : true) && (all.byGroup[g] || []).length).map(([name]) => name);
 }
 // SQL fragment selecting the requests waiting on this user; pushes params as needed.
 function queueCondition(req, params) {
-  if (isProcAdmin(req)) return `r.status IN ('pending','approved','purchasing','partially_received')`;
+  if (isProcAdmin(req) && !req.approverOnly) return `r.status IN ('pending','approved','purchasing','partially_received')`;
   const parts = [];
+  const grouped = groupedDepartments(req);
   for (const st of myStages(req)) {
-    if (st.status === 'pending') { params.push(st.category, st.stage_no); parts.push(`(r.status = 'pending' AND r.category = $${params.length - 1} AND r.stage_no = $${params.length})`); }
-    else { params.push(st.status); parts.push(`r.status = $${params.length}`); }
+    if (st.status === 'pending' && st.group_code) {
+      params.push(st.stage_no, groupedDepartments(req, st.group_code));
+      parts.push(`(r.status = 'pending' AND r.stage_no = $${params.length - 1} AND r.department = ANY($${params.length}::text[]))`);
+    } else if (st.status === 'pending') {
+      params.push(st.category, st.stage_no, grouped);
+      parts.push(`(r.status = 'pending' AND r.category = $${params.length - 2} AND r.stage_no = $${params.length - 1} AND NOT (r.department = ANY($${params.length}::text[])))`);
+    } else { params.push(st.status); parts.push(`r.status = $${params.length}`); }
   }
   return parts.length ? `(${parts.join(' OR ')})` : 'false';
 }
@@ -140,18 +210,18 @@ function isOwner(req, row) {
   return row.requested_by_id != null && Number(row.requested_by_id) === Number(req.user.id);
 }
 // First / next step of the configured chain. A category with no stages goes straight to Purchasing.
-function firstStep(stages, row) {
-  const list = (stages && stages[row.category]) || [];
+function firstStep(req, row) {
+  const list = chainFor(req, row);
   return list.length ? { status: 'pending', stage_no: list[0].stage_no } : { status: 'approved', stage_no: null };
 }
-function nextStep(stages, row) {
-  const list = (stages && stages[row.category]) || [];
+function nextStep(req, row) {
+  const list = chainFor(req, row);
   const idx = list.findIndex((x) => x.stage_no === Number(row.stage_no));
   const nxt = idx >= 0 ? list[idx + 1] : null;
   return nxt ? { status: 'pending', stage_no: nxt.stage_no } : { status: 'approved', stage_no: null };
 }
-function stepLabel(stages, category, step) {
-  return stageLabelFor(stages, { status: step.status, category, stage_no: step.stage_no });
+function stepLabel(req, row, step) {
+  return stageLabelFor(req, { ...row, status: step.status, stage_no: step.stage_no });
 }
 const ROMAN = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII'];
 function docNumber(kind, seq, date) {
@@ -228,12 +298,12 @@ function decorate(req, row) {
   const owner = isOwner(req, row);
   const admin = isProcAdmin(req);
   const actStage = canActAt(req, row);
-  const stage = row.status === 'pending' ? stageOf(req.procStages, row) : null;
+  const stage = row.status === 'pending' ? stageOf(req, row) : null;
   return {
     ...row,
     total_qty: Number(row.total_qty || 0),
     total_received: Number(row.total_received || 0),
-    stage_label: stageLabelFor(req.procStages, row),
+    stage_label: stageLabelFor(req, row),
     stage_short: stage ? stage.label : null,
     category_label: CATEGORY_LABELS[row.category] || row.category,
     can: {
@@ -266,6 +336,9 @@ router.get('/me', async (req, res) => {
         stages: mine.map((x) => x.label),
         my_stages: mine,
         approval_stages: req.procStages,
+        approval_groups: req.procAll.groups,
+        group_stages: req.procAll.byGroup,
+        approver_only: !!req.approverOnly,
         stage_labels: STAGE_LABELS,
         departments,
         department_names: departments.map((d) => d.name),
@@ -291,7 +364,11 @@ function requireProcAdmin(req, res) {
 router.get('/settings/approvals', async (req, res) => {
   try {
     const roles = await pool.query('SELECT key, name FROM roles ORDER BY name');
-    res.json({ success: true, data: { stages: await approvalStages(true), categories: CATEGORIES, category_labels: CATEGORY_LABELS, roles: roles.rows, post_approval: Object.entries(POST_APPROVAL_ROLES).map(([status, r]) => ({ status, role_keys: r, label: STAGE_LABELS[status] })) } });
+    const all = await approvalStages(true);
+    const depts = await pool.query('SELECT name, group_code FROM proc_departments WHERE is_active = true ORDER BY name');
+    const users = await pool.query(`SELECT u.id, u.name, COALESCE(r.name, u.role) AS role_name FROM users u LEFT JOIN roles r ON r.id = u.role_id WHERE u.is_active = true AND u.deleted_at IS NULL ORDER BY u.name`);
+    const groups = all.groups.map((g) => ({ ...g, departments: depts.rows.filter((d) => d.group_code === g.code).map((d) => d.name), stages: all.byGroup[g.code] || [] }));
+    res.json({ success: true, data: { stages: all.byCat, groups, ungrouped_departments: depts.rows.filter((d) => !d.group_code).map((d) => d.name), users: users.rows, categories: CATEGORIES, category_labels: CATEGORY_LABELS, roles: roles.rows, post_approval: Object.entries(POST_APPROVAL_ROLES).map(([status, r]) => ({ status, role_keys: r, label: STAGE_LABELS[status] })) } });
   } catch (err) {
     console.error('Procurement approval settings error:', err.message);
     fail(res, err, 'Failed to load approval settings');
@@ -304,32 +381,56 @@ router.put('/settings/approvals', async (req, res) => {
   if (!requireProcAdmin(req, res)) return;
   const client = await pool.connect();
   try {
-    const body = (req.body && req.body.stages) || {};
+    const body = (req.body && req.body.stages) || null;
+    const groupsBody = (req.body && req.body.groups) || null;
     const roles = await client.query('SELECT key FROM roles');
     const roleKeys = new Set(roles.rows.map((r) => r.key));
-    for (const cat of CATEGORIES) {
-      const list = Array.isArray(body[cat]) ? body[cat] : [];
-      if (list.length > 6) return res.status(400).json({ success: false, message: `${CATEGORY_LABELS[cat]}: at most 6 approval stages.` });
-      for (const st of list) {
-        if (!roleKeys.has(st.role_key)) return res.status(400).json({ success: false, message: `${CATEGORY_LABELS[cat]}: role "${st.role_key}" does not exist.` });
-        if (!String(st.label || '').trim()) return res.status(400).json({ success: false, message: `${CATEGORY_LABELS[cat]}: every stage needs a label.` });
+    const users = await client.query('SELECT id FROM users WHERE is_active = true AND deleted_at IS NULL');
+    const userIds = new Set(users.rows.map((u) => Number(u.id)));
+    const groupRows = await client.query('SELECT code FROM proc_approval_groups');
+    const groupCodes = new Set(groupRows.rows.map((g) => g.code));
+    const clean = (list, who) => {
+      if (list.length > 6) throw Object.assign(new Error(`${who}: at most 6 approval stages.`), { status: 400 });
+      return list.map((st) => {
+        const label = String(st.label || '').trim().slice(0, 80);
+        const roleK = st.role_key ? String(st.role_key) : null;
+        const ids = [...new Set((Array.isArray(st.approver_user_ids) ? st.approver_user_ids : []).map(Number).filter((n) => userIds.has(n)))];
+        if (!label) throw Object.assign(new Error(`${who}: every stage needs a label.`), { status: 400 });
+        if (roleK && !roleKeys.has(roleK)) throw Object.assign(new Error(`${who}: role "${roleK}" does not exist.`), { status: 400 });
+        if (!roleK && !ids.length) throw Object.assign(new Error(`${who}: pick at least one approver (a user or a role) for "${label}".`), { status: 400 });
+        return { label, role_key: roleK, ids, hint: String(st.approver_hint || '').trim().slice(0, 160) || null };
+      });
+    };
+    const catLists = body ? Object.fromEntries(CATEGORIES.map((cat) => [cat, clean(Array.isArray(body[cat]) ? body[cat] : [], CATEGORY_LABELS[cat])])) : null;
+    const groupLists = groupsBody ? Object.fromEntries(Object.entries(groupsBody).filter(([code]) => groupCodes.has(code)).map(([code, list]) => [code, clean(Array.isArray(list) ? list : [], code)])) : null;
+    await client.query('BEGIN');
+    if (catLists) {
+      await client.query(`DELETE FROM proc_approval_stages WHERE group_code = ''`);
+      for (const cat of CATEGORIES) {
+        const list = catLists[cat];
+        for (let i = 0; i < list.length; i += 1) {
+          await client.query(
+            `INSERT INTO proc_approval_stages (category, group_code, stage_no, role_key, label, approver_user_ids, approver_hint, "updatedBy") VALUES ($1, '', $2, $3, $4, $5::int[], $6, $7)`,
+            [cat, i + 1, list[i].role_key, list[i].label, list[i].ids, list[i].hint, actorName(req)]);
+        }
       }
     }
-    await client.query('BEGIN');
-    await client.query('DELETE FROM proc_approval_stages');
-    for (const cat of CATEGORIES) {
-      const list = Array.isArray(body[cat]) ? body[cat] : [];
-      for (let i = 0; i < list.length; i += 1) {
-        await client.query(
-          'INSERT INTO proc_approval_stages (category, stage_no, role_key, label, "updatedBy") VALUES ($1, $2, $3, $4, $5)',
-          [cat, i + 1, list[i].role_key, String(list[i].label).trim().slice(0, 80), actorName(req)],
-        );
+    if (groupLists) {
+      for (const [code, list] of Object.entries(groupLists)) {
+        await client.query('DELETE FROM proc_approval_stages WHERE group_code = $1', [code]);
+        for (let i = 0; i < list.length; i += 1) {
+          await client.query(
+            `INSERT INTO proc_approval_stages (category, group_code, stage_no, role_key, label, approver_user_ids, approver_hint, "updatedBy") VALUES ('*', $1, $2, $3, $4, $5::int[], $6, $7)`,
+            [code, i + 1, list[i].role_key, list[i].label, list[i].ids, list[i].hint, actorName(req)]);
+        }
       }
     }
     await client.query('COMMIT');
-    res.json({ success: true, data: { stages: await approvalStages(true) } });
+    const all = await approvalStages(true);
+    res.json({ success: true, data: { stages: all.byCat, group_stages: all.byGroup } });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
+    if (err.status) return res.status(err.status).json({ success: false, message: err.message });
     console.error('Procurement approval settings save error:', err.message);
     fail(res, err, 'Failed to save approval settings');
   } finally { client.release(); }
@@ -346,8 +447,8 @@ router.get('/departments', async (req, res) => {
   try {
     const all = req.query.all === '1';
     const r = await pool.query(
-      `SELECT d.*, (SELECT COUNT(*)::int FROM proc_requests r WHERE r.department = d.name) AS request_count
-       FROM proc_departments d ${all ? '' : 'WHERE d.is_active = true'} ORDER BY d.name`);
+      `SELECT d.*, g.name AS group_name, (SELECT COUNT(*)::int FROM proc_requests r WHERE r.department = d.name) AS request_count
+       FROM proc_departments d LEFT JOIN proc_approval_groups g ON g.code = d.group_code ${all ? '' : 'WHERE d.is_active = true'} ORDER BY d.name`);
     res.json({ success: true, data: r.rows });
   } catch (err) { fail(res, err, 'Failed to load departments'); }
 });
@@ -358,18 +459,26 @@ function departmentBody(b) {
     head_pic: String((b && b.head_pic) || '').trim().slice(0, 120) || null,
     cost_center: String((b && b.cost_center) || '').trim().toUpperCase().slice(0, 40) || null,
     default_category: CATEGORIES.includes(b && b.default_category) ? b.default_category : 'General',
+    group_code: String((b && b.group_code) || '').trim().toUpperCase().slice(0, 20) || null,
     is_active: b && b.is_active === false ? false : true,
   };
+}
+async function validGroup(code) {
+  if (!code) return true;
+  const r = await pool.query('SELECT 1 FROM proc_approval_groups WHERE code = $1', [code]);
+  return r.rows.length > 0;
 }
 router.post('/departments', async (req, res) => {
   if (!requireProcAdmin(req, res)) return;
   try {
     const d = departmentBody(req.body);
     if (!d.code || !d.name) return res.status(400).json({ success: false, message: 'Code and name are required.' });
+    if (!(await validGroup(d.group_code))) return res.status(400).json({ success: false, message: 'Unknown approval group.' });
     const r = await pool.query(
-      `INSERT INTO proc_departments (code, name, head_pic, cost_center, default_category, is_active, "createdBy", "updatedBy")
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$7) RETURNING *`,
-      [d.code, d.name, d.head_pic, d.cost_center, d.default_category, d.is_active, actorName(req)]);
+      `INSERT INTO proc_departments (code, name, head_pic, cost_center, default_category, is_active, group_code, "createdBy", "updatedBy")
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8) RETURNING *`,
+      [d.code, d.name, d.head_pic, d.cost_center, d.default_category, d.is_active, d.group_code, actorName(req)]);
+    stageCache = { at: 0, data: null };
     res.status(201).json({ success: true, data: r.rows[0] });
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ success: false, message: 'A department with that code or name already exists.' });
@@ -381,11 +490,13 @@ router.put('/departments/:id', async (req, res) => {
   try {
     const d = departmentBody(req.body);
     if (!d.code || !d.name) return res.status(400).json({ success: false, message: 'Code and name are required.' });
+    if (!(await validGroup(d.group_code))) return res.status(400).json({ success: false, message: 'Unknown approval group.' });
     const r = await pool.query(
-      `UPDATE proc_departments SET code = $2, name = $3, head_pic = $4, cost_center = $5, default_category = $6, is_active = $7, "updatedBy" = $8, "updatedAt" = NOW()
+      `UPDATE proc_departments SET code = $2, name = $3, head_pic = $4, cost_center = $5, default_category = $6, is_active = $7, group_code = $9, "updatedBy" = $8, "updatedAt" = NOW()
        WHERE id = $1 RETURNING *`,
-      [req.params.id, d.code, d.name, d.head_pic, d.cost_center, d.default_category, d.is_active, actorName(req)]);
+      [req.params.id, d.code, d.name, d.head_pic, d.cost_center, d.default_category, d.is_active, actorName(req), d.group_code]);
     if (!r.rows.length) return res.status(404).json({ success: false, message: 'Department not found' });
+    stageCache = { at: 0, data: null };
     res.json({ success: true, data: r.rows[0] });
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ success: false, message: 'A department with that code or name already exists.' });
@@ -443,19 +554,18 @@ router.put('/machines/:id', async (req, res) => {
 router.get('/approvers', async (req, res) => {
   try {
     const stage = String(req.query.stage || '');
-    const probe = stage === 'pending'
-      ? { status: 'pending', category: String(req.query.category || ''), stage_no: Number(req.query.stage_no) || 0 }
-      : { status: stage };
-    const roles = rolesFor(req.procStages, probe);
-    if (!roles.length) return res.status(400).json({ success: false, message: 'Unknown stage' });
-    const r = await pool.query(
-      `SELECT u.id, u.name, u.phone, u.email, r.name AS role_name
-       FROM users u JOIN roles r ON r.id = u.role_id
-       WHERE r.key = ANY($1) AND u.is_active = true AND u.deleted_at IS NULL
-       ORDER BY u.name`,
-      [roles],
-    );
-    res.json({ success: true, data: r.rows, stage, stage_label: stageLabelFor(req.procStages, probe) });
+    let probe;
+    if (req.query.request_id) {
+      probe = await loadRequest(pool, Number(req.query.request_id));
+      if (!probe) return res.status(404).json({ success: false, message: 'Request not found' });
+    } else {
+      probe = stage === 'pending'
+        ? { status: 'pending', category: String(req.query.category || ''), department: String(req.query.department || ''), stage_no: Number(req.query.stage_no) || 0 }
+        : { status: stage };
+    }
+    const who = actorsFor(req, probe);
+    if (!who.roles.length && !who.users.length) return res.status(400).json({ success: false, message: 'Unknown stage' });
+    res.json({ success: true, data: await actorUsers(pool, who), stage: probe.status, stage_label: stageLabelFor(req, probe) });
   } catch (err) {
     console.error('Procurement approvers error:', err.message);
     fail(res, err, 'Failed to load approvers');
@@ -853,7 +963,7 @@ router.get('/requests', async (req, res) => {
     if (parseDate(from)) { params.push(parseDate(from)); where.push(`r.pr_date >= $${params.length}`); }
     if (parseDate(to)) { params.push(parseDate(to)); where.push(`r.pr_date <= $${params.length}`); }
     if (mine === '1') { params.push(req.user.id); where.push(`r.requested_by_id = $${params.length}`); }
-    if (queue === '1') where.push(queueCondition(req, params));
+    if (queue === '1' || req.approverOnly) where.push(queueCondition(req, params));
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const count = await pool.query(`SELECT COUNT(*)::int AS n FROM proc_requests r ${whereSql}`, params);
     params.push(limit, (page - 1) * limit);
@@ -890,16 +1000,7 @@ router.get('/requests/:id', async (req, res) => {
       stock_at_request: it.stock_at_request == null ? null : Number(it.stock_at_request),
       image_url: await resolveImageUrl(it.image_key),
     })));
-    let approvers = [];
-    const stageRoles = rolesFor(req.procStages, row);
-    if (stageRoles.length) {
-      const a = await pool.query(
-        `SELECT u.id, u.name, u.phone, r.name AS role_name FROM users u JOIN roles r ON r.id = u.role_id
-         WHERE r.key = ANY($1) AND u.is_active = true AND u.deleted_at IS NULL ORDER BY u.name`,
-        [stageRoles],
-      );
-      approvers = a.rows;
-    }
+    const approvers = await actorUsers(pool, actorsFor(req, row));
     res.json({
       success: true,
       data: { ...decorate(req, row), items: withImages, pos: pos.rows, receipts: receipts.rows.map((g) => ({ ...g, total_qty: Number(g.total_qty) })), history: history.rows, approvers },
@@ -944,9 +1045,9 @@ router.post('/requests', async (req, res) => {
     await writeItems(client, row.id, v.items);
     await logHistory(client, { requestId: row.id, action: 'created', to: 'draft', note: `${b.category} · ${b.priority}${b.urgent_reason ? ` — ${b.urgent_reason}` : ''} · ${v.items.length} item(s)`, req });
     if (submit) {
-      const step = firstStep(req.procStages, row);
+      const step = firstStep(req, row);
       await client.query(`UPDATE proc_requests SET status = $2, stage_no = $3, submitted_at = NOW(), "updatedAt" = NOW() WHERE id = $1`, [row.id, step.status, step.stage_no]);
-      await logHistory(client, { requestId: row.id, action: 'submitted', from: 'draft', to: step.status, note: `Sent for ${stepLabel(req.procStages, row.category, step)}`, req });
+      await logHistory(client, { requestId: row.id, action: 'submitted', from: 'draft', to: step.status, note: `Sent for ${stepLabel(req, row, step)}`, req });
     }
     await client.query('COMMIT');
     const full = await loadRequest(pool, row.id);
@@ -1032,18 +1133,18 @@ router.post('/requests/:id/submit', (req, res) => transition(req, res, {
   allowed: 'submit', action: 'submitted',
   check: (row) => (row.priority === 'Urgent' && !row.urgent_reason ? 'An Urgent request needs a reason before it can be submitted.' : null),
   apply: (row) => {
-    const step = firstStep(req.procStages, row);
-    return { to: step.status, stageNo: step.stage_no, note: `${row.status === 'rejected' ? 'Re-submitted' : 'Submitted'} for ${stepLabel(req.procStages, row.category, step)}`, extraSql: ', submitted_at = NOW(), reject_reason = NULL' };
+    const step = firstStep(req, row);
+    return { to: step.status, stageNo: step.stage_no, note: `${row.status === 'rejected' ? 'Re-submitted' : 'Submitted'} for ${stepLabel(req, row, step)}`, extraSql: ', submitted_at = NOW(), reject_reason = NULL' };
   },
 }));
 
 router.post('/requests/:id/approve', (req, res) => transition(req, res, {
   allowed: 'approve', action: 'approved',
   apply: (row) => {
-    const step = nextStep(req.procStages, row);
+    const step = nextStep(req, row);
     const note = String((req.body && req.body.note) || '').trim();
-    const here = stageLabelFor(req.procStages, row);
-    const what = step.status === 'approved' ? `${here} — final approval, ready for Purchasing` : `${here} → ${stepLabel(req.procStages, row.category, step)}`;
+    const here = stageLabelFor(req, row);
+    const what = step.status === 'approved' ? `${here} — final approval, ready for Purchasing` : `${here} → ${stepLabel(req, row, step)}`;
     return { to: step.status, stageNo: step.stage_no, note: note ? `${what}. ${note}` : what, extraSql: step.status === 'approved' ? ', approved_at = NOW()' : '' };
   },
 }));
@@ -1229,7 +1330,7 @@ router.post('/requests/:id/remind', async (req, res) => {
     if (!decorate(req, row).can.remind) return res.status(400).json({ success: false, message: 'This request is not waiting on anyone.' });
     const channel = String((req.body && req.body.channel) || 'WhatsApp');
     const to = String((req.body && req.body.to) || '').trim();
-    await logHistory(pool, { requestId: row.id, action: 'reminder', from: row.status, to: row.status, note: `${channel} reminder sent${to ? ` to ${to}` : ''} for ${stageLabelFor(req.procStages, row) || row.status}`, req });
+    await logHistory(pool, { requestId: row.id, action: 'reminder', from: row.status, to: row.status, note: `${channel} reminder sent${to ? ` to ${to}` : ''} for ${stageLabelFor(req, row) || row.status}`, req });
     res.json({ success: true });
   } catch (err) {
     console.error('Procurement remind error:', err.message);
@@ -1782,7 +1883,7 @@ router.get('/reminders', async (req, res) => {
     const groups = [];
     const reqRow = (r) => ({
       id: r.id, title: r.pr_no, subtitle: `${r.department} · ${CATEGORY_LABELS[r.category] || r.category}${r.priority === 'Urgent' ? ' · URGENT' : ''}`,
-      link: `/procurement/requests/${r.id}`, age_days: daysAgo(r.updatedAt), urgent: r.priority === 'Urgent',
+      link: req.approverOnly ? `/procurement/approvals/${r.id}` : `/procurement/requests/${r.id}`, age_days: daysAgo(r.updatedAt), urgent: r.priority === 'Urgent',
     });
 
     // 1. Approvals waiting for me
@@ -1790,6 +1891,8 @@ router.get('/reminders', async (req, res) => {
     const cond = queueCondition(req, qp);
     const mine = await pool.query(`SELECT r.* FROM proc_requests r WHERE r.status = 'pending' AND ${cond} ORDER BY (r.priority = 'Urgent') DESC, r."updatedAt" LIMIT 20`, qp);
     if (mine.rows.length) groups.push({ key: 'approvals', label: 'Waiting for your approval', count: mine.rows.length, link: '/procurement/approvals', tone: 'warning', items: mine.rows.map(reqRow) });
+    // Approvals-only users see nothing beyond their own approvals.
+    if (req.approverOnly) return res.json({ success: true, data: { total: groups.reduce((x, g) => x + g.count, 0), groups, generated_at: new Date().toISOString() } });
 
     // 2. Approved, no PO yet (Purchasing)
     if (isPurchasing) {
@@ -1818,7 +1921,7 @@ router.get('/reminders', async (req, res) => {
       // 6. Overdue: required date passed, still open
       const o = await pool.query(`SELECT r.* FROM proc_requests r WHERE r.required_date < CURRENT_DATE AND r.status NOT IN ('completed','rejected','cancelled','draft') ORDER BY r.required_date LIMIT 20`);
       if (o.rows.length) groups.push({ key: 'overdue', label: 'Past the required date', count: o.rows.length, link: '/procurement/requests?status=open', tone: 'critical',
-        items: o.rows.map((x) => ({ ...reqRow(x), subtitle: `${x.department} · needed ${new Date(x.required_date).toISOString().slice(0, 10)} · ${STAGE_LABELS[x.status] || stageLabelFor(req.procStages, x) || x.status}` })) });
+        items: o.rows.map((x) => ({ ...reqRow(x), subtitle: `${x.department} · needed ${new Date(x.required_date).toISOString().slice(0, 10)} · ${STAGE_LABELS[x.status] || stageLabelFor(req, x) || x.status}` })) });
     }
 
     // 7. Auto-drafted PBs waiting to be reviewed (mine, or all for admin)
@@ -1945,8 +2048,8 @@ router.get('/summary', async (req, res) => {
         by_budget: Object.fromEntries(byBudget.rows.map((x) => [x.budget_type, x.n])),
         monthly: monthly.rows,
         lead_time: lead.rows[0],
-        aging: aging.rows.map((x) => ({ ...x, label: x.status === 'pending' ? `${stageLabelFor(req.procStages, x)} · ${CATEGORY_LABELS[x.category] || x.category}` : (STAGE_LABELS[x.status] || x.status) })),
-        pending_by_stage: byStage.rows.map((x) => { const st = stageOf(req.procStages, x); return { category: x.category, category_label: CATEGORY_LABELS[x.category] || x.category, stage_no: Number(x.stage_no), label: st ? st.label : `Stage ${x.stage_no}`, n: x.n }; }),
+        aging: aging.rows.map((x) => ({ ...x, label: x.status === 'pending' ? `${stageLabelFor(req, x)} · ${CATEGORY_LABELS[x.category] || x.category}` : (STAGE_LABELS[x.status] || x.status) })),
+        pending_by_stage: byStage.rows.map((x) => { const st = stageOf(req, x); return { category: x.category, category_label: CATEGORY_LABELS[x.category] || x.category, stage_no: Number(x.stage_no), label: st ? st.label : `Stage ${x.stage_no}`, n: x.n }; }),
         top_items: topItems.rows.map((x) => ({ ...x, qty: Number(x.qty) })),
         recent: recent.rows,
         my_queue: queue.rows.map((row) => decorate(req, row)),

@@ -19,6 +19,7 @@ const MODULES = [
   { key: 'outgoing',    label: 'Outgoing / Sales',   description: 'Finished goods, flakes and by-product shipments, bag REF lists.' },
   { key: 'qc_lab',      label: 'QC Lab',             description: 'Pellet sampling and lab results.' },
   { key: 'procurement', label: 'Procurement',        description: 'Purchase requests (PB), approvals, purchase orders and goods receipts (LPB).' },
+  { key: 'proc_approvals', label: 'Procurement — Approvals only', description: 'Approve or reject the purchase requests waiting on this user. No PB, PO, LPB or master data.' },
   { key: 'users',       label: 'User Management',    description: 'Users, roles and menu access.' },
 ];
 const MODULE_KEYS = MODULES.map((m) => m.key);
@@ -35,6 +36,7 @@ const LEGACY_ROLES = [
   { key: 'ppic',              name: 'PPIC',              description: 'Production planning: production, inventory, parts, spare parts, outgoing and QC lab.', permissions: { production: full, inventory: full, parts: full, spare_parts: full, outgoing: full, qc_lab: full } },
   { key: 'qc',                name: 'QC (Gate Entry)',   description: 'Reviews gate-entry receipts and updates their status / notes.', permissions: { inventory: rw } },
   { key: 'pet',               name: 'PET Maintenance',   description: 'Logs spare-part receipts and usage for the PET lines.', permissions: { spare_parts: rw } },
+  { key: 'approver',          name: 'Approver',          description: 'Approves or rejects the purchase requests waiting on them. Nothing else in Procurement.', permissions: { proc_approvals: rw } },
   { key: 'spare_parts_admin', name: 'Spare Parts Admin', description: 'Full control of the Spare Parts module only.', permissions: { spare_parts: full } },
   { key: 'qc_lab',            name: 'QC Lab',            description: 'Pellet sampling and lab results only.', permissions: { qc_lab: full } },
 ];
