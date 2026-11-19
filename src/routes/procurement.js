@@ -1251,8 +1251,14 @@ const RECEIPT_COLS = `g.*, r.pr_no, r.po_no, r.category, r.department, r.status 
   (SELECT COALESCE(SUM(x.qty_hold), 0) FROM proc_receipt_items x WHERE x.receipt_id = g.id) AS total_hold,
   (SELECT COUNT(*)::int FROM proc_receipt_items x WHERE x.receipt_id = g.id) AS line_count,
   (SELECT x.description FROM proc_receipt_items x WHERE x.receipt_id = g.id ORDER BY x.id LIMIT 1) AS first_item`;
+/** DATE columns come back from pg as local-midnight Date objects; JSON would shift them to UTC (a day early in WIB). */
+function dayStr(v) {
+  if (v == null || v === '') return null;
+  if (v instanceof Date) return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`;
+  return String(v).slice(0, 10);
+}
 function numReceipt(x) {
-  return { ...x, total_ok: Number(x.total_ok || 0), total_reject: Number(x.total_reject || 0), total_hold: Number(x.total_hold || 0), total_qty: Number(x.total_ok || 0) };
+  return { ...x, receipt_date: dayStr(x.receipt_date), sj_date: dayStr(x.sj_date), total_ok: Number(x.total_ok || 0), total_reject: Number(x.total_reject || 0), total_hold: Number(x.total_hold || 0), total_qty: Number(x.total_ok || 0) };
 }
 async function logReceipt(client, receiptId, action, note, req) {
   await client.query(
@@ -1424,6 +1430,8 @@ async function loadReceipt(client, id) {
     ordered_qty: i.ordered_qty == null ? null : Number(i.ordered_qty), received_total: i.received_total == null ? null : Number(i.received_total),
     image_url: await resolveImageUrl(i.image_key),
   })));
+  const holds = g.rows[0].request_id ? await pendingHoldByItem(client, g.rows[0].request_id) : {};
+  for (const i of withImages) i.pb_hold_pending = i.request_item_id ? Number(holds[i.request_item_id] || 0) : 0;
   return { ...numReceipt(g.rows[0]), items: withImages, events: events.rows };
 }
 
@@ -1478,15 +1486,20 @@ async function postToStock(client, req, { item, qty, receipt, row }) {
 // Body: { kind: 'pb'|'manual'|'direct', request_id?, manual_pb_no?, receipt_date, delivery_note, sj_date,
 //         checked_by, received_by, supplier_id?, supplier_name?, notes?, post_to_stock?,
 //         items: [{ request_item_id?, source?, source_id?, item_code?, description?, unit?, qty_ok, qty_reject, qty_hold, qc_note?, image_key?, image_name? }] }
-router.post('/receipts', async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const b = req.body || {};
+function httpErr(status, message) { return Object.assign(new Error(message), { status }); }
+
+/**
+ * Record one goods receipt inside the caller's transaction. Used by POST /receipts and by the
+ * quantity correction in PUT /receipts/:id (void + re-create under the same LPB number).
+ * Throws { status, message } for validation problems.
+ */
+async function createReceipt(client, req, b, opts = {}) {
+  {
     const kind = RECEIPT_KINDS.includes(b.kind) ? b.kind : 'pb';
     const lines = (Array.isArray(b.items) ? b.items.map(parseLine) : []).filter((l) => l.qty_ok + l.qty_reject + l.qty_hold > 0);
-    if (!lines.length) return res.status(400).json({ success: false, message: 'Enter a quantity (OK, reject or hold) for at least one line.' });
+    if (!lines.length) throw httpErr(400, 'Enter a quantity (OK, reject or hold) for at least one line.');
     const noNote = lines.find((l) => (l.qty_reject > 0 || l.qty_hold > 0) && !l.qc_note);
-    if (noNote) return res.status(400).json({ success: false, message: `${noNote.description || noNote.item_code || 'A line'} has reject or hold quantity — write the QC note (what was wrong).` });
+    if (noNote) throw httpErr(400, `${noNote.description || noNote.item_code || 'A line'} has reject or hold quantity — write the QC note (what was wrong).`);
     const receiptDate = parseDate(b.receipt_date) || new Date().toISOString().slice(0, 10);
     const postToStockFlag = b.post_to_stock !== false;
 
@@ -1494,23 +1507,22 @@ router.post('/receipts', async (req, res) => {
     let row = null; let unmatched = false; let manualNo = null;
     if (kind === 'pb') {
       row = await loadRequest(client, Number(b.request_id));
-      if (!row) return res.status(404).json({ success: false, message: 'Request not found' });
-      if (!decorate(req, row).can.receive) return res.status(403).json({ success: false, message: `${row.pr_no} is not ready for goods receipt (${decorate(req, row).stage_label || row.status}).` });
+      if (!row) throw httpErr(404, 'Request not found');
+      if (!decorate(req, row).can.receive) throw httpErr(403, `${row.pr_no} is not ready for goods receipt (${decorate(req, row).stage_label || row.status}).`);
     } else {
-      if (!canHandleReceipts(req)) return res.status(403).json({ success: false, message: 'Only Warehouse or a procurement admin can record a receipt without a system PB.' });
+      if (!canHandleReceipts(req)) throw httpErr(403, 'Only Warehouse or a procurement admin can record a receipt without a system PB.');
       if (kind === 'manual') {
         manualNo = String(b.manual_pb_no || '').trim().slice(0, 60);
-        if (!manualNo) return res.status(400).json({ success: false, message: 'Type the PB number written on the delivery.' });
+        if (!manualNo) throw httpErr(400, 'Type the PB number written on the delivery.');
         const m = await client.query('SELECT id FROM proc_requests WHERE LOWER(pr_no) = LOWER($1) LIMIT 1', [manualNo]);
         if (m.rows.length) {
           const cand = await loadRequest(client, m.rows[0].id);
           if (['purchasing', 'partially_received'].includes(cand.status)) row = cand;
-          else return res.status(400).json({ success: false, message: `${cand.pr_no} exists but is not open for receipt (${cand.status.replace('_', ' ')}).` });
+          else throw httpErr(400, `${cand.pr_no} exists but is not open for receipt (${cand.status.replace('_', ' ')}).`);
         } else unmatched = true;
       }
     }
 
-    await client.query('BEGIN');
     await client.query('LOCK TABLE proc_receipts IN SHARE ROW EXCLUSIVE MODE');
     let byId = {}; let holds = {};
     if (row) {
@@ -1524,27 +1536,29 @@ router.post('/receipts', async (req, res) => {
           if (hit) l.request_item_id = hit.id;
         }
         const it = l.request_item_id ? byId[l.request_item_id] : null;
-        if (l.request_item_id && !it) { await client.query('ROLLBACK'); return res.status(400).json({ success: false, message: 'A received line does not belong to this request.' }); }
+        if (l.request_item_id && !it) throw httpErr(400, 'A received line does not belong to this request.');
         if (it) {
           l.source = it.source; l.source_id = it.source_id; l.item_code = it.item_code; l.description = it.description; l.unit = it.unit;
           const outstanding = Number(it.qty) - Number(it.received_qty) - (holds[it.id] || 0);
           if (l.qty_ok + l.qty_hold > outstanding + 1e-9) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ success: false, message: `${it.description}: only ${outstanding} ${it.unit} outstanding, cannot receive ${l.qty_ok + l.qty_hold} (OK + hold).` });
+            throw httpErr(400, `${it.description}: only ${outstanding} ${it.unit} outstanding, cannot receive ${l.qty_ok + l.qty_hold} (OK + hold).`);
           }
         } else if (kind === 'pb') {
-          await client.query('ROLLBACK'); return res.status(400).json({ success: false, message: 'Every line of a PB receipt must reference a PB line.' });
+          throw httpErr(400, 'Every line of a PB receipt must reference a PB line.');
         }
       }
     }
-    for (const l of lines) if (!l.description) { await client.query('ROLLBACK'); return res.status(400).json({ success: false, message: 'Every received line needs a description.' }); }
+    for (const l of lines) if (!l.description) { throw httpErr(400, 'Every received line needs a description.'); }
 
-    let seq = await nextSeq(client, 'proc_receipts', 'receipt_date', receiptDate);
-    let grnNo = docNumber('LPB', seq, receiptDate);
-    for (let tries = 0; tries < 100; tries += 1) {
-      const dup = await client.query('SELECT 1 FROM proc_receipts WHERE grn_no = $1', [grnNo]);
-      if (!dup.rows.length) break;
-      seq += 1; grnNo = docNumber('LPB', seq, receiptDate);
+    let grnNo = opts.grnNo || null;
+    if (!grnNo) {
+      let seq = await nextSeq(client, 'proc_receipts', 'receipt_date', receiptDate);
+      grnNo = docNumber('LPB', seq, receiptDate);
+      for (let tries = 0; tries < 100; tries += 1) {
+        const dup = await client.query('SELECT 1 FROM proc_receipts WHERE grn_no = $1', [grnNo]);
+        if (!dup.rows.length) break;
+        seq += 1; grnNo = docNumber('LPB', seq, receiptDate);
+      }
     }
     const supplierId = Number(b.supplier_id) || (row && row.supplier_id) || null;
     const supplierName = String(b.supplier_name || '').trim() || (row && row.supplier_name) || null;
@@ -1576,16 +1590,26 @@ router.post('/receipts', async (req, res) => {
       if (l.request_item_id && l.qty_ok > 0) await client.query('UPDATE proc_request_items SET received_qty = received_qty + $2 WHERE id = $1', [l.request_item_id, l.qty_ok]);
     }
     const summary = `${lines.length} line(s) · OK ${lines.reduce((a, l) => a + l.qty_ok, 0)}${totalReject ? ` · reject ${totalReject}` : ''}${totalHold ? ` · hold ${totalHold}` : ''}${posted ? ` · ${posted} posted to stock` : ''}`;
-    await logReceipt(client, receipt.id, 'created', `${kind === 'direct' ? 'Direct supplier receipt' : kind === 'manual' ? `Manual PB ${manualNo}${unmatched ? ' (not found in system)' : ''}` : `Against ${row.pr_no}`} · checker ${checkedBy} · ${summary}`, req);
+    await logReceipt(client, receipt.id, opts.action || 'created', `${opts.notePrefix || ''}${kind === 'direct' ? 'Direct supplier receipt' : kind === 'manual' ? `Manual PB ${manualNo}${unmatched ? ' (not found in system)' : ''}` : `Against ${row.pr_no}`} · checker ${checkedBy} · ${summary}`, req);
     let to = null;
     if (row) {
       to = await refreshRequestStatus(client, req, row.id);
-      await logHistory(client, { requestId: row.id, action: 'goods_received', from: row.status, to, note: `${grnNo}${receipt.delivery_note ? ` · SJ ${receipt.delivery_note}` : ''} · ${summary}${to === 'completed' ? ' · fully received' : ''}`, req });
+      await logHistory(client, { requestId: row.id, action: 'goods_received', from: row.status, to, note: `${opts.notePrefix || ''}${grnNo}${receipt.delivery_note ? ` · SJ ${receipt.delivery_note}` : ''} · ${summary}${to === 'completed' ? ' · fully received' : ''}`, req });
     }
+    return { data: { ...numReceipt({ ...receipt, total_ok: lines.reduce((a, l) => a + l.qty_ok, 0), total_reject: totalReject, total_hold: totalHold, line_count: lines.length }), request_status: to, posted, unmatched }, receipt, lines };
+  }
+}
+
+router.post('/receipts', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const out = await createReceipt(client, req, req.body || {});
     await client.query('COMMIT');
-    res.status(201).json({ success: true, data: { ...numReceipt({ ...receipt, total_ok: lines.reduce((a, l) => a + l.qty_ok, 0), total_reject: totalReject, total_hold: totalHold, line_count: lines.length }), request_status: to, posted, unmatched } });
+    res.status(201).json({ success: true, data: out.data });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
+    if (err.status) return res.status(err.status).json({ success: false, message: err.message });
     console.error('Procurement receipt create error:', err.message);
     fail(res, err, 'Failed to record goods receipt');
   } finally { client.release(); }
@@ -1640,6 +1664,27 @@ router.post('/receipts/:id/hold', async (req, res) => {
 
 // Void a receipt: the OK stock it posted is reversed in the source inventory, the PB lines are
 // re-opened and the document is kept, struck through, with the reason. { reason }
+/** Reverse a receipt inside the caller's transaction: stock postings, PB received_qty, open holds. */
+async function voidReceiptTx(client, req, receipt, reason, { note } = {}) {
+  const lines = await client.query('SELECT * FROM proc_receipt_items WHERE receipt_id = $1 FOR UPDATE', [receipt.id]);
+  let reversed = 0; let reopened = 0;
+  for (const l of lines.rows) {
+    const ok = Number(l.qty_ok);
+    if (ok > 0 && (l.stock_ref || l.hold_stock_ref)) { if (await reverseStock(client, req, { line: l, qty: ok, receipt, reason })) reversed += 1; }
+    if (ok > 0 && l.request_item_id) { await client.query('UPDATE proc_request_items SET received_qty = GREATEST(received_qty - $2, 0) WHERE id = $1', [l.request_item_id, ok]); reopened += ok; }
+    if (Number(l.qty_hold) > 0 && !l.hold_resolved) await client.query(`UPDATE proc_receipt_items SET hold_resolved = 'void' WHERE id = $1`, [l.id]);
+  }
+  await client.query(`UPDATE proc_receipts SET voided = true, void_reason = $2, voided_at = NOW(), voided_by = $3 WHERE id = $1`, [receipt.id, reason, actorName(req)]);
+  await logReceipt(client, receipt.id, 'voided', `${note || reason}${reversed ? ` · ${reversed} stock posting(s) reversed` : ''}${reopened ? ` · ${reopened} re-opened on the PB` : ''}`, req);
+  let to = null;
+  if (receipt.request_id) {
+    const row = await loadRequest(client, receipt.request_id);
+    to = await refreshRequestStatus(client, req, receipt.request_id, { onVoid: true });
+    await logHistory(client, { requestId: receipt.request_id, action: 'receipt_voided', from: row.status, to, note: `${receipt.grn_no} voided — ${note || reason}`, req });
+  }
+  return { reversed, reopened, to };
+}
+
 router.post('/receipts/:id/void', async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1651,28 +1696,73 @@ router.post('/receipts/:id/void', async (req, res) => {
     const receipt = g.rows[0];
     if (!receipt) { await client.query('ROLLBACK'); return res.status(404).json({ success: false, message: 'Receipt not found' }); }
     if (receipt.voided) { await client.query('ROLLBACK'); return res.status(400).json({ success: false, message: `${receipt.grn_no} is already voided.` }); }
-    const lines = await client.query('SELECT * FROM proc_receipt_items WHERE receipt_id = $1 FOR UPDATE', [receipt.id]);
-    let reversed = 0; let reopened = 0;
-    for (const l of lines.rows) {
-      const ok = Number(l.qty_ok);
-      if (ok > 0 && (l.stock_ref || l.hold_stock_ref)) { if (await reverseStock(client, req, { line: l, qty: ok, receipt, reason })) reversed += 1; }
-      if (ok > 0 && l.request_item_id) { await client.query('UPDATE proc_request_items SET received_qty = GREATEST(received_qty - $2, 0) WHERE id = $1', [l.request_item_id, ok]); reopened += ok; }
-      if (Number(l.qty_hold) > 0 && !l.hold_resolved) await client.query(`UPDATE proc_receipt_items SET hold_resolved = 'void' WHERE id = $1`, [l.id]);
-    }
-    await client.query(`UPDATE proc_receipts SET voided = true, void_reason = $2, voided_at = NOW(), voided_by = $3 WHERE id = $1`, [receipt.id, reason, actorName(req)]);
-    await logReceipt(client, receipt.id, 'voided', `${reason}${reversed ? ` · ${reversed} stock posting(s) reversed` : ''}${reopened ? ` · ${reopened} re-opened on the PB` : ''}`, req);
-    let to = null;
-    if (receipt.request_id) {
-      const row = await loadRequest(client, receipt.request_id);
-      to = await refreshRequestStatus(client, req, receipt.request_id, { onVoid: true });
-      await logHistory(client, { requestId: receipt.request_id, action: 'receipt_voided', from: row.status, to, note: `${receipt.grn_no} voided — ${reason}`, req });
-    }
+    const out = await voidReceiptTx(client, req, receipt, reason);
     await client.query('COMMIT');
-    res.json({ success: true, data: await loadReceipt(pool, receipt.id), request_status: to, reversed });
+    res.json({ success: true, data: await loadReceipt(pool, receipt.id), request_status: out.to, reversed: out.reversed });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('Procurement receipt void error:', err.message);
     fail(res, err, 'Failed to void the receipt');
+  } finally { client.release(); }
+});
+
+// Edit an LPB. Header-only changes (date, SJ, checker, receiver, supplier, notes) are updated
+// in place. When `items` is sent the quantities are corrected: the current version is voided
+// (stock reversed, PB lines re-opened) and re-recorded under the SAME LPB number; the old
+// version stays in the trail renamed "<no>~1".
+const EDITABLE = ['receipt_date', 'sj_date', 'delivery_note', 'checked_by', 'received_by', 'supplier_id', 'supplier_name', 'notes'];
+router.put('/receipts/:id', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!canHandleReceipts(req)) return res.status(403).json({ success: false, message: 'Only Warehouse or a procurement admin can edit a receipt.' });
+    const b = req.body || {};
+    await client.query('BEGIN');
+    const g = await client.query('SELECT * FROM proc_receipts WHERE id = $1 FOR UPDATE', [req.params.id]);
+    const receipt = g.rows[0];
+    if (!receipt) { await client.query('ROLLBACK'); return res.status(404).json({ success: false, message: 'Receipt not found' }); }
+    if (receipt.voided) { await client.query('ROLLBACK'); return res.status(400).json({ success: false, message: `${receipt.grn_no} is voided and cannot be edited.` }); }
+    const reason = String(b.reason || '').trim();
+
+    if (Array.isArray(b.items)) {
+      if (!reason) { await client.query('ROLLBACK'); return res.status(400).json({ success: false, message: 'Say why the quantities are being corrected — it goes on the audit trail.' }); }
+      const n = (await client.query('SELECT COUNT(*)::int AS n FROM proc_receipts WHERE grn_no LIKE $1', [`${receipt.grn_no}~%`])).rows[0].n + 1;
+      const oldNo = `${receipt.grn_no}~${n}`;
+      await voidReceiptTx(client, req, receipt, `Corrected — ${reason}`, { note: `Superseded by corrected ${receipt.grn_no} — ${reason}` });
+      await client.query('UPDATE proc_receipts SET grn_no = $2 WHERE id = $1', [receipt.id, oldNo]);
+      const payload = { ...b, kind: receipt.kind, request_id: receipt.request_id, manual_pb_no: receipt.manual_pb_no };
+      const out = await createReceipt(client, req, payload, { grnNo: receipt.grn_no, action: 'corrected', notePrefix: `Correction of ${oldNo} (${reason}) · ` });
+      await client.query('COMMIT');
+      return res.json({ success: true, data: await loadReceipt(pool, out.receipt.id), replaced_id: receipt.id, request_status: out.data.request_status });
+    }
+
+    const next = {
+      receipt_date: parseDate(b.receipt_date) || receipt.receipt_date,
+      sj_date: b.sj_date === undefined ? receipt.sj_date : parseDate(b.sj_date),
+      delivery_note: b.delivery_note === undefined ? receipt.delivery_note : (String(b.delivery_note || '').trim() || null),
+      checked_by: b.checked_by === undefined ? receipt.checked_by : (String(b.checked_by || '').trim() || receipt.checked_by),
+      received_by: b.received_by === undefined ? receipt.received_by : (String(b.received_by || '').trim() || receipt.received_by),
+      supplier_id: b.supplier_id === undefined ? receipt.supplier_id : (Number(b.supplier_id) || null),
+      supplier_name: b.supplier_name === undefined ? receipt.supplier_name : (String(b.supplier_name || '').trim() || null),
+      notes: b.notes === undefined ? receipt.notes : (String(b.notes || '').trim() || null),
+    };
+    if (next.supplier_id) {
+      const sup = await client.query('SELECT name FROM proc_suppliers WHERE id = $1', [next.supplier_id]);
+      if (sup.rows.length) next.supplier_name = sup.rows[0].name;
+    }
+    const fmt = (v) => (v == null || v === '' ? '—' : v instanceof Date ? dayStr(v) : String(v));
+    const changes = EDITABLE.filter((k) => fmt(next[k]) !== fmt(receipt[k])).map((k) => `${k.replace('_', ' ')}: ${fmt(receipt[k])} → ${fmt(next[k])}`);
+    if (!changes.length) { await client.query('ROLLBACK'); return res.json({ success: true, data: await loadReceipt(pool, receipt.id), unchanged: true }); }
+    await client.query(
+      `UPDATE proc_receipts SET receipt_date = $2, sj_date = $3, delivery_note = $4, checked_by = $5, received_by = $6, supplier_id = $7, supplier_name = $8, notes = $9 WHERE id = $1`,
+      [receipt.id, next.receipt_date, next.sj_date, next.delivery_note, next.checked_by, next.received_by, next.supplier_id, next.supplier_name, next.notes]);
+    await logReceipt(client, receipt.id, 'edited', `${changes.join(' · ')}${reason ? ` — ${reason}` : ''}`, req);
+    await client.query('COMMIT');
+    res.json({ success: true, data: await loadReceipt(pool, receipt.id) });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (err.status) return res.status(err.status).json({ success: false, message: err.message });
+    console.error('Procurement receipt edit error:', err.message);
+    fail(res, err, 'Failed to edit the receipt');
   } finally { client.release(); }
 });
 
