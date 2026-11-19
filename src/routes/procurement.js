@@ -1353,7 +1353,7 @@ router.get('/receipts', async (req, res) => {
     const params = [];
     if (search && String(search).trim()) {
       params.push(`%${String(search).trim()}%`);
-      where.push(`(g.grn_no ILIKE $${params.length} OR r.pr_no ILIKE $${params.length} OR r.po_no ILIKE $${params.length} OR g.supplier_name ILIKE $${params.length} OR g.delivery_note ILIKE $${params.length} OR g.manual_pb_no ILIKE $${params.length} OR g.checked_by ILIKE $${params.length}
+      where.push(`(g.grn_no ILIKE $${params.length} OR r.pr_no ILIKE $${params.length} OR r.po_no ILIKE $${params.length} OR g.supplier_name ILIKE $${params.length} OR g.delivery_note ILIKE $${params.length} OR g.vehicle_no ILIKE $${params.length} OR g.manual_pb_no ILIKE $${params.length} OR g.checked_by ILIKE $${params.length}
         OR EXISTS (SELECT 1 FROM proc_receipt_items x WHERE x.receipt_id = g.id AND (x.description ILIKE $${params.length} OR x.item_code ILIKE $${params.length})))`);
     }
     if (parseDate(from)) { params.push(parseDate(from)); where.push(`g.receipt_date >= $${params.length}`); }
@@ -1569,9 +1569,9 @@ async function createReceipt(client, req, b, opts = {}) {
     const totalReject = lines.reduce((a, l) => a + l.qty_reject, 0); const totalHold = lines.reduce((a, l) => a + l.qty_hold, 0);
     const condition = totalHold + totalReject === 0 ? 'good' : lines.every((l) => l.qty_ok === 0) ? 'damaged' : 'partial_damage';
     const g = await client.query(
-      `INSERT INTO proc_receipts (grn_no, request_id, kind, manual_pb_no, unmatched, receipt_date, sj_date, checked_by, domain, supplier_id, supplier_name, delivery_note, received_by, condition, notes, posted_to_stock, "createdBy")
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,COALESCE((SELECT name FROM proc_suppliers WHERE id = $10), $11),$12,$13,$14,$15,$16,$17) RETURNING *`,
-      [grnNo, row ? row.id : null, kind, manualNo, unmatched, receiptDate, parseDate(b.sj_date), checkedBy, domain, supplierId, supplierName, String(b.delivery_note || '').trim() || null, receivedBy, condition, String(b.notes || '').trim() || null, postToStockFlag, actorName(req)],
+      `INSERT INTO proc_receipts (grn_no, request_id, kind, manual_pb_no, unmatched, receipt_date, sj_date, checked_by, domain, supplier_id, supplier_name, delivery_note, received_by, condition, notes, posted_to_stock, "createdBy", vehicle_no)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,COALESCE((SELECT name FROM proc_suppliers WHERE id = $10), $11),$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
+      [grnNo, row ? row.id : null, kind, manualNo, unmatched, receiptDate, parseDate(b.sj_date), checkedBy, domain, supplierId, supplierName, String(b.delivery_note || '').trim() || null, receivedBy, condition, String(b.notes || '').trim() || null, postToStockFlag, actorName(req), String(b.vehicle_no || '').trim().slice(0, 40) || null],
     );
     const receipt = g.rows[0];
     let posted = 0;
@@ -1710,7 +1710,7 @@ router.post('/receipts/:id/void', async (req, res) => {
 // in place. When `items` is sent the quantities are corrected: the current version is voided
 // (stock reversed, PB lines re-opened) and re-recorded under the SAME LPB number; the old
 // version stays in the trail renamed "<no>~1".
-const EDITABLE = ['receipt_date', 'sj_date', 'delivery_note', 'checked_by', 'received_by', 'supplier_id', 'supplier_name', 'notes'];
+const EDITABLE = ['receipt_date', 'sj_date', 'delivery_note', 'vehicle_no', 'checked_by', 'received_by', 'supplier_id', 'supplier_name', 'notes'];
 router.put('/receipts/:id', async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1744,6 +1744,7 @@ router.put('/receipts/:id', async (req, res) => {
       supplier_id: b.supplier_id === undefined ? receipt.supplier_id : (Number(b.supplier_id) || null),
       supplier_name: b.supplier_name === undefined ? receipt.supplier_name : (String(b.supplier_name || '').trim() || null),
       notes: b.notes === undefined ? receipt.notes : (String(b.notes || '').trim() || null),
+      vehicle_no: b.vehicle_no === undefined ? receipt.vehicle_no : (String(b.vehicle_no || '').trim().slice(0, 40) || null),
     };
     if (next.supplier_id) {
       const sup = await client.query('SELECT name FROM proc_suppliers WHERE id = $1', [next.supplier_id]);
@@ -1753,8 +1754,8 @@ router.put('/receipts/:id', async (req, res) => {
     const changes = EDITABLE.filter((k) => fmt(next[k]) !== fmt(receipt[k])).map((k) => `${k.replace('_', ' ')}: ${fmt(receipt[k])} → ${fmt(next[k])}`);
     if (!changes.length) { await client.query('ROLLBACK'); return res.json({ success: true, data: await loadReceipt(pool, receipt.id), unchanged: true }); }
     await client.query(
-      `UPDATE proc_receipts SET receipt_date = $2, sj_date = $3, delivery_note = $4, checked_by = $5, received_by = $6, supplier_id = $7, supplier_name = $8, notes = $9 WHERE id = $1`,
-      [receipt.id, next.receipt_date, next.sj_date, next.delivery_note, next.checked_by, next.received_by, next.supplier_id, next.supplier_name, next.notes]);
+      `UPDATE proc_receipts SET receipt_date = $2, sj_date = $3, delivery_note = $4, checked_by = $5, received_by = $6, supplier_id = $7, supplier_name = $8, notes = $9, vehicle_no = $10 WHERE id = $1`,
+      [receipt.id, next.receipt_date, next.sj_date, next.delivery_note, next.checked_by, next.received_by, next.supplier_id, next.supplier_name, next.notes, next.vehicle_no]);
     await logReceipt(client, receipt.id, 'edited', `${changes.join(' · ')}${reason ? ` — ${reason}` : ''}`, req);
     await client.query('COMMIT');
     res.json({ success: true, data: await loadReceipt(pool, receipt.id) });

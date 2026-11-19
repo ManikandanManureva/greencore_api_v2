@@ -66,6 +66,7 @@ node src/scripts/fix-imported-sample-links.js
 
 # Per-user UI language preference
 node src/scripts/add-user-language.js
+node src/scripts/add-procurement-receipt-vehicle.js
 
 # One-time data loads below are NOT run here — they're safe to re-run (they skip if data
 # already exists) but are listed separately since they're one-off imports, not schema setup:
