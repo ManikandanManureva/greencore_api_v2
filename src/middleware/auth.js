@@ -1,6 +1,6 @@
 const jwt = require('jsonwebtoken');
 const pool = require('../config/database');
-const { loadPermissions } = require('./permissions');
+const { loadPermissions, appRole } = require('./permissions');
 
 const authenticateToken = async (req, res, next) => {
   try {
@@ -37,7 +37,9 @@ const authenticateToken = async (req, res, next) => {
       employeeId: result.rows[0].employee_id,
       name: result.rows[0].name,
       email: result.rows[0].email,
-      role: result.rows[0].role,
+      // Operator-app role (pc/pe/pet/ppic); the dashboard role key is roleKey above.
+      role: appRole(result.rows[0].role, access),
+      dashboardRole: result.rows[0].role,
       materialTypeId: result.rows[0].material_type_id,
       // Supervisor corrections (delete / correct bags, reopen shifts) — see add-production-corrections.js
       canCorrectProduction: result.rows[0].can_correct_production === true

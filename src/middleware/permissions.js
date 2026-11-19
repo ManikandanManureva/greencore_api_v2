@@ -95,6 +95,21 @@ async function loadPermissions(pool, userRow) {
   }
 }
 
+/**
+ * The role string the operator app (and the production routes) key off: pc / pe / pet / ppic.
+ * users.role now carries the dashboard role key, and a custom role made in User Management
+ * (e.g. "PPIC & ADMIN" → ppic_admin) is unknown to the app, which then shows the operator
+ * screens only. Built-in operator keys pass through; any other role that may edit production
+ * data is presented as `ppic`; everything else keeps its own key.
+ */
+const APP_ROLES = ['pc', 'pe', 'pet', 'ppic'];
+function appRole(role, access) {
+  const key = String(role || '').toLowerCase();
+  if (!key || APP_ROLES.includes(key) || key === 'super_admin') return role;
+  const prod = access && access.permissions && access.permissions.production;
+  return prod && prod.write ? 'ppic' : role;
+}
+
 function actionForMethod(method) {
   const m = String(method || 'GET').toUpperCase();
   if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return 'read';
@@ -123,5 +138,5 @@ function requireModule(moduleKey, label) {
 module.exports = {
   MODULES, MODULE_KEYS, LEGACY_ROLES,
   emptyPermissions, normalizePermissions, legacyPermissionsFor, loadPermissions,
-  actionForMethod, hasPermission, requireModule,
+  actionForMethod, hasPermission, requireModule, appRole,
 };

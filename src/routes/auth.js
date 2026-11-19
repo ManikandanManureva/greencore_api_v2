@@ -5,7 +5,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
-const { loadPermissions } = require('../middleware/permissions');
+const { loadPermissions, appRole } = require('../middleware/permissions');
 console.log("inside auth 8 ");
 
 // Login endpoint
@@ -95,7 +95,7 @@ router.post('/login', async (req, res) => {
         name: user.name,
         email: user.email,
         phone: user.phone || null,
-        role: user.role,
+        role: appRole(user.role, access),
         roleName: access.roleName,
         permissions: access.permissions,
         materialTypeId: user.material_type_id,
@@ -169,7 +169,7 @@ router.post('/refresh', async (req, res) => {
         name: tokenData.name,
         email: tokenData.email,
         phone: flags.rows[0]?.phone || null,
-        role: tokenData.role,
+        role: appRole(tokenData.role, access),
         roleName: access.roleName,
         permissions: access.permissions,
         materialTypeId: tokenData.material_type_id,
