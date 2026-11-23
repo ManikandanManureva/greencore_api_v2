@@ -19,6 +19,8 @@ const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { requireModule, hasPermission } = require('../middleware/permissions');
 const { isS3Configured, uploadBuffer, getSignedUrlForKey } = require('../config/s3');
+const procMail = require('../services/procMail');
+const { mailEnabled, sendMail, mailConfig } = require('../services/mailer');
 
 /**
  * Procurement — Permintaan Barang (PB) → approvals → Purchasing (PO) → Laporan Penerimaan
@@ -125,6 +127,15 @@ async function actorUsers(client, { roles, users }) {
      ORDER BY u.name`,
     [roles, users]);
   return r.rows;
+}
+/** What the email module needs from this router, bound to the caller's stage config. */
+function mailHelpers(req) {
+  return {
+    actors: (row) => actorUsers(pool, actorsFor(req, row)),
+    stageLabel: (row) => stageLabelFor(req, row),
+    chain: (row) => chainFor(req, row),
+    purchasing: () => actorUsers(pool, { roles: POST_APPROVAL_ROLES.approved, users: [] }),
+  };
 }
 async function activeDepartments() {
   const r = await pool.query('SELECT id, code, name, head_pic, cost_center, default_category, group_code FROM proc_departments WHERE is_active = true ORDER BY name');
@@ -340,6 +351,7 @@ router.get('/me', async (req, res) => {
         approval_groups: req.procAll.groups,
         group_stages: req.procAll.byGroup,
         approver_only: !!req.approverOnly,
+        mail_enabled: mailEnabled(),
         stage_labels: STAGE_LABELS,
         departments,
         department_names: departments.map((d) => d.name),
@@ -374,6 +386,31 @@ router.get('/settings/approvals', async (req, res) => {
     console.error('Procurement approval settings error:', err.message);
     fail(res, err, 'Failed to load approval settings');
   }
+});
+
+// Email notifications: configured from the server environment; this only reports and tests it.
+router.get('/settings/mail', async (req, res) => {
+  try {
+    const c = mailConfig();
+    const all = await approvalStages();
+    const ids = new Set(); const roles = new Set();
+    for (const list of [...Object.values(all.byCat), ...Object.values(all.byGroup)]) for (const st of list) { (st.approver_user_ids || []).forEach((i) => ids.add(Number(i))); if (st.role_key) roles.add(st.role_key); }
+    const users = await actorUsers(pool, { roles: [...roles, ...POST_APPROVAL_ROLES.approved], users: [...ids] });
+    res.json({ success: true, data: { enabled: mailEnabled(), from: c.from || null, app_url: c.appUrl || null, my_email: req.user.email || null,
+      approvers_without_email: users.filter((u) => !u.email).map((u) => u.name) } });
+  } catch (err) { fail(res, err, 'Failed to load mail settings'); }
+});
+router.post('/settings/mail/test', async (req, res) => {
+  try {
+    if (!mailEnabled()) return res.status(400).json({ success: false, message: 'Email is not configured on this server (SMTP_HOST, MAIL_FROM, APP_URL).' });
+    if (!req.user.email) return res.status(400).json({ success: false, message: 'Your account has no email address. Add one under User Management first.' });
+    const c = mailConfig();
+    const r = await sendMail({ to: req.user.email, subject: 'Greencore Procurement — test email',
+      html: procMail.page({ appUrl: c.appUrl, lang: 'en', title: 'Email works', eyebrow: 'Test message', chip: { text: 'OK', bg: procMail.C.okBg, fg: procMail.C.ok }, inner: procMail.resultBody('Approval emails will arrive like this.', `Sent to ${procMail.esc(req.user.email)} from ${procMail.esc(c.from)}.`) }).html,
+      text: `Greencore Procurement test email. Sent to ${req.user.email}.` });
+    if (!r.ok) return res.status(502).json({ success: false, message: r.reason || 'Send failed' });
+    res.json({ success: true });
+  } catch (err) { fail(res, err, 'Failed to send test email'); }
 });
 
 // Body: { stages: { Sparepart: [{ role_key, label }, ...], Packaging: [...], General: [...] } }
@@ -964,7 +1001,7 @@ router.get('/requests', async (req, res) => {
     if (parseDate(from)) { params.push(parseDate(from)); where.push(`r.pr_date >= $${params.length}`); }
     if (parseDate(to)) { params.push(parseDate(to)); where.push(`r.pr_date <= $${params.length}`); }
     if (mine === '1') { params.push(req.user.id); where.push(`r.requested_by_id = $${params.length}`); }
-    if (queue === '1' || req.approverOnly) where.push(queueCondition(req, params));
+    if (queue === '1') where.push(queueCondition(req, params));
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const count = await pool.query(`SELECT COUNT(*)::int AS n FROM proc_requests r ${whereSql}`, params);
     params.push(limit, (page - 1) * limit);
@@ -1053,6 +1090,7 @@ router.post('/requests', async (req, res) => {
     await client.query('COMMIT');
     const full = await loadRequest(pool, row.id);
     res.status(201).json({ success: true, data: decorate(req, full) });
+    if (submit) procMail.afterTransition({ action: 'submitted', row: full, helpers: mailHelpers(req), actorName: actorName(req) }).catch(() => {});
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('Procurement request create error:', err.message);
@@ -1123,6 +1161,8 @@ async function transition(req, res, { allowed, check, apply, action, noteFrom })
     await client.query('COMMIT');
     const full = await loadRequest(pool, row.id);
     res.json({ success: true, data: decorate(req, full) });
+    // Email the next approvers / the requester once the change is committed. Never blocks the response.
+    procMail.afterTransition({ action, row: full, helpers: mailHelpers(req), actorName: actorName(req) }).catch(() => {});
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error(`Procurement ${action} error:`, err.message);
@@ -1139,7 +1179,7 @@ router.post('/requests/:id/submit', (req, res) => transition(req, res, {
   },
 }));
 
-router.post('/requests/:id/approve', (req, res) => transition(req, res, {
+const approveSpec = (req) => ({
   allowed: 'approve', action: 'approved',
   apply: (row) => {
     const step = nextStep(req, row);
@@ -1148,16 +1188,18 @@ router.post('/requests/:id/approve', (req, res) => transition(req, res, {
     const what = step.status === 'approved' ? `${here} — final approval, ready for Purchasing` : `${here} → ${stepLabel(req, row, step)}`;
     return { to: step.status, stageNo: step.stage_no, note: note ? `${what}. ${note}` : what, extraSql: step.status === 'approved' ? ', approved_at = NOW()' : '' };
   },
-}));
+});
+router.post('/requests/:id/approve', (req, res) => transition(req, res, approveSpec(req)));
 
-router.post('/requests/:id/reject', (req, res) => transition(req, res, {
+const rejectSpec = (req) => ({
   allowed: 'reject', action: 'rejected',
   check: () => (String((req.body && req.body.reason) || '').trim() ? null : 'Give the requester a reason so they can revise the request.'),
   apply: () => {
     const reason = String(req.body.reason).trim();
     return { to: 'rejected', stageNo: null, note: reason, extraSql: ', reject_reason = $4', extraParams: [reason] };
   },
-}));
+});
+router.post('/requests/:id/reject', (req, res) => transition(req, res, rejectSpec(req)));
 
 router.post('/requests/:id/cancel', (req, res) => transition(req, res, {
   allowed: 'cancel', action: 'cancelled',
@@ -1330,9 +1372,16 @@ router.post('/requests/:id/remind', async (req, res) => {
     if (!row) return res.status(404).json({ success: false, message: 'Request not found' });
     if (!decorate(req, row).can.remind) return res.status(400).json({ success: false, message: 'This request is not waiting on anyone.' });
     const channel = String((req.body && req.body.channel) || 'WhatsApp');
-    const to = String((req.body && req.body.to) || '').trim();
-    await logHistory(pool, { requestId: row.id, action: 'reminder', from: row.status, to: row.status, note: `${channel} reminder sent${to ? ` to ${to}` : ''} for ${stageLabelFor(req, row) || row.status}`, req });
-    res.json({ success: true });
+    let to = String((req.body && req.body.to) || '').trim();
+    if (channel === 'SystemEmail') {
+      // Re-send the approval email (fresh personal link) to one approver, or to everyone at the stage.
+      if (!mailEnabled()) return res.status(400).json({ success: false, message: 'Email is not configured on this server.' });
+      const r = await procMail.notifyStage(row, mailHelpers(req), { reminder: true, onlyUserId: req.body && req.body.user_id ? Number(req.body.user_id) : null });
+      if (!r.sent.length) return res.status(400).json({ success: false, message: r.skipped.length ? `No email address on file for ${r.skipped.join(', ')}.` : 'Nobody to email at this stage.' });
+      to = r.sent.join(', ');
+    }
+    await logHistory(pool, { requestId: row.id, action: 'reminder', from: row.status, to: row.status, note: `${channel === 'SystemEmail' ? 'Email' : channel} reminder sent${to ? ` to ${to}` : ''} for ${stageLabelFor(req, row) || row.status}`, req });
+    res.json({ success: true, data: { to } });
   } catch (err) {
     console.error('Procurement remind error:', err.message);
     fail(res, err, 'Failed to log reminder');
@@ -2063,3 +2112,5 @@ router.get('/summary', async (req, res) => {
 });
 
 module.exports = router;
+// Used by routes/procurement-mail.js (approve / send back from the email link).
+router._internal = { transition, approveSpec, rejectSpec, approvalStages, loadRequest, decorate, chainFor, stageLabelFor };

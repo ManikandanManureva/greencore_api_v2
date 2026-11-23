@@ -17,6 +17,7 @@ const sparePartsRoutes = require('./routes/spareparts');
 const finishedGoodsRoutes = require('./routes/finished-goods');
 const qcLabRoutes = require('./routes/qc-lab');
 const procurementRoutes = require('./routes/procurement');
+const procurementMailRoutes = require('./routes/procurement-mail');
 const usersRoutes = require('./routes/users');
 
 const app = express();
@@ -78,6 +79,9 @@ app.use('/api/spareparts', sparePartsRoutes);
 app.use('/spareparts', sparePartsRoutes);
 app.use('/api/finished-goods', finishedGoodsRoutes);
 app.use('/finished-goods', finishedGoodsRoutes);
+// Email approval links (token in the URL, no JWT) — must be mounted before the authenticated router.
+app.use('/api/procurement/mail', procurementMailRoutes);
+app.use('/procurement/mail', procurementMailRoutes);
 app.use('/api/procurement', procurementRoutes);
 app.use('/procurement', procurementRoutes);
 app.use('/api/qc-lab', qcLabRoutes);
