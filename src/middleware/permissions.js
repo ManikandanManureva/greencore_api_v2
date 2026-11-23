@@ -18,7 +18,7 @@ const MODULES = [
   { key: 'spare_parts', label: 'Spare Parts',        description: 'Machine spare parts for PC/PE and PET lines.' },
   { key: 'outgoing',    label: 'Outgoing / Sales',   description: 'Finished goods, flakes and by-product shipments, bag REF lists.' },
   { key: 'qc_lab',      label: 'QC Lab',             description: 'Pellet sampling and lab results.' },
-  { key: 'procurement', label: 'Procurement',        description: 'Purchase requests (PB), approvals, purchase orders and goods receipts (LPB).' },
+  { key: 'procurement', label: 'Procurement',        description: 'Purchase requests (PB), approvals, purchase orders and goods receipts (LPB). Read is enough to approve the stages assigned to the user.' },
   { key: 'proc_approvals', label: 'Procurement — Approvals only', description: 'Approve or reject the purchase requests waiting on this user. No PB, PO, LPB or master data.' },
   { key: 'users',       label: 'User Management',    description: 'Users, roles and menu access.' },
 ];

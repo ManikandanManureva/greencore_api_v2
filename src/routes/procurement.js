@@ -147,8 +147,14 @@ const APPROVER_ONLY_ROUTES = [
   ['GET', /^\/me$/], ['GET', /^\/requests$/], ['GET', /^\/requests\/\d+$/], ['POST', /^\/requests\/\d+\/(approve|reject|note|remind)$/],
   ['GET', /^\/approvers$/], ['GET', /^\/reminders$/], ['GET', /^\/uploads\//], ['GET', /^\/departments$/],
 ];
+// Approving, sending back, noting and reminding need only Read on Procurement: the stage
+// configuration decides who may act, not the Write permission (which is for raising/editing PBs).
+const APPROVAL_ACTIONS = /^\/requests\/\d+\/(approve|reject|note|remind)$/;
 router.use(authenticateToken, (req, res, next) => {
-  if (hasPermission(req.user, 'procurement', 'read')) return requireModule('procurement', 'Procurement')(req, res, next);
+  if (hasPermission(req.user, 'procurement', 'read')) {
+    if (req.method === 'POST' && APPROVAL_ACTIONS.test(req.path.replace(/\/+$/, ''))) return next();
+    return requireModule('procurement', 'Procurement')(req, res, next);
+  }
   if (hasPermission(req.user, 'proc_approvals', 'read')) {
     const p = req.path.replace(/\/+$/, '') || '/';
     if (APPROVER_ONLY_ROUTES.some(([m, re]) => m === req.method && re.test(p))) { req.approverOnly = true; return next(); }
@@ -327,7 +333,9 @@ function decorate(req, row) {
       receive: ['purchasing', 'partially_received'].includes(row.status) && actStage,
       // Purchasing records or corrects the PO number while goods are still on the way
       set_po: ['purchasing', 'partially_received'].includes(row.status) && (admin || POST_APPROVAL_ROLES.approved.includes(roleKey(req))),
-      cancel: ['draft', ...PENDING, 'approved'].includes(row.status) && (owner || admin),
+      // A submitted PB with wrong details is sent back by the approver, not cancelled by the requester;
+      // withdrawing it altogether is Purchasing's (or an admin's) call. A draft is still the requester's own.
+      cancel: row.status === 'draft' ? (owner || admin) : ([...PENDING, 'approved'].includes(row.status) && (admin || POST_APPROVAL_ROLES.approved.includes(roleKey(req)))),
       remind: PENDING.includes(row.status) || row.status === 'approved',
       delete: row.status === 'draft' ? (owner || admin) : admin,
     },
@@ -1203,7 +1211,7 @@ router.post('/requests/:id/reject', (req, res) => transition(req, res, rejectSpe
 
 router.post('/requests/:id/cancel', (req, res) => transition(req, res, {
   allowed: 'cancel', action: 'cancelled',
-  apply: () => ({ to: 'cancelled', stageNo: null, note: String((req.body && req.body.reason) || '').trim() || 'Cancelled by requester' }),
+  apply: (row) => ({ to: 'cancelled', stageNo: null, note: String((req.body && req.body.reason) || '').trim() || (row.status === 'draft' ? 'Draft withdrawn' : 'Cancelled by Purchasing') }),
 }));
 
 // ─── POs: one PB can be split over several vendors ───────────────────────────
