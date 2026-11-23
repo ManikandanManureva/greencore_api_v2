@@ -61,7 +61,9 @@ async function run() {
     await client.query(`ALTER TABLE proc_approval_stages ADD COLUMN IF NOT EXISTS approver_user_ids INTEGER[] NOT NULL DEFAULT '{}'`);
     await client.query(`ALTER TABLE proc_approval_stages ADD COLUMN IF NOT EXISTS approver_hint VARCHAR(160)`);
     await client.query(`ALTER TABLE proc_approval_stages ALTER COLUMN role_key DROP NOT NULL`);
-    await client.query(`ALTER TABLE proc_approval_stages DROP CONSTRAINT IF EXISTS proc_approval_stages_category_stage_no_key`);
+    // The old UNIQUE (category, stage_no) must go whatever it was named on this database.
+    const olds = await client.query(`SELECT conname FROM pg_constraint WHERE conrelid = 'proc_approval_stages'::regclass AND contype = 'u'`);
+    for (const c of olds.rows) await client.query(`ALTER TABLE proc_approval_stages DROP CONSTRAINT IF EXISTS "${c.conname}"`);
     await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS ux_proc_approval_stage ON proc_approval_stages (category, group_code, stage_no)`);
 
     // Departments: create the ones from the matrix that do not exist yet, then assign groups.

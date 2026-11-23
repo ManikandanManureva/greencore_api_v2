@@ -307,7 +307,8 @@ function decorate(req, row) {
     stage_short: stage ? stage.label : null,
     category_label: CATEGORY_LABELS[row.category] || row.category,
     can: {
-      edit: (row.status === 'draft' || row.status === 'rejected') && (owner || admin),
+      // Requester only while it is theirs to fix; once approved, only Purchasing (or an admin) may correct it, and only until a PO is recorded.
+      edit: ((row.status === 'draft' || row.status === 'rejected') && (owner || admin)) || (row.status === 'approved' && (admin || POST_APPROVAL_ROLES.approved.includes(roleKey(req)))),
       submit: (row.status === 'draft' || row.status === 'rejected') && (owner || admin),
       approve: PENDING.includes(row.status) && actStage,
       reject: PENDING.includes(row.status) && actStage,
@@ -1064,7 +1065,7 @@ router.put('/requests/:id', async (req, res) => {
   try {
     const row = await loadRequest(client, req.params.id);
     if (!row) return res.status(404).json({ success: false, message: 'Request not found' });
-    if (!decorate(req, row).can.edit) return res.status(403).json({ success: false, message: 'Only a draft or rejected request can be edited, by its requester or an admin.' });
+    if (!decorate(req, row).can.edit) return res.status(403).json({ success: false, message: 'A draft or rejected request can be edited by its requester or an admin; an approved request only by Purchasing, until a PO is recorded.' });
     const departmentNames = (await activeDepartments()).map((d) => d.name);
     const b = requestBody(req.body, departmentNames);
     if (!b.department || !b.category) return res.status(400).json({ success: false, message: 'department and category are required' });
