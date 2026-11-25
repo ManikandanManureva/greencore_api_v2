@@ -76,6 +76,7 @@ node src/scripts/add-procurement-mail-actions.js
 #   node src/scripts/migrate-spareparts-v2.js                (v1 -> v2 schema data migration)
 #   node src/scripts/merge-pcpe-spareparts.js                (merged PC+PE catalogs)
 #   node src/scripts/refresh-starlinger-and-boretech.js      (refreshed PET spare parts data)
+#   node src/scripts/import-pcpe-mechanic-electric.js        (PC/PE split: Mechanic refresh + new Electric catalog, with usage logs)
 #   node src/scripts/remove-duplicate-sp-mec-items.js        (one-time duplicate cleanup)
 #   node src/scripts/import-qc-lab-history.js                (668 historical QC Lab samples)
 # Run any of these by hand only if this server has never had that data loaded.
