@@ -2311,10 +2311,12 @@ router.get('/crusher-logs', authenticateToken, async (req, res) => {
       params.push(status);
     }
 
-    // Always apply date filter (selected date or today); optionally narrow by shift_id for "today"
+    // Always apply date filter (selected date or today); optionally narrow by shift_id for "today".
+    // Filtered by the shift's business date (os.start_time), not the row's own created_at — an
+    // overnight shift that logs a bag just after midnight must still show under the date it started.
     const targetDate = date || new Date().toISOString().split('T')[0];
     paramIndex++;
-    sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
+    sql += ` AND DATE(os.start_time) = $${paramIndex}`;
     params.push(targetDate);
     if (shift_id) {
       paramIndex++;
@@ -2354,7 +2356,7 @@ router.get('/crusher-logs', authenticateToken, async (req, res) => {
     }
 
     countParamIndex++;
-    countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
+    countSql += ` AND DATE(os.start_time) = $${countParamIndex}`;
     countParams.push(targetDate);
     if (shift_id) {
       countParamIndex++;
@@ -2463,10 +2465,11 @@ router.get('/washing-logs', authenticateToken, async (req, res) => {
       params.push(status);
     }
 
-    // Always apply date filter; optionally narrow by shift_id for "today"
+    // Always apply date filter; optionally narrow by shift_id for "today". Filtered by the
+    // shift's business date (os.start_time), not the row's own created_at — see crusher-logs.
     const washingTargetDate = date || new Date().toISOString().split('T')[0];
     paramIndex++;
-    sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
+    sql += ` AND DATE(os.start_time) = $${paramIndex}`;
     params.push(washingTargetDate);
     if (shift_id) {
       paramIndex++;
@@ -2506,7 +2509,7 @@ router.get('/washing-logs', authenticateToken, async (req, res) => {
     }
 
     countParamIndex++;
-    countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
+    countSql += ` AND DATE(os.start_time) = $${countParamIndex}`;
     countParams.push(washingTargetDate);
     if (shift_id) {
       countParamIndex++;
@@ -2586,10 +2589,11 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
       params.push(status);
     }
 
-    // Always apply date filter; optionally narrow by shift_id for "today"
+    // Always apply date filter; optionally narrow by shift_id for "today". Filtered by the
+    // shift's business date (os.start_time), not the row's own created_at — see crusher-logs.
     const extrusionTargetDate = date || new Date().toISOString().split('T')[0];
     paramIndex++;
-    sql += ` AND DATE(pl.created_at) = $${paramIndex}`;
+    sql += ` AND DATE(os.start_time) = $${paramIndex}`;
     params.push(extrusionTargetDate);
     if (shift_id) {
       paramIndex++;
@@ -2629,7 +2633,7 @@ router.get('/extrusion-logs', authenticateToken, async (req, res) => {
     }
 
     countParamIndex++;
-    countSql += ` AND DATE(pl.created_at) = $${countParamIndex}`;
+    countSql += ` AND DATE(os.start_time) = $${countParamIndex}`;
     countParams.push(extrusionTargetDate);
     if (shift_id) {
       countParamIndex++;
@@ -2716,8 +2720,10 @@ router.get('/final-packing-logs', authenticateToken, async (req, res) => {
       params.push(status);
     }
 
-    // Optional shift scope (current shift) + calendar day from date picker.
-    // If we only filter by shift_id, multi-day shifts show yesterday's rows while the UI date is "today".
+    // Optional shift scope (current shift) + calendar day from date picker. Filtered by the
+    // shift's business date (os.start_time, fixed at shift start), not the row's own created_at —
+    // an overnight shift that logs a bag just after midnight must still show under the date it
+    // started, and this also keeps a multi-day shift from spilling into the next day's date filter.
     const packingTargetDate =
       date && String(date).trim() !== ''
         ? String(date).trim().split('T')[0]
@@ -2729,11 +2735,11 @@ router.get('/final-packing-logs', authenticateToken, async (req, res) => {
     }
     if (date && String(date).trim() !== '') {
       paramIndex++;
-      sql += ` AND DATE(pl.created_at) = $${paramIndex}::date`;
+      sql += ` AND DATE(os.start_time) = $${paramIndex}::date`;
       params.push(packingTargetDate);
     } else if (!shift_id) {
       paramIndex++;
-      sql += ` AND DATE(pl.created_at) = $${paramIndex}::date`;
+      sql += ` AND DATE(os.start_time) = $${paramIndex}::date`;
       params.push(packingTargetDate);
     }
 
@@ -2766,11 +2772,11 @@ router.get('/final-packing-logs', authenticateToken, async (req, res) => {
     }
     if (date && String(date).trim() !== '') {
       countParamIndex++;
-      countSql += ` AND DATE(pl.created_at) = $${countParamIndex}::date`;
+      countSql += ` AND DATE(os.start_time) = $${countParamIndex}::date`;
       countParams.push(packingTargetDate);
     } else if (!shift_id) {
       countParamIndex++;
-      countSql += ` AND DATE(pl.created_at) = $${countParamIndex}::date`;
+      countSql += ` AND DATE(os.start_time) = $${countParamIndex}::date`;
       countParams.push(packingTargetDate);
     }
     if (search) {
@@ -2816,7 +2822,7 @@ router.get('/ppic-station-overview', authenticateToken, async (req, res) => {
       LEFT JOIN shift_types st ON os.shift_type_id = st.id
       LEFT JOIN users u ON os.user_id = u.id
       LEFT JOIN material_types mt ON os.material_type_id = mt.id
-      WHERE DATE(pl.created_at) = $1
+      WHERE DATE(os.start_time) = $1
     `;
     const params = [targetDate];
     let paramIndex = 1;
